@@ -17,6 +17,7 @@ namespace sbd {
       int method = 0;
       int max_it = 1;
       int max_nb = 10;
+      int nroots = 1;
       double eps = 1.0e-4;
       double max_time = 86400.0;
       int init = 0;
@@ -46,6 +47,9 @@ namespace sbd {
 	}
 	if ( std::string(argv[i]) == "--block" ) {
 	  sbd_data.max_nb = std::atoi(argv[++i]);
+	}
+	if ( std::string(argv[i]) == "--nroots" ) {
+	  sbd_data.nroots = std::atoi(argv[++i]);
 	}
 	if ( std::string(argv[i]) == "--tolerance" ) {
 	  sbd_data.eps = std::atof(argv[++i]);
@@ -142,6 +146,7 @@ namespace sbd {
 #endif
 	  int max_it = sbd_data.max_it;
       int max_nb = sbd_data.max_nb;
+      int nroots = sbd_data.nroots;
       double eps = sbd_data.eps;
       double max_time = sbd_data.max_time;
       int init = sbd_data.init;
@@ -271,10 +276,30 @@ namespace sbd {
 	sbd::Davidson(hii, w, device_mult,
 			max_it,max_nb,eps,max_time);
 #else
+	if( nroots > 1 ) {
+	  // Multi-root (block Davidson-Liu). Seed W[0]=w (HF/current), W[1..] random.
+	  std::vector<std::vector<ElemT>> Wroots(nroots, w);
+	  for(int p=1; p < nroots; p++) {
+	    Randomize(Wroots[p],b_comm,h_comm);
+	    MpiBcast(Wroots[p],0,t_comm);
+	  }
+	  std::vector<double> Eroots;
+	  DavidsonMultiRoot(hii,Wroots,Eroots,det,bit_length,static_cast<size_t>(L),
+			    idxmap,exidx,I0,I1,I2,
+			    h_comm,b_comm,t_comm,
+			    max_it,max_nb,nroots,eps);
+	  if( mpi_rank == 0 ) {
+	    std::cout.precision(12);
+	    for(int p=0; p < nroots; p++)
+	      std::cout << " sbd: MultiRoot E[" << p << "] = " << Eroots[p] << std::endl;
+	  }
+	  w = Wroots[0];   // keep ground root for the downstream single-vector flow (for now)
+	} else {
 	Davidson(hii,w,det,bit_length,static_cast<size_t>(L),
 		 idxmap,exidx,I0,I1,I2,
 		 h_comm,b_comm,t_comm,
 		 max_it,max_nb,eps);
+	}
 #endif
     auto time_end_david = std::chrono::high_resolution_clock::now();
 	auto elapsed_david_count = std::chrono::duration_cast<std::chrono::microseconds>(time_end_david-time_start_david).count();
