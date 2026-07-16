@@ -120,6 +120,38 @@ namespace sbd {
        @param[out] one_p_rdm: one-particle reduced density matrix if sbd_data.do_rdm != 0
        @param[out] two_p_rdm: two-particle reduced density matrix if sbd_data.do_rdm != 0
      */
+
+    /**
+       Write per-root 1p/2p RDM files "1pRDM.<p>.txt" / "2pRDM.<p>.txt"
+       (spin-summed, same layout as main.cc's single-root writer). Rank-0 only.
+    */
+    template <typename ElemT>
+    void WriteRdmFiles(int p, int L,
+		       const std::vector<std::vector<ElemT>> & one_p_rdm,
+		       const std::vector<std::vector<ElemT>> & two_p_rdm) {
+      std::ostringstream one_name; one_name << "1pRDM." << p << ".txt";
+      std::ostringstream two_name; two_name << "2pRDM." << p << ".txt";
+      std::ofstream ofs_one(one_name.str());
+      ofs_one.precision(16);
+      for(int io=0; io < L; io++)
+	for(int jo=0; jo < L; jo++)
+	  ofs_one << io << " " << jo << " "
+		  << GetReal(one_p_rdm[0][io+L*jo]) + GetReal(one_p_rdm[1][io+L*jo])
+		  << std::endl;
+      std::ofstream ofs_two(two_name.str());
+      ofs_two.precision(16);
+      for(int io=0; io < L; io++)
+	for(int jo=0; jo < L; jo++)
+	  for(int ia=0; ia < L; ia++)
+	    for(int ja=0; ja < L; ja++)
+	      ofs_two << io << " " << jo << " " << ia << " " << ja << " "
+		      << GetReal(two_p_rdm[0][io+L*jo+L*L*(ia+L*ja)])
+		       + GetReal(two_p_rdm[1][io+L*jo+L*L*(ia+L*ja)])
+		       + GetReal(two_p_rdm[2][io+L*jo+L*L*(ia+L*ja)])
+		       + GetReal(two_p_rdm[3][io+L*jo+L*L*(ia+L*ja)])
+		      << std::endl;
+    }
+
     template <typename ElemT>
     void diag(const MPI_Comm & comm,
 	      const SBD & sbd_data,
@@ -293,7 +325,31 @@ namespace sbd {
 	    for(int p=0; p < nroots; p++)
 	      std::cout << " sbd: MultiRoot E[" << p << "] = " << Eroots[p] << std::endl;
 	  }
-	  w = Wroots[0];   // keep ground root for the downstream single-vector flow (for now)
+	  // Per-root energy + RDM. Stream: build one root's RDM, write it, free the
+	  // vector before the next root (eigenvectors can be large).
+	  for(int p=0; p < nroots; p++) {
+	    // recomputed H-expectation energy for this root
+	    std::vector<ElemT> vp(Wroots[p].size(),ElemT(0.0));
+	    mult(hii,Wroots[p],vp,bit_length,static_cast<size_t>(L),det,
+		 idxmap,exidx,I0,I1,I2,h_comm,b_comm,t_comm);
+	    ElemT Ep; InnerProduct(Wroots[p],vp,Ep,b_comm);
+	    if( do_rdm != 0 ) {
+	      std::vector<std::vector<ElemT>> one_p_rdm_p;
+	      std::vector<std::vector<ElemT>> two_p_rdm_p;
+	      Correlation(Wroots[p],det,bit_length,static_cast<size_t>(L),
+			  idxmap,exidx,h_comm,b_comm,t_comm,
+			  one_p_rdm_p,two_p_rdm_p);
+	      if( mpi_rank == 0 )
+		WriteRdmFiles(p,static_cast<int>(L),one_p_rdm_p,two_p_rdm_p);
+	    }
+	    if( mpi_rank == 0 )
+	      std::cout << " sbd: MultiRoot root " << p
+			<< " Energy = " << GetReal(Ep) << std::endl;
+	    // free non-root-0 vectors after their RDMs are written (keep root 0
+	    // for the downstream single-vector energy/density out-params)
+	    if( p != 0 ) std::vector<ElemT>().swap(Wroots[p]);
+	  }
+	  w = Wroots[0];
 	} else {
 	Davidson(hii,w,det,bit_length,static_cast<size_t>(L),
 		 idxmap,exidx,I0,I1,I2,
