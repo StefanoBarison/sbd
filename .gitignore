@@ -47,3 +47,7 @@ cmake_install.cmake
 
 
 test/
+
+# ---- RDM files ----
+*RDM.txt
+*RDM.*.txt
