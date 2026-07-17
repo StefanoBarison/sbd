@@ -8,6 +8,8 @@
 #include <iomanip>
 #include <type_traits>
 
+#include "sbd/framework/nvtx.h"
+
 namespace sbd {
 
   namespace hp_numeric {
@@ -20,6 +22,7 @@ namespace sbd {
 		    ElemT* A,
 		    int LDA,
 		    RealT* W) {
+      SBD_NVTX_RANGE_COLOR("JacobiHeev", __LINE__);
       
       int n = N;
       int lda = LDA;

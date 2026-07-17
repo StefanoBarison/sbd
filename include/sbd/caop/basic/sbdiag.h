@@ -21,6 +21,7 @@ namespace sbd {
       int max_iv = 1;
       double eps = 1.0e-4;
       int init = 0;
+      size_t seed = 0;
 
       size_t system_size = 64;
       size_t bit_length = 32;
@@ -67,6 +68,9 @@ namespace sbd {
 	}
 	if( std::string(argv[i]) == "--init" ) {
 	  sbd_data.init = std::atoi(argv[++i]);
+	}
+	if( std::string(argv[i]) == "--seed" ) {
+	  sbd_data.seed = std::stoull(argv[++i]);
 	}
 	if( std::string(argv[i]) == "--do_sort_basis" ) {
 	  if( std::atoi(argv[++i]) != 0 ) {
@@ -130,6 +134,21 @@ namespace sbd {
       int max_nb = sbd_data.max_nb;
       int max_iv = sbd_data.max_iv;
       int init   = sbd_data.init;
+      size_t seed = sbd_data.seed;
+      bool seed_was_random = (seed == 0);
+      if (seed == 0) {
+        if (mpi_rank == 0) {
+          seed = static_cast<size_t>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        }
+        unsigned long long bcast_seed = (unsigned long long)seed;
+        MPI_Bcast(&bcast_seed, 1, MPI_UNSIGNED_LONG_LONG, 0, comm);
+        seed = (size_t)bcast_seed;
+      }
+      if (mpi_rank == 0) {
+        std::cout << "# seed: " << seed
+                  << (seed_was_random ? " (random)" : " (user-specified)") << std::endl;
+      }
       double eps = sbd_data.eps;
       size_t system_size = sbd_data.system_size;
       size_t bit_length = sbd_data.bit_length;
@@ -158,7 +177,7 @@ namespace sbd {
       auto time_start_init = std::chrono::high_resolution_clock::now();
       std::vector<ElemT> W;
       if ( loadname.empty() ) {
-	InitVectorCAOP(W,basis,h_comm,b_comm,t_comm,init);
+	InitVectorCAOP(W,basis,h_comm,b_comm,t_comm,init,seed);
       } else {
 	LoadWavefunction(loadname,basis,h_comm,b_comm,t_comm,W);
       }
@@ -180,7 +199,7 @@ namespace sbd {
 	if( method == 0 ) {
 	  Davidson(hii,W,basis,bit_length,slide,H,sign,
 		   h_comm,b_comm,t_comm,
-		   max_it,max_nb,max_iv,eps);
+		   max_it,max_nb,max_iv,eps,seed);
 	} else if ( method == 2 ) {
 	  Lanczos(hii,W,basis,bit_length,slide,H,sign,
 		  h_comm,b_comm,t_comm,
@@ -244,7 +263,7 @@ namespace sbd {
 	if( method == 1 ) {
 	  Davidson(hii,ib,ik,hij,W,slide,
 		   h_comm,b_comm,t_comm,
-		   max_it,max_nb,max_iv,eps);
+		   max_it,max_nb,max_iv,eps,seed);
 	} else if ( method == 3 ) {
 	  Lanczos(hii,ib,ik,hij,W,slide,
 		  h_comm,b_comm,t_comm,
@@ -340,7 +359,8 @@ namespace sbd {
       int b_comm_size = sbd_data.b_comm_size;
       int h_comm_size = mpi_size / (t_comm_size*b_comm_size);
       size_t bit_length = sbd_data.bit_length;
-      size_t system_size = sbd_data.system_size;      
+      size_t system_size = sbd_data.system_size;
+      det_vector<size_t>::init_elem_size((system_size + bit_length - 1) / bit_length);
       MPI_Comm h_comm;
       MPI_Comm b_comm;
       MPI_Comm t_comm;

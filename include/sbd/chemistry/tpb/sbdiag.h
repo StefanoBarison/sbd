@@ -5,6 +5,12 @@
 #ifndef SBD_CHEMISTRY_TPB_SBDIAG_H
 #define SBD_CHEMISTRY_TPB_SBDIAG_H
 
+#ifdef SBD_USE_NCCL
+#include <nccl.h>
+#endif
+
+#include "sbd/framework/nvtx.h"
+
 #ifdef USE_OMP_OFFLOAD
 #include "../basic/omp_offload.h"
 #endif
@@ -25,6 +31,7 @@ namespace sbd {
       double eps = 1.0e-4;
       double max_time = 86400.0;
       int init = 0;
+      size_t seed = 1729;
       int do_shuffle = 0;
       int do_rdm = 0;
       int carryover_type = 0;
@@ -56,6 +63,12 @@ namespace sbd {
 	}
 	if( std::string(argv[i]) == "--method" ) {
 	  sbd_data.method = std::atoi(argv[++i]);
+	}
+	if( std::string(argv[i]) == "--init" ) {
+	  sbd_data.init = std::atoi(argv[++i]);
+	}
+	if( std::string(argv[i]) == "--seed" ) {
+	  sbd_data.seed = std::atoi(argv[++i]);
 	}
 	if( std::string(argv[i]) == "--iteration" ) {
 	  sbd_data.max_it = std::atoi(argv[++i]);
@@ -158,6 +171,7 @@ namespace sbd {
       double eps = sbd_data.eps;
       double max_time = sbd_data.max_time;
       int init = sbd_data.init;
+      size_t seed = sbd_data.seed;
       int do_shuffle = sbd_data.do_shuffle;
       int do_rdm = sbd_data.do_rdm;
       double ratio = sbd_data.ratio;
@@ -174,6 +188,8 @@ namespace sbd {
       sbd::SetupIntegrals(fcidump,L,N,I0,I1,I2);
 
       int norbs = L;
+      sbd::det_vector<size_t>::init_elem_size((2*norbs + bit_length - 1) / bit_length);
+      sbd::det_vector<size_t, sbd::det_kind::half>::init_elem_size((norbs + bit_length - 1) / bit_length);
 
 #ifdef USE_OMP_OFFLOAD
       // check orbital count and determinant size : there are limits in omp_offload.h
@@ -231,9 +247,14 @@ namespace sbd {
       MPI_Comm h_comm;
       MPI_Comm b_comm;
       MPI_Comm t_comm;
+      // a_comm is introduced as a combined communicator of t_comm and h_comm.
+      // This enables replacing consecutive AllReduce operations over t_comm
+      // and h_comm with a single collective call, reducing communication
+      // overhead and latency.
+      MPI_Comm a_comm;
       sbd::TaskCommunicator(comm,
 			    h_comm_size,adet_comm_size,bdet_comm_size,task_comm_size,
-			    h_comm,b_comm,t_comm);
+			    h_comm,b_comm,t_comm,a_comm);
 
       auto time_start_help = std::chrono::high_resolution_clock::now();
       sbd::MakeHelpers(adet,bdet,bit_length,L,helper,
@@ -250,11 +271,13 @@ namespace sbd {
       }
 
       int mpi_rank_h; MPI_Comm_rank(h_comm,&mpi_rank_h);
+      int mpi_size_h; MPI_Comm_size(h_comm,&mpi_size_h);
       int mpi_rank_b; MPI_Comm_rank(b_comm,&mpi_rank_b);
+      int mpi_size_b; MPI_Comm_size(b_comm,&mpi_size_b);
       int mpi_rank_t; MPI_Comm_rank(t_comm,&mpi_rank_t);
       int mpi_size_t; MPI_Comm_size(t_comm,&mpi_size_t);
-      int mpi_size_b; MPI_Comm_size(b_comm,&mpi_size_b);
-      int mpi_size_h; MPI_Comm_size(h_comm,&mpi_size_h);
+      int mpi_rank_a; MPI_Comm_rank(a_comm,&mpi_rank_a);
+      int mpi_size_a; MPI_Comm_size(a_comm,&mpi_size_a);
 
       /**
 	 Initialize/Load wave function
@@ -262,7 +285,7 @@ namespace sbd {
       auto time_start_init = std::chrono::high_resolution_clock::now();
       std::vector<double> W;
       if( loadname == std::string("") ) {
-	sbd::BasisInitVector(W,adet,bdet,adet_comm_size,bdet_comm_size,h_comm,b_comm,t_comm,init);
+	sbd::BasisInitVector(W,adet,bdet,adet_comm_size,bdet_comm_size,h_comm,b_comm,t_comm,init,seed);
       } else {
 	sbd::LoadWavefunction(loadname,adet,bdet,
 			      adet_comm_size,bdet_comm_size,
@@ -274,6 +297,39 @@ namespace sbd {
       if( mpi_rank == 0 ) {
 	std::cout << " Elapsed time for init " << elapsed_init << " (sec) " << std::endl;
       }
+
+#ifdef SBD_USE_NCCL
+      // Initialize NCCL communicators.
+      // Only b_nccl_comm and a_nccl_comm are initialized, as all collective
+      // operations are performed on a_comm. Other NCCL communicators are
+      // omitted to reduce initialization overhead and resource usage.
+      ncclComm_t h_nccl_comm;
+      ncclComm_t b_nccl_comm;
+      ncclComm_t t_nccl_comm;
+      ncclComm_t a_nccl_comm;
+      if (false && mpi_size_h > 1) {
+          init_nccl_comm(&h_nccl_comm, h_comm);
+          thrust::device_vector<double> A(W.size(), 0.0);
+          nccl_allreduce(A, ncclSum, h_nccl_comm);
+      }
+      if (mpi_size_b > 1) {
+          init_nccl_comm(&b_nccl_comm, b_comm);
+          thrust::device_vector<double> A(W.size(), 0.0);
+          nccl_allreduce(A, ncclSum, b_nccl_comm);
+      }
+      if (false && mpi_size_t > 1) {
+          init_nccl_comm(&t_nccl_comm, t_comm);
+          thrust::device_vector<double> A(W.size(), 0.0);
+          nccl_allreduce(A, ncclSum, t_nccl_comm);
+      }
+      if (mpi_size_a > 1) {
+          init_nccl_comm(&a_nccl_comm, a_comm);
+          thrust::device_vector<double> A(W.size(), 0.0);
+          nccl_allreduce(A, ncclSum, a_nccl_comm);
+      }
+      printf("[%s,%d] NCCL communicators have been created.\n",
+             __FILE__, __LINE__);
+#endif
 
 #ifdef SBD_THRUST
 	// multiplyer class for TPB on Thrust
@@ -294,10 +350,16 @@ namespace sbd {
 	auto time_start_qcham = std::chrono::high_resolution_clock::now();
 #ifdef SBD_THRUST
 	auto time_start_mult_init = std::chrono::high_resolution_clock::now();
-	device_mult.Init(adet, bdet, bit_length, static_cast<size_t>(L),
-					adet_comm_size,bdet_comm_size, helper, I0, I1, I2,
-					h_comm,b_comm,t_comm,
-	                sbd_data.use_precalculated_dets, sbd_data.max_memory_gb_for_determinants, sbd_data.thrust_collapse_loops);
+        {
+            SBD_NVTX_RANGE_COLOR("device_mult.Init", __LINE__);
+            device_mult.Init(adet, bdet, bit_length, static_cast<size_t>(L),
+                             adet_comm_size,bdet_comm_size, helper, I0, I1, I2,
+                             h_comm,b_comm,t_comm,a_comm,
+#ifdef SBD_USE_NCCL
+                             h_nccl_comm, b_nccl_comm, t_nccl_comm, a_nccl_comm,
+#endif
+                             sbd_data.use_precalculated_dets, sbd_data.max_memory_gb_for_determinants, sbd_data.thrust_collapse_loops);
+        }
 	auto time_end_mult_init = std::chrono::high_resolution_clock::now();
 	auto elapsed_mult_init_count = std::chrono::duration_cast<std::chrono::microseconds>(time_end_mult_init-time_start_mult_init).count();
 	double elapsed_mult_init = 1.0e-6 * elapsed_mult_init_count;
@@ -306,7 +368,10 @@ namespace sbd {
 	}
 
 	thrust::device_vector<double> hii;
-	device_mult.makeQChamDiagTerms(hii);
+        {
+            SBD_NVTX_RANGE_COLOR("device_mult.makeQChamDiagTerms", __LINE__);
+            device_mult.makeQChamDiagTerms(hii);
+        }
 #else
 	std::vector<double> hii;
 	sbd::makeQChamDiagTerms(adet,bdet,bit_length,L,
@@ -322,11 +387,13 @@ namespace sbd {
 
 #ifdef SBD_THRUST
 	if( method == 0 ) {
-		sbd::Davidson(hii, W, device_mult,
-				max_it,max_nb,eps,max_time);
+            SBD_NVTX_RANGE_COLOR("Davidson", __LINE__);
+            sbd::Davidson(hii, W, device_mult,
+                          max_it,max_nb,eps,max_time);
 	} else {
-		sbd::Lanczos(hii, W, device_mult,
-				max_it,max_nb,eps);
+            SBD_NVTX_RANGE_COLOR("Lanczos", __LINE__);
+            sbd::Lanczos(hii, W, device_mult,
+                         max_it,max_nb,eps);
 	}
 #else
 	if( method == 0 ) {
@@ -367,13 +434,16 @@ namespace sbd {
 
 	auto time_start_mult = std::chrono::high_resolution_clock::now();
 #ifdef SBD_THRUST
-    // copyin W
-    thrust::device_vector<double> W_dev(W.size());
-    thrust::copy_n(W.begin(), W.size(), W_dev.begin());
+        // copyin W
+        thrust::device_vector<double> W_dev(W.size());
+        thrust::copy_n(W.begin(), W.size(), W_dev.begin());
 
-    thrust::device_vector<double> C_dev(C.size(), 0.0);
+        thrust::device_vector<double> C_dev(C.size(), 0.0);
 
-	device_mult.run(hii, W_dev, C_dev);
+        {
+            SBD_NVTX_RANGE_COLOR("device_mult.run", __LINE__);
+            device_mult.run(hii, W_dev, C_dev);
+        }
 
 	thrust::copy_n(C_dev.begin(), C_dev.size(), C.begin());
 #else
@@ -411,9 +481,12 @@ namespace sbd {
 #ifdef SBD_THRUST
 	auto time_start_mult_init = std::chrono::high_resolution_clock::now();
 	device_mult.Init(adet, bdet, bit_length, static_cast<size_t>(L),
-					adet_comm_size,bdet_comm_size, helper, I0, I1, I2,
-					h_comm,b_comm,t_comm,
-	                sbd_data.use_precalculated_dets, sbd_data.max_memory_gb_for_determinants, sbd_data.thrust_collapse_loops);
+                         adet_comm_size,bdet_comm_size, helper, I0, I1, I2,
+                         h_comm, b_comm, t_comm, a_comm,
+#ifdef SBD_USE_NCCL
+                         h_nccl_comm, b_nccl_comm, t_nccl_comm, a_nccl_comm,
+#endif
+                         sbd_data.use_precalculated_dets, sbd_data.max_memory_gb_for_determinants, sbd_data.thrust_collapse_loops);
 	auto time_end_mult_init = std::chrono::high_resolution_clock::now();
 	auto elapsed_mult_init_count = std::chrono::duration_cast<std::chrono::microseconds>(time_end_mult_init-time_start_mult_init).count();
 	double elapsed_mult_init = 1.0e-6 * elapsed_mult_init_count;
@@ -448,7 +521,7 @@ namespace sbd {
 	}
 
 	auto time_start_davidson = std::chrono::high_resolution_clock::now();
-	sbd::BasisInitVector(W,adet,bdet,adet_comm_size,bdet_comm_size,h_comm,b_comm,t_comm,init);
+	sbd::BasisInitVector(W,adet,bdet,adet_comm_size,bdet_comm_size,h_comm,b_comm,t_comm,init,seed);
 #ifdef SBD_THRUST
 	if( method == 1 ) {
 		sbd::Davidson(hii, W, device_mult,
@@ -578,9 +651,12 @@ namespace sbd {
 
 	auto time_start_meas = std::chrono::high_resolution_clock::now();
 #ifdef SBD_THRUST
-	device_mult.correlation(W,
-		one_p_rdm,
-	    two_p_rdm);
+        {
+            SBD_NVTX_RANGE_COLOR("device_mult.correlation", __LINE__);
+            device_mult.correlation(W,
+                                    one_p_rdm,
+                                    two_p_rdm);
+        }
 #else
 	Correlation(W,adet,bdet,bit_length,L,
 		    adet_comm_size,bdet_comm_size,
@@ -758,8 +834,8 @@ namespace sbd {
 	bdet = adet;
       } else if ( do_shuffle == 1 ) {
 	if( mpi_rank == 0 ) {
-	  unsigned int seed = static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-	  sbd::ShuffleDet(adet,seed);
+	  unsigned int seeda = static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+	  sbd::ShuffleDet(adet,seeda);
 	}
 	sbd::MpiBcast(adet,0,comm);
 	bdet = adet;

@@ -9,6 +9,7 @@
 
 #define SBD_MAX_THREADS 192
 
+#include <chrono>
 #include <random>
 
 namespace sbd {
@@ -66,7 +67,7 @@ namespace sbd {
       RealT val, tmp;
       #pragma omp for schedule(static)
       for(size_t is=0; is < X.size(); is++) {
-        val = GetReal( Conjugate(X[is]) * X[is] ) - eps;
+        val = SquaredNorm(X[is]) - eps;
         tmp = mysum + val;
         eps = (tmp - mysum) - val;
         mysum = tmp;
@@ -97,30 +98,71 @@ namespace sbd {
     x = std::complex<double>(dist(gen),dist(gen));
   }
 
+// Hash (seed, global_element_index) -> uniform double in (-1,1).
+// Bijective mix based on splitmix64 finalizer; fast enough for per-element use.
+  static inline unsigned long long sbd_elem_hash(size_t seed, size_t idx) {
+    unsigned long long x = (unsigned long long)seed * 6364136223846793005ULL
+                         + (unsigned long long)idx  * 2862933555777941757ULL;
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+  }
+
+  static inline double sbd_hash_to_uniform(unsigned long long h) {
+    return (double)(h >> 11) * (2.0 / 9007199254740992.0) - 1.0;
+  }
+
+// Time+rank seed for the seed==0 case.  Uses MPI_COMM_WORLD rank so ranks
+// that share the same b_comm rank (e.g. rank 0 on different nodes) still
+// diverge.  No broadcast: random initialisation needs no cross-rank agreement.
+  static inline size_t sbd_time_seed() {
+    auto ns = static_cast<size_t>(
+      std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    return static_cast<size_t>(sbd_elem_hash(ns, static_cast<size_t>(rank)));
+  }
+
   template <typename ElemT>
-  void Randomize(std::vector<ElemT> & X,
+  void apply_dist_seeded(ElemT & x, size_t seed, size_t idx) {
+    x = ElemT(sbd_hash_to_uniform(sbd_elem_hash(seed, idx)));
+  }
+
+  template<>
+  void apply_dist_seeded(std::complex<double> & x, size_t seed, size_t idx) {
+    x = std::complex<double>(sbd_hash_to_uniform(sbd_elem_hash(seed, 2*idx)),
+                             sbd_hash_to_uniform(sbd_elem_hash(seed, 2*idx + 1)));
+  }
+
+  template <typename ElemT>
+  void Randomize(size_t seed,
+		 std::vector<ElemT> & X,
 		 MPI_Comm b_comm,
 		 MPI_Comm h_comm) {
+    if (seed == 0) seed = sbd_time_seed();
     using RealT = typename GetRealType<ElemT>::RealT;
     int mpi_size_h; MPI_Comm_size(h_comm,&mpi_size_h);
     int mpi_size_b; MPI_Comm_size(b_comm,&mpi_size_b);
     int nth = omp_get_max_threads();
     RealT array[SBD_MAX_THREADS];
     RealT sum=0.0;
+    unsigned long long global_offset = 0;
+    if (mpi_size_b > 1) {
+      unsigned long long local_size = (unsigned long long)X.size();
+      MPI_Exscan(&local_size, &global_offset, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, b_comm);
+    }
+// Deterministic by global element index: reproducible for any (nranks, nthreads).
 // use Kahan summation for each thread and add the private sums in deterministic order
     #pragma omp parallel
     {
-      unsigned int seed = static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-      std::mt19937 gen(seed);
-      std::uniform_real_distribution<RealT> dist(-1,1);
       int tid = omp_get_thread_num();
       RealT mysum = 0.0;
       RealT eps   = 0.0;
       RealT val, tmp;
       #pragma omp for schedule(static)
       for(size_t is=0; is < X.size(); is++) {
-	apply_dist(X[is],gen);
-        val = GetReal( Conjugate(X[is]) * X[is] ) - eps;
+        apply_dist_seeded(X[is], seed, (size_t)global_offset + is);
+        val = SquaredNorm(X[is]) - eps;
         tmp = mysum + val;
         eps = (tmp - mysum) - val;
         mysum = tmp;
@@ -149,27 +191,32 @@ namespace sbd {
   }
 
   template <typename ElemT>
-  void Randomize(std::vector<ElemT> & X,
+  void Randomize(size_t seed,
+		 std::vector<ElemT> & X,
 		 MPI_Comm b_comm) {
+    if (seed == 0) seed = sbd_time_seed();
     using RealT = typename GetRealType<ElemT>::RealT;
     int mpi_size_b; MPI_Comm_size(b_comm,&mpi_size_b);
     int nth = omp_get_max_threads();
     RealT array[SBD_MAX_THREADS];
     RealT sum=0.0;
+    unsigned long long global_offset = 0;
+    if (mpi_size_b > 1) {
+      unsigned long long local_size = (unsigned long long)X.size();
+      MPI_Exscan(&local_size, &global_offset, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, b_comm);
+    }
+// Deterministic by global element index: reproducible for any (nranks, nthreads).
 // use Kahan summation for each thread and add the private sums in deterministic order
     #pragma omp parallel
     {
-      unsigned int seed = static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-      std::mt19937 gen(seed);
-      std::uniform_real_distribution<RealT> dist(-1,1);
       int tid = omp_get_thread_num();
       RealT mysum = 0.0;
       RealT eps   = 0.0;
       RealT val, tmp;
       #pragma omp for schedule(static)
       for(size_t is=0; is < X.size(); is++) {
-	apply_dist(X[is],gen);
-        val = GetReal( Conjugate(X[is]) * X[is] ) - eps;
+        apply_dist_seeded(X[is], seed, (size_t)global_offset + is);
+        val = SquaredNorm(X[is]) - eps;
         tmp = mysum + val;
         eps = (tmp - mysum) - val;
         mysum = tmp;
@@ -192,7 +239,24 @@ namespace sbd {
       X[is] *= factor;
     }
   }
-  
+
+// Unseeded wrappers: pass seed=0, which the seeded implementations replace
+// with a local time+rank seed.  The first argument is std::vector so
+// these can never match the seeded overloads by accident (std::vector cannot
+// implicitly convert to size_t).
+  template <typename ElemT>
+  void Randomize(std::vector<ElemT> & X,
+		 MPI_Comm b_comm,
+		 MPI_Comm h_comm) {
+    Randomize(size_t(0), X, b_comm, h_comm);
+  }
+
+  template <typename ElemT>
+  void Randomize(std::vector<ElemT> & X,
+		 MPI_Comm b_comm) {
+    Randomize(size_t(0), X, b_comm);
+  }
+
   template <typename ElemT>
   void Swap(ElemT a, std::vector<ElemT> & X,
 	    ElemT b, std::vector<ElemT> & Y) {

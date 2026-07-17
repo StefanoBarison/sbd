@@ -1,0 +1,60 @@
+# Path to the SBD library
+SBD_PATH=../..
+
+# mpi c++ compiler
+# CCCOM=mpicxx
+# CCCOM=/opt/nvidia/hpc_sdk/Linux_x86_64/2025/comm_libs/mpi/bin/mpic++
+
+# flags for build: include path to openmp. The following is the case using homebrew's llvm on Mac
+# CCFLAGS= -std=c++17 -stdlib=libc++ -fopenmp -I/opt/homebrew/opt/llvm/include -O3
+
+
+# accelerate using Thrust
+# CCFLAGS= -mp -cuda -fast -Minfo=accel --diag_suppress declared_but_not_referenced,set_but_not_used -fmax-errors=0 -I/opt/nvidia/hpc_sdk/Linux_x86_64/2025/cuda/include/cccl -I/usr/local/cuda/include -DSBD_THRUST
+#-DSBD_PREFECT
+#-DSBD_DEBUG_MULT
+#-DSBD_THRUST_NO_COLLAPSE
+
+# Specify -gpu=mem:unified option on Grace Hopper environment (?)
+# std::vector between diag and mult will be lost without this option (???)
+# CCFLAGS= -cuda -Minfo=accel -gpu=mem:unified --diag_suppress declared_but_not_referenced,set_but_not_used -fmax-errors=0 -I/opt/nvidia/hpc_sdk/Linux_x86_64/2025/cuda/include/cccl -I/usr/local/cuda/include -DSBD_THRUST
+
+# CPU run
+#CCFLAGS= -mp --diag_suppress declared_but_not_referenced,set_but_not_used -fmax-errors=0 -I/opt/nvidia/hpc_sdk/Linux_x86_64/2025/cuda/include/cccl -I/usr/local/cuda/include -DSBD_DEBUG_MULT
+
+
+# flags for linking: include link to lapack and blas. The following s the case using homebrew's openblas on Mac
+# SYSLIB= -L/opt/homebrew/opt/openblas/lib -llapack -lblas
+# SYSLIB= -llapack -lblas
+
+### Example for the Fugaku
+# SBD_PATH=../../
+# CCCOM=mpiFCCpx
+# CCFLAGS= -Nclang -std=c++17 -stdlib=libc++ -Kfast,openmp -Xpreprocessor -fopenmp
+# SYSLIB= -SSL2
+#
+### Trad-mode for Fugaku
+# SBD_PATH=../../
+# CCCOM=mpiFCCpx
+# CCFLAGS= -std=c++17 -Kfast,openmp -DSBD_TRADMODE
+# SYSLIB= -SSL2
+
+# **** NVHPC ****
+CCCOM=mpic++
+CCFLAGS= -std=c++17 -mp -cuda -fast -Minfo=accel --diag_suppress declared_but_not_referenced,set_but_not_used -fmax-errors=0 -I/usr/local/cuda/include -DSBD_THRUST
+SYSLIB= -llapack -lblas
+# CCFLAGS+= -DNDEBUG
+# CCFLAGS+= -acc=gpu -gpu=maxregcount:64,ptxinfo
+CCFLAGS+= -DSBD_THRUST_SAFE_MPI_ALLREDUCE
+CCFLAGS+= -DSBD_USE_NVTX                     # Enable NVTX annotations for profiling (Nsight Systems)
+CCFLAGS+= -DSBD_USE_THRUST_NOSYNC            # Disable implicit sync in thrust execution to improve concurrency and performance
+CCFLAGS+= -DSBD_USE_NCCL                     # Enable NCCL-based GPU collective communication
+SYSLIB+= -lnccl
+CCFLAGS+= -DSBD_USE_CUBLAS                   # Enable cuBLAS for GPU-accelerated linear algebra operations
+SYSLIB+= -lcublas
+CCFLAGS+= -DSBD_USE_RANK_DISTRIBUTION        # Enable configurable MPI rank distribution strategy
+CCFLAGS+= -DSBD_USE_BLOCK_RANK_DISTRIBUTION  # With SBD_USE_RANK_DISTRIBUTION: use block (contiguous) assignment
+                                             # Otherwise: default is cyclic (strided) distribution
+# CCFLAGS+= -DSBD_USE_VECTORIZATION            # Enable vectorized execution (e.g., multi-element per thread)
+CCFLAGS+= -DSBD_REORDER_INDEX_ARRAY          # Apply block-based index reordering to improve data locality
+CCFLAGS+= -DSBD_USE_32BIT_PARITY             # Use 32-bit popcount-based parity to reduce cost and register pressure

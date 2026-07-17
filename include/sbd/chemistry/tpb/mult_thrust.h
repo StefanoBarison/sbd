@@ -8,6 +8,11 @@
 #include <chrono>
 #include <cstdio>
 
+#ifdef SBD_USE_NCCL
+#include <nccl.h>
+#endif
+
+#include "sbd/framework/nvtx.h"
 
 // per thread DetI, DetJ storage size (1GB max)
 #define MAX_DET_SIZE 134217728
@@ -54,7 +59,7 @@ public:
     void Init(
         const std::vector<std::vector<size_t>> &adets_in,
         const std::vector<std::vector<size_t>> &bdets_in,
-        const size_t bit_length_in,
+        const uint32_t bit_length_in,
         const size_t norbs_in,
         const size_t adet_comm_size_in,
         const size_t bdet_comm_size_in,
@@ -65,6 +70,13 @@ public:
         MPI_Comm h_comm_in,
         MPI_Comm b_comm_in,
         MPI_Comm t_comm_in,
+        MPI_Comm a_comm_in,
+#ifdef SBD_USE_NCCL
+        ncclComm_t h_nccl_comm,
+        ncclComm_t b_nccl_comm,
+        ncclComm_t t_nccl_comm,
+        ncclComm_t a_nccl_comm,
+#endif
         bool use_pre_dets,
         int max_gb_dets,
         bool collapse);
@@ -77,9 +89,9 @@ public:
 
     void makeQChamDiagTerms(thrust::device_vector<ElemT> &hii);
 
-	void correlation(const std::vector<ElemT> & w,
-				std::vector<std::vector<ElemT>> & onebody_out,
-				std::vector<std::vector<ElemT>> & twobody_out);
+    void correlation(const std::vector<ElemT> & w,
+                     std::vector<std::vector<ElemT>> & onebody_out,
+                     std::vector<std::vector<ElemT>> & twobody_out);
 };
 
 // contructor for Mult data
@@ -87,7 +99,7 @@ template <typename ElemT>
 void MultTPBThrust<ElemT>::Init(
     const std::vector<std::vector<size_t>> &adets_in,
     const std::vector<std::vector<size_t>> &bdets_in,
-    const size_t bit_length_in,
+    const uint32_t bit_length_in,
     const size_t norbs_in,
     const size_t adet_comm_size_in,
     const size_t bdet_comm_size_in,
@@ -96,12 +108,41 @@ void MultTPBThrust<ElemT>::Init(
     const oneInt<ElemT> &I1_in,
     const twoInt<ElemT> &I2_in,
     MPI_Comm h_comm_in,
-	MPI_Comm b_comm_in,
-	MPI_Comm t_comm_in,
+    MPI_Comm b_comm_in,
+    MPI_Comm t_comm_in,
+    MPI_Comm a_comm_in,
+#ifdef SBD_USE_NCCL
+    ncclComm_t h_nccl_comm,
+    ncclComm_t b_nccl_comm,
+    ncclComm_t t_nccl_comm,
+    ncclComm_t a_nccl_comm,
+#endif
     bool use_pre_dets,
     int max_gb_dets,
     bool collapse)
 {
+    SBD_NVTX_RANGE_COLOR("Init", __LINE__);
+
+#ifdef SBD_USE_RANK_DISTRIBUTION
+#ifdef SBD_USE_BLOCK_RANK_DISTRIBUTION
+    printf("[%s,%d] Block rank distribution enabled\n", __FILE__, __LINE__);
+#else
+    printf("[%s,%d] Cyclic (strided) rank distribution enabled\n", __FILE__, __LINE__);
+#endif
+#ifdef SBD_USE_VECTORIZATION
+    printf("[%s,%d] Vectorization enabled\n", __FILE__, __LINE__);
+#endif
+#endif
+
+#ifdef SBD_USE_32BIT_PARITY
+    printf("[%s,%d] 32-bit version of parity used (bit_length = %u)\n",
+           __FILE__, __LINE__, bit_length_in);
+    if (bit_length_in > 32) {
+        fprintf(stderr, "[ERROR] bit_length is too large for 32-bit version\n");
+        exit(-1);
+    }
+#endif
+
     this->bit_length_ = bit_length_in;
     this->norbs_ = norbs_in;
     this->D_size_ = (2 * norbs_in + bit_length_in - 1) / bit_length_in;
@@ -110,6 +151,13 @@ void MultTPBThrust<ElemT>::Init(
     this->h_comm_ = h_comm_in;
     this->b_comm_ = b_comm_in;
     this->t_comm_ = t_comm_in;
+    this->a_comm_ = a_comm_in;
+#ifdef SBD_USE_NCCL
+    this->h_nccl_comm_ = h_nccl_comm;
+    this->b_nccl_comm_ = b_nccl_comm;
+    this->t_nccl_comm_ = t_nccl_comm;
+    this->a_nccl_comm_ = a_nccl_comm;
+#endif
 
     adet_comm_size = adet_comm_size_in;
     bdet_comm_size = bdet_comm_size_in;
@@ -331,10 +379,6 @@ void MultTPBThrust<ElemT>::UpdateDet(size_t task)
     }
 }
 
-
-
-
-
 template <typename ElemT>
 class MultAlphaBeta : public MultKernelBase<ElemT>
 {
@@ -350,28 +394,127 @@ public:
         helper = h;
     }
 
-    // kernel entry point
-    __device__ __host__ void operator()(size_t i)
-    {
-        size_t j = i / helper.size_single_beta;
-        size_t k = i - j * helper.size_single_beta;
-
+    __device__ inline void loop_body(size_t i, int64_t& braIdx, ElemT& eij) {
+        braIdx = -1;
+        eij = 0;
+        size_t j = i / helper.size_single_beta;  // 0 .. size_single_alpha-1
+        size_t k = i % helper.size_single_beta;  // 0 .. size_single_beta-1
+        if (j >= helper.size_single_alpha) return;
         size_t ia = helper.SinglesFromAlphaBraIndex[j];
         size_t ja = helper.SinglesFromAlphaKetIndex[j];
         size_t ib = helper.SinglesFromBetaBraIndex[k];
         size_t jb = helper.SinglesFromBetaKetIndex[k];
-
-        size_t braIdx = (ia - helper.braAlphaStart) * (helper.braBetaEnd - helper.braBetaStart) + ib - helper.braBetaStart;
-        if( (braIdx % this->mpi_size_h) == this->mpi_rank_h ) {
+        braIdx = (ia - helper.braAlphaStart) * (helper.braBetaEnd - helper.braBetaStart) +
+                  ib - helper.braBetaStart;
+#ifndef SBD_USE_RANK_DISTRIBUTION
+        if( (braIdx % this->mpi_size_h) != this->mpi_rank_h ) return;
+#endif
+        size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+        eij = this->TwoExcite(
+            DetI,
+            helper.SinglesAlphaCrAnSM[j],
+            helper.SinglesBetaCrAnSM[k],
+            helper.SinglesAlphaCrAnSM[j + helper.size_single_alpha],
+            helper.SinglesBetaCrAnSM[k + helper.size_single_beta]);
+        if (eij != 0) {
             size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
-                            + jb - helper.ketBetaStart;
+                           + jb - helper.ketBetaStart;
+            eij *= this->T[ketIdx];
+        }
+    }        
 
-            size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+    // kernel entry point
+    __device__ __host__ void operator()(size_t i)
+    {
+        int64_t braIdx;
+        ElemT eij;
+        loop_body(i, braIdx, eij);
+        if (braIdx < 0 || eij == 0) return;
+        atomicAdd(this->Wb + braIdx, eij);
+    }
+};
 
-            ElemT eij = this->TwoExcite(DetI,
-                                        helper.SinglesAlphaCrAnSM[j], helper.SinglesBetaCrAnSM[k],
-                                        helper.SinglesAlphaCrAnSM[j + helper.size_single_alpha], helper.SinglesBetaCrAnSM[k + helper.size_single_beta]);
-            atomicAdd(this->Wb + braIdx, eij * this->T[ketIdx]);
+
+// NOTE: "Vec" here refers to processing multiple elements per thread (thread
+// coarsening), not SIMD vectorization. Memory accesses are not contiguous and
+// no vector instructions are used. The main purpose is to increase work per
+// thread and reduce the number of global atomic operations, as adjacent
+// elements often update the same memory locations and can be accumulated within
+// a thread before issuing a single atomic update.
+template <typename ElemT, int VecLen = 2>
+class MultAlphaBeta_Vec : public MultKernelBase<ElemT>
+{
+protected:
+    TaskHelpersThrust<ElemT> helper;
+public:
+    MultAlphaBeta_Vec(const TaskHelpersThrust<ElemT>& h,
+                      const thrust::device_vector<ElemT>& v_wb,
+                      const thrust::device_vector<ElemT>& v_t,
+                      const MultTPBThrust<ElemT>& data
+        ) : MultKernelBase<ElemT>(v_wb, v_t, data)
+    {
+        helper = h;
+    }
+
+    // NOTE: loop_body is intentionally duplicated in both MultAlphaBeta and
+    // MultAlphaBeta_Vec. While it would be cleaner to share the implementation
+    // via inheritance, doing so resulted in noticeable performance degradation,
+    // so the duplication is kept to preserve performance.
+    __device__ inline void loop_body(size_t i, int64_t& braIdx, ElemT& eij) {
+        braIdx = -1;
+        eij = 0;
+        size_t j = i / helper.size_single_beta;  // 0 .. size_single_alpha-1
+        size_t k = i % helper.size_single_beta;  // 0 .. size_single_beta-1
+        if (j >= helper.size_single_alpha) return;
+        size_t ia = helper.SinglesFromAlphaBraIndex[j];
+        size_t ja = helper.SinglesFromAlphaKetIndex[j];
+        size_t ib = helper.SinglesFromBetaBraIndex[k];
+        size_t jb = helper.SinglesFromBetaKetIndex[k];
+        braIdx = (ia - helper.braAlphaStart) * (helper.braBetaEnd - helper.braBetaStart) +
+                  ib - helper.braBetaStart;
+#ifndef SBD_USE_RANK_DISTRIBUTION
+        if( (braIdx % this->mpi_size_h) != this->mpi_rank_h ) return;
+#endif
+        size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+        eij = this->TwoExcite(
+            DetI,
+            helper.SinglesAlphaCrAnSM[j],
+            helper.SinglesBetaCrAnSM[k],
+            helper.SinglesAlphaCrAnSM[j + helper.size_single_alpha],
+            helper.SinglesBetaCrAnSM[k + helper.size_single_beta]);
+        if (eij != 0) {
+            size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
+                           + jb - helper.ketBetaStart;
+            eij *= this->T[ketIdx];
+        }
+    }        
+
+    // kernel entry point
+    __device__ __host__ void operator()(size_t i0)
+    {
+        size_t i = (VecLen * i0);
+        int64_t braIdx;
+        ElemT eij;
+        loop_body(i, braIdx, eij);
+        for (size_t i1 = 1; i1 < VecLen; i1++) {
+            i = (VecLen * i0) + i1;
+            int64_t braIdx_new;
+            ElemT eij_new;
+            loop_body(i, braIdx_new, eij_new);
+            if (braIdx == braIdx_new) {
+                if (braIdx >= 0) {
+                    eij += eij_new;
+                }
+                continue;
+            }
+            if ((braIdx >= 0) && (eij != 0)) {
+                atomicAdd(this->Wb + braIdx, eij);
+            }
+            braIdx = braIdx_new;
+            eij = eij_new;
+        }
+        if ((braIdx >= 0) && (eij != 0)) {
+            atomicAdd(this->Wb + braIdx, eij);
         }
     }
 };
@@ -404,15 +547,19 @@ public:
         size_t jb = ib;
 
         size_t braIdx = (ia - helper.braAlphaStart) * (helper.braBetaEnd - helper.braBetaStart) + ib - helper.braBetaStart;
-        if( (braIdx % this->mpi_size_h) == this->mpi_rank_h ) {
-            size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
-                            + jb - helper.ketBetaStart;
+#ifndef SBD_USE_RANK_DISTRIBUTION
+        if( (braIdx % this->mpi_size_h) != this->mpi_rank_h ) return;
+#endif
 
-            size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+        size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
+                       + jb - helper.ketBetaStart;
 
-            ElemT eij = this->OneExcite(DetI, helper.SinglesAlphaCrAnSM[j], helper.SinglesAlphaCrAnSM[j + helper.size_single_alpha]);
-            atomicAdd(this->Wb + braIdx, eij * this->T[ketIdx]);
-        }
+        size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+
+        ElemT eij = this->OneExcite(DetI, helper.SinglesAlphaCrAnSM[j], helper.SinglesAlphaCrAnSM[j + helper.size_single_alpha]);
+        if (eij == 0) return;
+
+        atomicAdd(this->Wb + braIdx, eij * this->T[ketIdx]);
     }
 };
 
@@ -441,18 +588,23 @@ public:
         size_t ja = helper.DoublesFromAlphaKetIndex[j];
         size_t ib = k + helper.braBetaStart;
         size_t jb = ib;
+
         size_t braIdx = (ia - helper.braAlphaStart) * (helper.braBetaEnd - helper.braBetaStart) + ib - helper.braBetaStart;
-        if( (braIdx % this->mpi_size_h) == this->mpi_rank_h ) {
-            size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
-                            + jb - helper.ketBetaStart;
+#ifndef SBD_USE_RANK_DISTRIBUTION
+        if( (braIdx % this->mpi_size_h) != this->mpi_rank_h ) return;
+#endif
 
-            size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+        size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
+                       + jb - helper.ketBetaStart;
 
-            ElemT eij = this->TwoExcite(DetI,
-                                        helper.DoublesAlphaCrAnSM[j], helper.DoublesAlphaCrAnSM[j + helper.size_double_alpha],
-                                        helper.DoublesAlphaCrAnSM[j + 2 * helper.size_double_alpha], helper.DoublesAlphaCrAnSM[j + 3 * helper.size_double_alpha]);
-            atomicAdd(this->Wb + braIdx, eij * this->T[ketIdx]);
-        }
+        size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+
+        ElemT eij = this->TwoExcite(DetI,
+                                    helper.DoublesAlphaCrAnSM[j], helper.DoublesAlphaCrAnSM[j + helper.size_double_alpha],
+                                    helper.DoublesAlphaCrAnSM[j + 2 * helper.size_double_alpha], helper.DoublesAlphaCrAnSM[j + 3 * helper.size_double_alpha]);
+        if (eij == 0) return;
+
+        atomicAdd(this->Wb + braIdx, eij * this->T[ketIdx]);
     }
 };
 
@@ -481,16 +633,21 @@ public:
         size_t ja = ia;
         size_t ib = helper.SinglesFromBetaBraIndex[k];
         size_t jb = helper.SinglesFromBetaKetIndex[k];
+
         size_t braIdx = (ia - helper.braAlphaStart) * (helper.braBetaEnd - helper.braBetaStart) + ib - helper.braBetaStart;
-        if( (braIdx % this->mpi_size_h) == this->mpi_rank_h ) {
-            size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
-                            + jb - helper.ketBetaStart;
+#ifndef SBD_USE_RANK_DISTRIBUTION
+        if( (braIdx % this->mpi_size_h) != this->mpi_rank_h ) return;
+#endif
 
-            size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+        size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
+                       + jb - helper.ketBetaStart;
 
-            ElemT eij = this->OneExcite(DetI, helper.SinglesBetaCrAnSM[k], helper.SinglesBetaCrAnSM[k + helper.size_single_beta]);
-            atomicAdd(this->Wb + braIdx, eij * this->T[ketIdx]);
-        }
+        size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+
+        ElemT eij = this->OneExcite(DetI, helper.SinglesBetaCrAnSM[k], helper.SinglesBetaCrAnSM[k + helper.size_single_beta]);
+        if (eij == 0) return;
+
+        atomicAdd(this->Wb + braIdx, eij * this->T[ketIdx]);
     }
 };
 
@@ -520,16 +677,293 @@ public:
         size_t ib = helper.DoublesFromBetaBraIndex[k];
         size_t jb = helper.DoublesFromBetaKetIndex[k];
         size_t braIdx = (ia - helper.braAlphaStart) * (helper.braBetaEnd - helper.braBetaStart) + ib - helper.braBetaStart;
-        if( (braIdx % this->mpi_size_h) == this->mpi_rank_h ) {
+#ifndef SBD_USE_RANK_DISTRIBUTION
+        if( (braIdx % this->mpi_size_h) != this->mpi_rank_h ) return;
+#endif
+
+        size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
+                       + jb - helper.ketBetaStart;
+
+        size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+
+        ElemT eij = this->TwoExcite(DetI,
+                                    helper.DoublesBetaCrAnSM[k], helper.DoublesBetaCrAnSM[k + helper.size_double_beta],
+                                    helper.DoublesBetaCrAnSM[k + 2 * helper.size_double_beta], helper.DoublesBetaCrAnSM[k + 3 * helper.size_double_beta]);
+        if (eij == 0) return;
+
+        atomicAdd(this->Wb + braIdx, eij * this->T[ketIdx]);
+    }
+};
+
+#define SB_MULT_ALPHA 0
+#define SB_MULT_BETA  1
+#define SB_MULT_SINGLE 0
+#define SB_MULT_DOUBLE 1
+
+// MultUnified unifies multiple kernel variants into a single template-based
+// implementation, allowing shared application of optimizations (e.g., thread
+// coarsening) and avoiding code duplication across individual kernels.
+template <typename ElemT, int AlphaOrBeta, int SingleOrDouble>
+class MultUnified : public MultKernelBase<ElemT>
+{
+protected:
+    TaskHelpersThrust<ElemT> helper;
+public:
+    MultUnified(const TaskHelpersThrust<ElemT>& h,
+                const thrust::device_vector<ElemT>& v_wb,
+                const thrust::device_vector<ElemT>& v_t,
+                const MultTPBThrust<ElemT>& data
+        ) : MultKernelBase<ElemT>(v_wb, v_t, data)
+    {
+        helper = h;
+    }
+
+    __device__ inline void loop_body(size_t i, int64_t& braIdx, ElemT& eij) {
+        braIdx = -1;
+        eij = 0;
+        size_t k;
+        size_t j;
+        size_t ia;
+        size_t ja;
+        size_t ib;
+        size_t jb;
+        if (AlphaOrBeta == SB_MULT_ALPHA) {
+            size_t braBetaSize = helper.braBetaEnd - helper.braBetaStart;
+            if (SingleOrDouble == SB_MULT_SINGLE) {
+                // SingleAlpha
+                k = i / helper.size_single_alpha;
+                j = i % helper.size_single_alpha;
+                ia = helper.SinglesFromAlphaBraIndex[j];
+                ja = helper.SinglesFromAlphaKetIndex[j];
+            } else {
+                // DoubleAlpha
+                k = i / helper.size_double_alpha;
+                j = i % helper.size_double_alpha;
+                ia = helper.DoublesFromAlphaBraIndex[j];
+                ja = helper.DoublesFromAlphaKetIndex[j];
+            }
+            ib = k + helper.braBetaStart;
+            jb = ib;
+            if (k >= braBetaSize) return;
+        } else {
+            size_t braAlphaSize = helper.braAlphaEnd - helper.braAlphaStart;
+            if (SingleOrDouble == SB_MULT_SINGLE) {
+                // SingleBeta
+                j = i / helper.size_single_beta;
+                k = i % helper.size_single_beta;
+                ib = helper.SinglesFromBetaBraIndex[k];
+                jb = helper.SinglesFromBetaKetIndex[k];
+            } else {
+                // DoubleBeta
+                j = i / helper.size_double_beta;
+                k = i % helper.size_double_beta;
+                ib = helper.DoublesFromBetaBraIndex[k];
+                jb = helper.DoublesFromBetaKetIndex[k];
+            }
+            ia = j + helper.braAlphaStart;
+            ja = ia;
+            if (j >= braAlphaSize) return;
+        }
+
+        braIdx = (ia - helper.braAlphaStart) * (helper.braBetaEnd - helper.braBetaStart)
+                + ib - helper.braBetaStart;
+#ifndef SBD_USE_RANK_DISTRIBUTION
+        if( (braIdx % this->mpi_size_h) != this->mpi_rank_h ) return;
+#endif
+        size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+        if (AlphaOrBeta == SB_MULT_ALPHA) {
+            if (SingleOrDouble == SB_MULT_SINGLE) {
+                // SingleAlpha
+                eij = this->OneExcite(
+                    DetI,
+                    helper.SinglesAlphaCrAnSM[j],
+                    helper.SinglesAlphaCrAnSM[j + helper.size_single_alpha]);
+            } else {
+                // DoubleAlpha
+                eij = this->TwoExcite(
+                    DetI,
+                    helper.DoublesAlphaCrAnSM[j],
+                    helper.DoublesAlphaCrAnSM[j + helper.size_double_alpha],
+                    helper.DoublesAlphaCrAnSM[j + 2 * helper.size_double_alpha],
+                    helper.DoublesAlphaCrAnSM[j + 3 * helper.size_double_alpha]);
+            }
+        } else {
+            if (SingleOrDouble == SB_MULT_SINGLE) {
+                // SingleBeta
+                eij = this->OneExcite(
+                    DetI,
+                    helper.SinglesBetaCrAnSM[k],
+                    helper.SinglesBetaCrAnSM[k + helper.size_single_beta]);
+            } else {
+                // DoubleBeta
+                eij = this->TwoExcite(
+                    DetI,
+                    helper.DoublesBetaCrAnSM[k],
+                    helper.DoublesBetaCrAnSM[k + helper.size_double_beta],
+                    helper.DoublesBetaCrAnSM[k + 2 * helper.size_double_beta],
+                    helper.DoublesBetaCrAnSM[k + 3 * helper.size_double_beta]);
+            }
+        }
+        if (eij != 0) {
             size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
-                            + jb - helper.ketBetaStart;
+                           + jb - helper.ketBetaStart;
+            eij *= this->T[ketIdx];
+        }
+    }
+    
+    // kernel entry point
+    __device__ void operator()(size_t i)
+    {
+        int64_t braIdx;
+        ElemT eij;
+        loop_body(i, braIdx, eij);
+        if ((braIdx < 0) || (eij == 0)) return;
+        atomicAdd(this->Wb + braIdx, eij);
+    }
+};
 
-            size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+// MultUnified_Vec extends MultUnified by applying thread coarsening (multiple
+// elements per thread). This is not SIMD vectorization; memory accesses are not
+// contiguous. The goal is to reduce global atomic operations by accumulating
+// contributions within a thread before issuing atomic updates.
+template <typename ElemT, int AlphaOrBeta, int SingleOrDouble, int VecLen = 2>
+class MultUnified_Vec : public MultKernelBase<ElemT>
+{
+protected:
+    TaskHelpersThrust<ElemT> helper;
+public:
+    MultUnified_Vec(const TaskHelpersThrust<ElemT>& h,
+                    const thrust::device_vector<ElemT>& v_wb,
+                    const thrust::device_vector<ElemT>& v_t,
+                    const MultTPBThrust<ElemT>& data
+        ) : MultKernelBase<ElemT>(v_wb, v_t, data)
+    {
+        helper = h;
+    }
+    
+    // NOTE: loop_body is intentionally duplicated in both MultUnified and
+    // MultUnified_Vec. While it would be cleaner to share the implementation
+    // via inheritance, doing so resulted in noticeable performance degradation,
+    // so the duplication is kept to preserve performance.
+    __device__ inline void loop_body(size_t i, int64_t& braIdx, ElemT& eij) {
+        braIdx = -1;
+        eij = 0;
+        size_t k;
+        size_t j;
+        size_t ia;
+        size_t ja;
+        size_t ib;
+        size_t jb;
+        if (AlphaOrBeta == SB_MULT_ALPHA) {
+            size_t braBetaSize = helper.braBetaEnd - helper.braBetaStart;
+            if (SingleOrDouble == SB_MULT_SINGLE) {
+                // SingleAlpha
+                k = i / helper.size_single_alpha;
+                j = i % helper.size_single_alpha;
+                ia = helper.SinglesFromAlphaBraIndex[j];
+                ja = helper.SinglesFromAlphaKetIndex[j];
+            } else {
+                // DoubleAlpha
+                k = i / helper.size_double_alpha;
+                j = i % helper.size_double_alpha;
+                ia = helper.DoublesFromAlphaBraIndex[j];
+                ja = helper.DoublesFromAlphaKetIndex[j];
+            }
+            ib = k + helper.braBetaStart;
+            jb = ib;
+            if (k >= braBetaSize) return;
+        } else {
+            size_t braAlphaSize = helper.braAlphaEnd - helper.braAlphaStart;
+            if (SingleOrDouble == SB_MULT_SINGLE) {
+                // SingleBeta
+                j = i / helper.size_single_beta;
+                k = i % helper.size_single_beta;
+                ib = helper.SinglesFromBetaBraIndex[k];
+                jb = helper.SinglesFromBetaKetIndex[k];
+            } else {
+                // DoubleBeta
+                j = i / helper.size_double_beta;
+                k = i % helper.size_double_beta;
+                ib = helper.DoublesFromBetaBraIndex[k];
+                jb = helper.DoublesFromBetaKetIndex[k];
+            }
+            ia = j + helper.braAlphaStart;
+            ja = ia;
+            if (j >= braAlphaSize) return;
+        }
 
-            ElemT eij = this->TwoExcite(DetI,
-                                        helper.DoublesBetaCrAnSM[k], helper.DoublesBetaCrAnSM[k + helper.size_double_beta],
-                                        helper.DoublesBetaCrAnSM[k + 2 * helper.size_double_beta], helper.DoublesBetaCrAnSM[k + 3 * helper.size_double_beta]);
-            atomicAdd(this->Wb + braIdx, eij * this->T[ketIdx]);
+        braIdx = (ia - helper.braAlphaStart) * (helper.braBetaEnd - helper.braBetaStart)
+                + ib - helper.braBetaStart;
+#ifndef SBD_USE_RANK_DISTRIBUTION
+        if( (braIdx % this->mpi_size_h) != this->mpi_rank_h ) return;
+#endif
+        size_t* DetI = this->det_I + ((ia - helper.braAlphaStart) * this->bdets_size + ib - helper.braBetaStart) * this->D_size;
+        if (AlphaOrBeta == SB_MULT_ALPHA) {
+            if (SingleOrDouble == SB_MULT_SINGLE) {
+                // SingleAlpha
+                eij = this->OneExcite(
+                    DetI,
+                    helper.SinglesAlphaCrAnSM[j],
+                    helper.SinglesAlphaCrAnSM[j + helper.size_single_alpha]);
+            } else {
+                // DoubleAlpha
+                eij = this->TwoExcite(
+                    DetI,
+                    helper.DoublesAlphaCrAnSM[j],
+                    helper.DoublesAlphaCrAnSM[j + helper.size_double_alpha],
+                    helper.DoublesAlphaCrAnSM[j + 2 * helper.size_double_alpha],
+                    helper.DoublesAlphaCrAnSM[j + 3 * helper.size_double_alpha]);
+            }
+        } else {
+            if (SingleOrDouble == SB_MULT_SINGLE) {
+                // SingleBeta
+                eij = this->OneExcite(
+                    DetI,
+                    helper.SinglesBetaCrAnSM[k],
+                    helper.SinglesBetaCrAnSM[k + helper.size_single_beta]);
+            } else {
+                // DoubleBeta
+                eij = this->TwoExcite(
+                    DetI,
+                    helper.DoublesBetaCrAnSM[k],
+                    helper.DoublesBetaCrAnSM[k + helper.size_double_beta],
+                    helper.DoublesBetaCrAnSM[k + 2 * helper.size_double_beta],
+                    helper.DoublesBetaCrAnSM[k + 3 * helper.size_double_beta]);
+            }
+        }
+        if (eij != 0) {
+            size_t ketIdx = (ja - helper.ketAlphaStart) * (helper.ketBetaEnd - helper.ketBetaStart)
+                           + jb - helper.ketBetaStart;
+            eij *= this->T[ketIdx];
+        }
+    }
+    
+    // kernel entry point
+    __device__ void operator()(size_t i0)
+    {
+        size_t i = (VecLen * i0);
+        int64_t braIdx;
+        ElemT eij;
+        loop_body(i, braIdx, eij);
+        for (size_t i1 = 1; i1 < VecLen; i1++) {
+            i = (VecLen * i0) + i1;
+            int64_t braIdx_new;
+            ElemT eij_new;
+            loop_body(i, braIdx_new, eij_new);
+            if (braIdx == braIdx_new) {
+                if (braIdx >= 0) {
+                    eij += eij_new;
+                }
+                continue;
+            }
+            if ((braIdx >= 0) && (eij != 0)) {
+                atomicAdd(this->Wb + braIdx, eij);
+            }
+            braIdx = braIdx_new;
+            eij = eij_new;
+        }
+        if ((braIdx >= 0) && (eij != 0)) {
+            atomicAdd(this->Wb + braIdx, eij);
         }
     }
 };
@@ -759,6 +1193,11 @@ void MultTPBThrust<ElemT>::run(
     MPI_Comm_size(this->t_comm_, &mpi_size_t);
     int mpi_rank_t;
     MPI_Comm_rank(this->t_comm_, &mpi_rank_t);
+    int mpi_size_a;
+    MPI_Comm_size(this->a_comm_, &mpi_size_a);
+    int mpi_rank_a;
+    MPI_Comm_rank(this->a_comm_, &mpi_rank_a);
+
     size_t braAlphaSize = 0;
     size_t braBetaSize = 0;
 
@@ -791,11 +1230,15 @@ void MultTPBThrust<ElemT>::run(
 
     if (mpi_rank_t == 0) {
         auto ci = thrust::counting_iterator<size_t>(0);
-        thrust::for_each_n(thrust::device, ci, T[active_T].size(), Wb_init_kernel(Wb, hii, T[active_T]));
+        {
+            SBD_NVTX_RANGE_COLOR("thrust::for_each_n", __LINE__);
+            thrust::for_each_n(thrust::device, ci, T[active_T].size(), Wb_init_kernel(Wb, hii, T[active_T]));
+        }
     }
 
     double time_slid = 0.0;
     for (size_t task = 0; task < helper.size(); task++) {
+        SBD_NVTX_RANGE_COLOR("for (size_t task ...", __LINE__ + task);
 #ifdef SBD_DEBUG_MULT
         auto time_task_start = std::chrono::high_resolution_clock::now();
         std::cout << " Start multiplication for task " << task << " at (h,b,t) = ("
@@ -861,41 +1304,178 @@ void MultTPBThrust<ElemT>::run(
             UpdateDet(task);
 
             if (helper[task].taskType == 2) {
+                // SingleAlpha
                 size = helper[task].size_single_alpha * braBetaSize;
+#ifndef SBD_USE_RANK_DISTRIBUTION
                 MultSingleAlpha single_kernel(helper[task], Wb, T[active_T], *this);
                 single_kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
-
                 auto cis = thrust::counting_iterator<size_t>(0);
-                thrust::for_each_n(thrust::device, cis, size, single_kernel);
+#else // #ifndef SBD_USE_RANK_DISTRIBUTION
+                size = (size + mpi_size_h - 1) / mpi_size_h;
+#ifndef SBD_USE_VECTORIZATION
+                MultUnified<ElemT, SB_MULT_ALPHA, SB_MULT_SINGLE>
+                    single_kernel(helper[task], Wb, T[active_T], *this);
+#else
+                constexpr int VecLenS = 2;
+                size = (size + VecLenS - 1) / VecLenS;
+                MultUnified_Vec<ElemT, SB_MULT_ALPHA, SB_MULT_SINGLE, VecLenS>
+                    single_kernel(helper[task], Wb, T[active_T], *this);
+#endif
+                single_kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
+                auto cis = thrust::make_transform_iterator(
+                    thrust::counting_iterator<size_t>(0),
+                    [=] __host__ __device__ (size_t t) {
+#ifdef SBD_USE_BLOCK_RANK_DISTRIBUTION
+                        // Contiguous block distribution
+                        return t + (size * mpi_rank_h);
+#else
+                        // Cyclic (strided) distribution
+                        return mpi_rank_h + (mpi_size_h * t);
+#endif
+                    });
+#endif // #ifndef SBD_USE_RANK_DISTRIBUTION
+                {
+                    SBD_NVTX_RANGE_COLOR("thrust::for_each_n", __LINE__);
+                    thrust::for_each_n(thrust::device, cis, size, single_kernel);
+                }
 
+                // DoubleAlpha
                 size = helper[task].size_double_alpha * braBetaSize;
+#ifndef SBD_USE_RANK_DISTRIBUTION
                 MultDoubleAlpha double_kernel(helper[task], Wb, T[active_T], *this);
                 double_kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
-
                 auto cid = thrust::counting_iterator<size_t>(0);
-                thrust::for_each_n(thrust::device, cid, size, double_kernel);
+#else // #ifndef SBD_USE_RANK_DISTRIBUTION
+                size = (size + mpi_size_h - 1) / mpi_size_h;
+#ifndef SBD_USE_VECTORIZATION
+                MultUnified<ElemT, SB_MULT_ALPHA, SB_MULT_DOUBLE>
+                    double_kernel(helper[task], Wb, T[active_T], *this);
+#else
+                constexpr int VecLenD = 2;
+                size = (size + VecLenD - 1) / VecLenD;
+                MultUnified_Vec<ElemT, SB_MULT_ALPHA, SB_MULT_DOUBLE, VecLenD>
+                    double_kernel(helper[task], Wb, T[active_T], *this);
+#endif
+                double_kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
+                auto cid = thrust::make_transform_iterator(
+                    thrust::counting_iterator<size_t>(0),
+                    [=] __host__ __device__ (size_t t) {
+#ifdef SBD_USE_BLOCK_RANK_DISTRIBUTION
+                        // Contiguous block distribution
+                        return t + (size * mpi_rank_h);
+#else
+                        // Cyclic (strided) distribution
+                        return mpi_rank_h + (mpi_size_h * t);
+#endif
+                    });
+#endif // #ifndef SBD_USE_RANK_DISTRIBUTION
+                {
+                    SBD_NVTX_RANGE_COLOR("thrust::for_each_n", __LINE__);
+                    thrust::for_each_n(thrust::device, cid, size, double_kernel);
+                }
             } else if(helper[task].taskType == 1) {
+                // SingleBeta
                 size = helper[task].size_single_beta * braAlphaSize;
+#ifndef SBD_USE_RANK_DISTRIBUTION
                 MultSingleBeta single_kernel(helper[task], Wb, T[active_T], *this);
                 single_kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
-
                 auto cis = thrust::counting_iterator<size_t>(0);
-                thrust::for_each_n(thrust::device, cis, size, single_kernel);
+#else // #ifndef SBD_USE_RANK_DISTRIBUTION
+                size = (size + mpi_size_h - 1) / mpi_size_h;
+#ifndef SBD_USE_VECTORIZATION
+                MultUnified<ElemT, SB_MULT_BETA, SB_MULT_SINGLE>
+                    single_kernel(helper[task], Wb, T[active_T], *this);
+#else
+                constexpr int VecLenS = 2;
+                size = (size + VecLenS - 1) / VecLenS;
+                MultUnified_Vec<ElemT, SB_MULT_BETA, SB_MULT_SINGLE, VecLenS>
+                    single_kernel(helper[task], Wb, T[active_T], *this);
+#endif
+                single_kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
+                auto cis = thrust::make_transform_iterator(
+                    thrust::counting_iterator<size_t>(0),
+                    [=] __host__ __device__ (size_t t) {
+#ifdef SBD_USE_BLOCK_RANK_DISTRIBUTION
+                        // Contiguous block distribution
+                        return t + (size * mpi_rank_h);
+#else
+                        // Cyclic (strided) distribution
+                        return mpi_rank_h + (mpi_size_h * t);
+#endif
+                    });
+#endif // #ifndef SBD_USE_RANK_DISTRIBUTION
+                {
+                    SBD_NVTX_RANGE_COLOR("thrust::for_each_n", __LINE__);
+                    thrust::for_each_n(thrust::device, cis, size, single_kernel);
+                }
 
+                // DoubleBeta
                 size = helper[task].size_double_beta * braAlphaSize;
+#ifndef SBD_USE_RANK_DISTRIBUTION
                 MultDoubleBeta double_kernel(helper[task], Wb, T[active_T], *this);
                 double_kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
-
                 auto cid = thrust::counting_iterator<size_t>(0);
-                thrust::for_each_n(thrust::device, cid, size, double_kernel);
+#else // #ifndef SBD_USE_RANK_DISTRIBUTION
+                size = (size + mpi_size_h - 1) / mpi_size_h;
+#ifndef SBD_USE_VECTORIZATION
+                MultUnified<ElemT, SB_MULT_BETA, SB_MULT_DOUBLE>
+                    double_kernel(helper[task], Wb, T[active_T], *this);
+#else
+                constexpr int VecLenD = 2;
+                size = (size + VecLenD - 1) / VecLenD;
+                MultUnified_Vec<ElemT, SB_MULT_BETA, SB_MULT_DOUBLE, VecLenD>
+                    double_kernel(helper[task], Wb, T[active_T], *this);
+#endif
+                double_kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
+                auto cid = thrust::make_transform_iterator(
+                    thrust::counting_iterator<size_t>(0),
+                    [=] __host__ __device__ (size_t t) {
+#ifdef SBD_USE_BLOCK_RANK_DISTRIBUTION
+                        // Contiguous block distribution
+                        return t + (size * mpi_rank_h);
+#else
+                        // Cyclic (strided) distribution
+                        return mpi_rank_h + (mpi_size_h * t);
+#endif
+                    });
+#endif // #ifndef SBD_USE_RANK_DISTRIBUTION
+                {
+                    SBD_NVTX_RANGE_COLOR("thrust::for_each_n", __LINE__);
+                    thrust::for_each_n(thrust::device, cid, size, double_kernel);
+                }
             } else {
+                //
                 size = helper[task].size_single_alpha * helper[task].size_single_beta;
-
+#ifndef SBD_USE_RANK_DISTRIBUTION
                 MultAlphaBeta kernel(helper[task], Wb, T[active_T], *this);
                 kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
-
                 auto ci = thrust::counting_iterator<size_t>(0);
-                thrust::for_each_n(thrust::device, ci, size, kernel);
+#else // #ifndef SBD_USE_RANK_DISTRIBUTION
+                size = (size + mpi_size_h - 1) / mpi_size_h;
+#ifndef SBD_USE_VECTORIZATION
+                MultAlphaBeta kernel(helper[task], Wb, T[active_T], *this);
+#else
+                constexpr int VecLen = 2;
+                size = (size + VecLen - 1) / VecLen;
+                MultAlphaBeta_Vec<ElemT, VecLen> kernel(helper[task], Wb, T[active_T], *this);
+#endif
+                kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
+                auto ci = thrust::make_transform_iterator(
+                    thrust::counting_iterator<size_t>(0),
+                    [=] __host__ __device__ (size_t t) {
+#ifdef SBD_USE_BLOCK_RANK_DISTRIBUTION
+                        // Contiguous block distribution
+                        return t + (size * mpi_rank_h);
+#else
+                        // Cyclic (strided) distribution
+                        return mpi_rank_h + (mpi_size_h * t);
+#endif
+                    });
+#endif // #ifndef SBD_USE_RANK_DISTRIBUTION
+                {
+                    SBD_NVTX_RANGE_COLOR("thrust::for_each_n", __LINE__);
+                    thrust::for_each_n(thrust::device, ci, size, kernel);
+                }
             }
         } else {
             size = braAlphaSize * braBetaSize;
@@ -916,7 +1496,10 @@ void MultTPBThrust<ElemT>::run(
                     kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
 
                     auto ci = thrust::counting_iterator<size_t>(0);
-                    thrust::for_each_n(thrust::device, ci, num_threads, kernel);
+                    {
+                        SBD_NVTX_RANGE_COLOR("thrust::for_each_n", __LINE__);
+                        thrust::for_each_n(thrust::device, ci, num_threads, kernel);
+                    }
                     offset += num_threads;
                 }
             } else if(helper[task].taskType == 1) {
@@ -931,7 +1514,10 @@ void MultTPBThrust<ElemT>::run(
                     kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
 
                     auto ci = thrust::counting_iterator<size_t>(0);
-                    thrust::for_each_n(thrust::device, ci, num_threads, kernel);
+                    {
+                        SBD_NVTX_RANGE_COLOR("thrust::for_each_n", __LINE__);
+                        thrust::for_each_n(thrust::device, ci, num_threads, kernel);
+                    }
                     offset += num_threads;
                 }
             } else {
@@ -946,7 +1532,10 @@ void MultTPBThrust<ElemT>::run(
                     kernel.set_mpi_size(mpi_rank_h, mpi_size_h);
 
                     auto ci = thrust::counting_iterator<size_t>(0);
-                    thrust::for_each_n(thrust::device, ci, num_threads, kernel);
+                    {
+                        SBD_NVTX_RANGE_COLOR("thrust::for_each_n", __LINE__);
+                        thrust::for_each_n(thrust::device, ci, num_threads, kernel);
+                    }
                     offset += num_threads;
                 }
             }
@@ -962,10 +1551,18 @@ void MultTPBThrust<ElemT>::run(
     auto time_mult_end = std::chrono::high_resolution_clock::now();
 
     auto time_comm_start = std::chrono::high_resolution_clock::now();
-    if (mpi_size_t > 1)
+#ifdef SBD_USE_NCCL
+    if (mpi_size_a > 1) {
+        nccl_allreduce(Wb, ncclSum, this->a_nccl_comm_);
+    }
+#else
+    if (mpi_size_t > 1) {
         MpiAllreduce(Wb, MPI_SUM, this->t_comm_);
-    if (mpi_size_h > 1)
+    }
+    if (mpi_size_h > 1) {
         MpiAllreduce(Wb, MPI_SUM, this->h_comm_);
+    }
+#endif
     auto time_comm_end = std::chrono::high_resolution_clock::now();
 
 #ifdef SBD_DEBUG_MULT

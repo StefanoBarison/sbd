@@ -18,7 +18,8 @@ namespace sbd {
 		      MPI_Comm h_comm,
 		      MPI_Comm b_comm,
 		      MPI_Comm t_comm,
-		      int init) {
+		      int init,
+		      size_t seed) {
     int mpi_rank_h; MPI_Comm_rank(h_comm,&mpi_rank_h);
     int mpi_size_h; MPI_Comm_size(h_comm,&mpi_size_h);
     int mpi_rank_b; MPI_Comm_rank(b_comm,&mpi_rank_b);
@@ -28,7 +29,7 @@ namespace sbd {
     if( init == 0 ) {
       if( mpi_rank_t == 0 ) {
 	w.resize(basis.size());
-	Randomize(w,b_comm,h_comm);
+	Randomize(seed,w,b_comm,h_comm);
       }
       MpiBcast(w,0,t_comm);
     }
@@ -48,7 +49,8 @@ namespace sbd {
 		int max_iteration,
 		int num_block,
 		int num_initvec,
-		RealT eps) {
+		RealT eps,
+		size_t seed) {
 
     // RealT eps_reg = 1.0e-12;
     size_t w_size = W.size();
@@ -88,7 +90,7 @@ namespace sbd {
 	if( mpi_rank_t == 0 ) {
 	  if( mpi_rank_h == 0 ) {
 	    V[iv].resize(w_size);
-	    Randomize(V[iv],b_comm);
+	    Randomize(seed+iv,V[iv],b_comm);
 	    MGS(V,iv,V[iv],vdot,b_comm);
 	    MGS(V,iv,V[iv],vdot,b_comm);
 	    Normalize(V[iv],vnrm,b_comm);
@@ -106,7 +108,7 @@ namespace sbd {
 	  C[iv][is] = V[iv][is];
 	}
       }
-      
+
       for(int ib=0; ib < nb; ib++) {
 	Zero(HC[ib]);
 	mult(hii,C[ib],HC[ib],
@@ -248,7 +250,8 @@ namespace sbd {
 		int max_iteration,
 		int num_block,
 		int num_initvec,
-		RealT eps) {
+		RealT eps,
+		size_t seed) {
 
     // RealT eps_reg = 1.0e-12;
     size_t w_size = W.size();
@@ -288,7 +291,7 @@ namespace sbd {
 	if( mpi_rank_t == 0 ) {
 	  if( mpi_rank_h == 0 ) {
 	    V[iv].resize(w_size);
-	    Randomize(V[iv],b_comm);
+	    Randomize(seed+iv,V[iv],b_comm);
 	    MGS(V,iv,V[iv],vdot,b_comm);
 	    MGS(V,iv,V[iv],vdot,b_comm);
 	    Normalize(V[iv],vnrm,b_comm);

@@ -28,10 +28,30 @@ namespace sbd {
   template <typename T> inline __host__ __device__ T Conjugate(T a) { return a; }
   template<> inline __host__ __device__ std::complex<float> Conjugate(std::complex<float> a) { return std::conj(a); }
   template<> inline __host__ __device__ std::complex<double> Conjugate(std::complex<double> a) { return std::conj(a); }
+
+  // sbd::SquaredNorm: squared magnitude, safe for GPU device code.
+  // std::norm(complex<T>) dispatches through _Norm_helper which calls std::abs
+  // (hypot), untranslatable by nvc++. These overloads use direct arithmetic.
+  template <typename T> inline __host__ __device__ T SquaredNorm(T x) { return x * x; }
+  template <typename T> inline __host__ __device__ T SquaredNorm(const std::complex<T>& x)
+  { return x.real() * x.real() + x.imag() * x.imag(); }
+
+  // sbd::conj: conjugate, safe for GPU device code.
+  template <typename T> inline __host__ __device__ T conj(T x) { return x; }
+  template <typename T> inline __host__ __device__ std::complex<T> conj(const std::complex<T>& x)
+  { return std::complex<T>(x.real(), -x.imag()); }
 #else
   template <typename T> inline T Conjugate(T a) { return a; }
   template<> inline std::complex<float> Conjugate(std::complex<float> a) { return std::conj(a); }
   template<> inline std::complex<double> Conjugate(std::complex<double> a) { return std::conj(a); }
+
+  template <typename T> inline T SquaredNorm(T x) { return x * x; }
+  template <typename T> inline T SquaredNorm(const std::complex<T>& x)
+  { return x.real() * x.real() + x.imag() * x.imag(); }
+
+  template <typename T> inline T conj(T x) { return x; }
+  template <typename T> inline std::complex<T> conj(const std::complex<T>& x)
+  { return std::complex<T>(x.real(), -x.imag()); }
 #endif
 
   template <typename T> struct GetMpiType { static MPI_Datatype MpiT; };
@@ -39,6 +59,7 @@ namespace sbd {
   template<> inline MPI_Datatype GetMpiType<double>::MpiT = MPI_DOUBLE;
   template<> inline MPI_Datatype GetMpiType<std::complex<float>>::MpiT = MPI_CXX_FLOAT_COMPLEX;
   template<> inline MPI_Datatype GetMpiType<std::complex<double>>::MpiT = MPI_CXX_DOUBLE_COMPLEX;
+  template<> inline MPI_Datatype GetMpiType<uint32_t>::MpiT = MPI_UINT32_T;
 
 #if SIZE_MAX == UCHAR_MAX
   #define SBD_MPI_SIZE_T MPI_UNSIGNED_CHAR

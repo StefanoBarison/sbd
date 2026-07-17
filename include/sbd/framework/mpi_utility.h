@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "mpi.h"
+#include "sbd/framework/det_vector.h"
 
 namespace sbd {
 
@@ -40,7 +41,8 @@ namespace sbd {
     i_end = j_end;
   }
 
-  template <typename ElemT>
+  template <typename ElemT,
+            std::enable_if_t<std::is_trivially_copyable_v<ElemT>, int> = 0>
   void MpiSend(const std::vector<ElemT> & data, int dest, MPI_Comm comm) {
     size_t d_size = data.size();
     MPI_Send(&d_size,1,SBD_MPI_SIZE_T,dest,0,comm);
@@ -50,7 +52,8 @@ namespace sbd {
     }
   }
 
-  template <typename ElemT>
+  template <typename ElemT,
+            std::enable_if_t<std::is_trivially_copyable_v<ElemT>, int> = 0>
   void MpiRecv(std::vector<ElemT> & data, int source, MPI_Comm comm) {
     MPI_Status status;
     size_t d_size;
@@ -85,7 +88,8 @@ namespace sbd {
     }
   }
   
-  template <typename ElemT>
+  template <typename ElemT,
+            std::enable_if_t<std::is_trivially_copyable_v<ElemT>, int> = 0>
   void MpiBcast(std::vector<ElemT> & data, int root, MPI_Comm comm) {
     size_t d_size;
     int mpi_rank; MPI_Comm_rank(comm,&mpi_rank);
@@ -101,8 +105,12 @@ namespace sbd {
     MPI_Bcast(data.data(),d_size,DataT,root,comm);
   }
   
-  template <>
-  void MpiSend(const std::vector<std::vector<size_t>> & config, int dest, MPI_Comm comm) {
+  // MpiSend/MpiRecv/MpiBcast for 2D containers (vvs and det_vector<ElemT>).
+  // Container::value_type is non-trivially-copyable (a row or inner vector),
+  // which disambiguates from the 1D std::vector<ElemT> overloads above.
+  template<typename Container,
+           std::enable_if_t<!std::is_trivially_copyable_v<typename Container::value_type>, int> = 0>
+  void MpiSend(const Container& config, int dest, MPI_Comm comm) {
     size_t c_num = config.size();
     MPI_Send(&c_num,1,SBD_MPI_SIZE_T,dest,0,comm);
     if( c_num != 0 ) {
@@ -118,9 +126,10 @@ namespace sbd {
       MPI_Send(config_send.data(),total_size,SBD_MPI_SIZE_T,dest,2,comm);
     }
   }
-  
-  template <>
-  void MpiRecv(std::vector<std::vector<size_t>> & config, int source, MPI_Comm comm) {
+
+  template<typename Container,
+           std::enable_if_t<!std::is_trivially_copyable_v<typename Container::value_type>, int> = 0>
+  void MpiRecv(Container& config, int source, MPI_Comm comm) {
     MPI_Status status;
     size_t c_num;
     MPI_Recv(&c_num,1,SBD_MPI_SIZE_T,source,0,comm,&status);
@@ -130,7 +139,8 @@ namespace sbd {
       size_t total_size = c_num*c_len;
       std::vector<size_t> config_recv(total_size);
       MPI_Recv(config_recv.data(),total_size,SBD_MPI_SIZE_T,source,2,comm,&status);
-      config = std::vector<std::vector<size_t>>(c_num,std::vector<size_t>(c_len));
+      config.resize(c_num);
+      for(size_t n=0; n < c_num; n++) config[n].resize(c_len);
       for(size_t n=0; n < c_num; n++) {
 	for(size_t i=0; i < c_len; i++) {
 	  config[n][i] = config_recv[i+c_len*n];
@@ -139,60 +149,9 @@ namespace sbd {
     }
   }
 
-  template <>
-  void MpiIsend(const std::vector<std::vector<size_t>> & config, int dest, MPI_Comm comm) {
-    int mpi_rank; MPI_Comm_rank(comm,&mpi_rank);
-    std::cout << " MpiIsend for std::vector<std::vector<size_t>> is called at rank " << mpi_rank;
-    MPI_Request req;
-    size_t c_num = config.size();
-    std::cout << " c_num = " << c_num;
-    MPI_Isend(&c_num,1,SBD_MPI_SIZE_T,dest,0,comm,&req);
-    if( c_num != 0 ) {
-      size_t c_len = config[0].size();
-      std::cout << " c_len = " << c_len;
-      MPI_Isend(&c_len,1,SBD_MPI_SIZE_T,dest,1,comm,&req);
-      size_t total_size = c_num*c_len;
-      std::cout << " total size = " << total_size;
-      std::vector<size_t> config_send(total_size);
-      for(size_t n=0; n < c_num; n++) {
-	for(size_t i=0; i < c_len; i++) {
-	  config_send[i+c_len*n] = config[n][i];
-	}
-      }
-      MPI_Isend(config_send.data(),total_size,SBD_MPI_SIZE_T,dest,2,comm,&req);
-    }
-    std::cout << std::endl;
-  }
-
-  template <>
-  void MpiIrecv(std::vector<std::vector<size_t>> & config, int source, MPI_Comm comm) {
-    int mpi_rank; MPI_Comm_rank(comm,&mpi_rank);
-    std::cout << " MpiIrecv for std::vector<std::vector<size_t>> is called at rank "
-	      << mpi_rank;
-    MPI_Request req;
-    size_t c_num;
-    MPI_Irecv(&c_num,1,SBD_MPI_SIZE_T,source,0,comm,&req);
-    std::cout << " c_num = " << c_num;
-    if( c_num != 0 ) {
-      size_t c_len;
-      MPI_Irecv(&c_len,1,SBD_MPI_SIZE_T,source,1,comm,&req);
-      std::cout << " c_len = " << c_len << std::endl;
-      size_t total_size = c_num*c_len;
-      std::cout << " total size = " << total_size << std::endl;
-      std::vector<size_t> config_recv(total_size);
-      MPI_Irecv(config_recv.data(),total_size,SBD_MPI_SIZE_T,source,2,comm,&req);
-      config.resize(c_num,std::vector<size_t>(c_len));
-      for(size_t n=0; n < c_num; n++) {
-	for(size_t i=0; i < c_len; i++) {
-	  config[n][i] = config_recv[i+c_len*n];
-	}
-      }
-    }
-  }
-  
-  
-  template <>
-  void MpiBcast(std::vector<std::vector<size_t>> & config,
+  template<typename Container,
+           std::enable_if_t<!std::is_trivially_copyable_v<typename Container::value_type>, int> = 0>
+  void MpiBcast(Container& config,
 		int root,
 		MPI_Comm comm) {
 
@@ -204,7 +163,7 @@ namespace sbd {
     }
     MPI_Bcast(&c_num,1,SBD_MPI_SIZE_T,root,comm);
     if( c_num != 0 ) {
-      
+
       size_t c_len;
       if( mpi_rank == root ) {
 	c_len = config[0].size();
@@ -221,7 +180,8 @@ namespace sbd {
       }
       MPI_Bcast(config_transfer.data(),static_cast<int>(total_size),SBD_MPI_SIZE_T,root,comm);
       if( mpi_rank != root ) {
-	config = std::vector<std::vector<size_t>>(c_num,std::vector<size_t>(c_len));
+	config.resize(c_num);
+	for(size_t n=0; n < c_num; n++) config[n].resize(c_len);
 	for(size_t n=0; n < c_num; n++) {
 	  for(size_t i=0; i < c_len; i++) {
 	    config[n][i] = config_transfer[i+c_len*n];
@@ -230,7 +190,7 @@ namespace sbd {
       }
     }
   }
-  
+
   template <typename ElemT>
   void MpiIncSlide(const std::vector<ElemT> & A,
 		   std::vector<ElemT> & B,
@@ -321,7 +281,8 @@ namespace sbd {
     }
   }
 
-  template <typename ElemT>
+  template <typename ElemT,
+            std::enable_if_t<std::is_trivially_copyable_v<ElemT>, int> = 0>
   void MpiSlide(const std::vector<ElemT> & A,
 		std::vector<ElemT> & B,
 		int slide,
@@ -366,21 +327,21 @@ namespace sbd {
   }
 
   
-
-  template <>
-  void MpiSlide(const std::vector<std::vector<size_t>> & A,
-		std::vector<std::vector<size_t>> & B,
-		int slide,
-		MPI_Comm comm) {
+  // MpiSlide for 2D containers (vvs and det_vector) with caller-supplied flat scratch buffers.
+  // When the same scratch vectors are reused across calls, resize() is a no-op on subsequent
+  // calls of equal size, avoiding repeated zero-initialization.
+  // In-place (A aliases B) is safe: A is fully packed into scratch_send before B is modified.
+  template<typename Container>
+  void MpiSlideWithScratch(const Container& A, Container& B, int slide, MPI_Comm comm,
+                            std::vector<size_t>& scratch_send,
+                            std::vector<size_t>& scratch_recv) {
     int mpi_rank; MPI_Comm_rank(comm,&mpi_rank);
     int mpi_size; MPI_Comm_size(comm,&mpi_size);
     int mpi_dest   = (mpi_size+mpi_rank+slide) % mpi_size;
     int mpi_source = (mpi_size+mpi_rank-slide) % mpi_size;
-    
+
     std::vector<MPI_Request> req_size(2);
     std::vector<MPI_Status> sta_size(2);
-
-    // We first check the size
     std::vector<size_t> size_send(2);
     std::vector<size_t> size_recv(2);
     size_send[0] = A.size();
@@ -399,27 +360,37 @@ namespace sbd {
     std::vector<MPI_Request> req_data(2);
     std::vector<MPI_Status> sta_data(2);
 
-    std::vector<size_t> data_send(total_send_size);
-    std::vector<size_t> data_recv(total_recv_size);
-    if( size_recv[0] != 0 ) {
-      B.resize(size_recv[0],std::vector<size_t>(size_recv[1]));
-    } else {
-      B.resize(0);
-    }
+    scratch_send.resize(total_send_size);
+    scratch_recv.resize(total_recv_size);
 
+    // Pack A into scratch_send before touching B.
+    // Ordering guarantee: A content is fully captured before B.resize() below,
+    // so it is safe to call with A and B aliasing the same vector (in-place slide).
     for(size_t n=0; n < size_send[0]; n++) {
       for(size_t k=0; k < size_send[1]; k++) {
-	data_send[n*size_send[1]+k] = A[n][k];
+        scratch_send[n*size_send[1]+k] = A[n][k];
       }
     }
 
     if( total_send_size != 0 ) {
-      MPI_Isend(data_send.data(),total_send_size,SBD_MPI_SIZE_T,mpi_dest,1,comm,&req_data[0]);
+      MPI_Isend(scratch_send.data(),total_send_size,SBD_MPI_SIZE_T,mpi_dest,1,comm,&req_data[0]);
     }
     if( total_recv_size != 0 ) {
-      MPI_Irecv(data_recv.data(),total_recv_size,SBD_MPI_SIZE_T,mpi_source,1,comm,&req_data[1]);
+      MPI_Irecv(scratch_recv.data(),total_recv_size,SBD_MPI_SIZE_T,mpi_source,1,comm,&req_data[1]);
     }
-    
+
+    // B.resize placed here — after pack (A safe) and Isend/Irecv (in flight),
+    // so construction of new vector rows overlaps with the MPI transfer.
+    // When A==B (in-place slide), B already has the right capacity if the
+    // communicator is balanced, making resize() a no-op.
+    if( size_recv[0] != 0 ) {
+      size_t old_size = B.size();
+      B.resize(size_recv[0]);
+      for(size_t n=old_size; n < size_recv[0]; n++) B[n].resize(size_recv[1]);
+    } else {
+      B.resize(0);
+    }
+
     if( total_send_size != 0 && total_recv_size != 0 ) {
       MPI_Waitall(2,req_data.data(),sta_data.data());
     } else if ( total_send_size != 0 && total_recv_size == 0 ) {
@@ -430,10 +401,16 @@ namespace sbd {
 
     for(size_t n=0; n < size_recv[0]; n++) {
       for(size_t k=0; k < size_recv[1]; k++) {
-	B[n][k] = data_recv[n*size_recv[1]+k];
+        B[n][k] = scratch_recv[n*size_recv[1]+k];
       }
     }
-    
+  }
+
+  template<typename Container,
+           std::enable_if_t<!std::is_trivially_copyable_v<typename Container::value_type>, int> = 0>
+  void MpiSlide(const Container& A, Container& B, int slide, MPI_Comm comm) {
+    std::vector<size_t> scratch_send, scratch_recv;
+    MpiSlideWithScratch(A, B, slide, comm, scratch_send, scratch_recv);
   }
 
 

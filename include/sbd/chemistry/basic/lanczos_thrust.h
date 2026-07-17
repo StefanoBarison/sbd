@@ -5,7 +5,7 @@
 #ifndef SBD_CHEMISTRY_LANCZOS_THRUST_H
 #define SBD_CHEMISTRY_LANCZOS_THRUST_H
 
-
+#include "sbd/framework/nvtx.h"
 
 #ifdef __CUDACC__
 #include "sbd/framework/cuda_reduce.h"
@@ -26,6 +26,8 @@ void Lanczos(const thrust::device_vector<ElemT> &hii,
 				int num_block,
 				RealT eps)
 {
+    SBD_NVTX_RANGE_COLOR("Lanczos", __LINE__);
+
 	char jobz = 'V';
 	char uplo = 'U';
 	int lda = num_block;

@@ -6,6 +6,8 @@
 #ifndef SBD_FRAMEWORK_HP_NUMERIC_H
 #define SBD_FRAMEWORK_HP_NUMERIC_H
 
+#include "sbd/framework/nvtx.h"
+
 #include "sbd/framework/type_def.h"
 
 #include <array>
@@ -478,6 +480,7 @@ inline void MatQr(int m, int n, int k, std::complex<double> *pa, std::complex<do
 			   float *, int *, float *, float *, int *, int *);
 
     inline void MatHeev(char jobz, char uplo, int n, float *pa, int lda, float *pw) {
+      SBD_NVTX_RANGE_COLOR("MatHeev", __LINE__);
       int info;
       // Set workspace
       int lwork = -1;

@@ -12,6 +12,7 @@
 #include "sbd/sbd.h"
 #include "mpi.h"
 
+#include "sbd/framework/nvtx.h"
 
 int main(int argc, char * argv[]) {
 
@@ -96,8 +97,11 @@ int main(int argc, char * argv[]) {
   /**
      sample-based diagonalization using fcidump file and adet file
    */
-  sbd::tpb::diag(comm,sbd_data,fcifumpfile,adetfile,loadname,savename,
-		 energy,density,co_adet,co_bdet,one_p_rdm,two_p_rdm);
+  {
+      SBD_NVTX_RANGE("diag", __LINE__);
+      sbd::tpb::diag(comm,sbd_data,fcifumpfile,adetfile,loadname,savename,
+                     energy,density,co_adet,co_bdet,one_p_rdm,two_p_rdm);
+  }
 
   /**
      Get L (number of orbitals) and N (number of electrons) from fcidump data for output
@@ -181,8 +185,11 @@ int main(int argc, char * argv[]) {
   /**
      sample-based diagonalization using data for fcidump, adet, bdet.
    */
-  sbd::tpb::diag(comm,sbd_data,fcidump,adet,bdet,loadname,savename,
-		 energy,density,co_adet,co_bdet,one_p_rdm,two_p_rdm);
+  {
+      SBD_NVTX_RANGE("diag");
+      sbd::tpb::diag(comm,sbd_data,fcidump,adet,bdet,loadname,savename,
+                     energy,density,co_adet,co_bdet,one_p_rdm,two_p_rdm);
+  }
 
 #endif
 

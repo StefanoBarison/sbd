@@ -45,9 +45,7 @@ public:
     // kernel entry point
     __device__ __host__ void operator()(size_t i)
     {
-		if( (i % this->mpi_size_h) == this->mpi_rank_h ) {
-			this->correlation.ZeroDiffCorrelation(this->det + i * this->D_size, this->wb[i]);
-        }
+        this->correlation.ZeroDiffCorrelation(this->det + i * this->D_size, this->wb[i]);
     }
 };
 
@@ -72,23 +70,25 @@ public:
     // kernel entry point
     __device__ __host__ void operator()(size_t i)
     {
-		size_t ibst = idxmap.AdetToBdetSM[i];
-		size_t idet = idxmap.AdetToDetSM[i];
-		size_t ia = idxmap.AdetIndex[i];
-		size_t iast = ia;
-		if (idet % this->mpi_size_h != this->mpi_rank_h)
-			return;
+		uint32_t ibst = idxmap.AdetToBdetSM[i];
+		uint32_t idet = idxmap.AdetToDetSM[i];
+		uint32_t ia   = idxmap.AdetIndex[i];
+		uint32_t iast = ia;
 
-		if (exidx.SelfFromBdetOffset[ibst] != exidx.SelfFromBdetOffset[ibst + 1]) {
-			size_t jbst = exidx.SelfFromBdetSM[exidx.SelfFromBdetOffset[ibst]];
+		const uint32_t self_lo = exidx.SelfFromBdetOffset[ibst];
+		const uint32_t self_hi = exidx.SelfFromBdetOffset[ibst + 1];
+		const uint32_t ja_lo   = exidx.SinglesFromAdetOffset[ia];
+		const uint32_t ja_hi   = exidx.SinglesFromAdetOffset[ia + 1];
+		if (self_lo != self_hi && ja_lo != ja_hi) {
+			uint32_t jbst = exidx.SelfFromBdetSM[self_lo];
+			const uint32_t bdet_lo = tidxmap.BdetToDetOffset[jbst];
+			const uint32_t bdet_hi = tidxmap.BdetToDetOffset[jbst + 1];
 			// single alpha excitations
-			for (size_t ja = exidx.SinglesFromAdetOffset[ia]; ja < exidx.SinglesFromAdetOffset[ia + 1]; ja++) {
-				size_t jast = exidx.SinglesFromAdetSM[ja];
-				int64_t idxa = tidxmap.bdet_lower_bound(jbst, jast);
-				if (idxa >= 0) {
-					if (jast != tidxmap.BdetToAdetSM[idxa])
-						continue;
-					size_t jdet = tidxmap.BdetToDetSM[idxa];
+			for (uint32_t ja = ja_lo; ja < ja_hi; ja++) {
+				uint32_t jast = exidx.SinglesFromAdetSM[ja];
+				auto [found_a, idxa] = tidxmap.bdet_lower_bound(bdet_lo, bdet_hi, jast);
+				if (found_a) {
+					uint32_t jdet = tidxmap.BdetToDetSM[idxa];
 					this->correlation.OneDiffCorrelation(this->det + idet * this->D_size,
 											this->wb[idet], this->twk[jdet],
 											exidx.SinglesAdetCrAnSM[ja],
@@ -120,23 +120,25 @@ public:
     // kernel entry point
     __device__ __host__ void operator()(size_t i)
     {
-		size_t ibst = idxmap.AdetToBdetSM[i];
-		size_t idet = idxmap.AdetToDetSM[i];
-		size_t ia = idxmap.AdetIndex[i];
-		size_t iast = ia;
-		if (idet % this->mpi_size_h != this->mpi_rank_h)
-			return;
+		uint32_t ibst = idxmap.AdetToBdetSM[i];
+		uint32_t idet = idxmap.AdetToDetSM[i];
+		uint32_t ia   = idxmap.AdetIndex[i];
+		uint32_t iast = ia;
 
-		if (exidx.SelfFromBdetOffset[ibst] != exidx.SelfFromBdetOffset[ibst + 1]) {
-			size_t jbst = exidx.SelfFromBdetSM[exidx.SelfFromBdetOffset[ibst]];
+		const uint32_t self_lo = exidx.SelfFromBdetOffset[ibst];
+		const uint32_t self_hi = exidx.SelfFromBdetOffset[ibst + 1];
+		const uint32_t ja_lo   = exidx.DoublesFromAdetOffset[ia];
+		const uint32_t ja_hi   = exidx.DoublesFromAdetOffset[ia + 1];
+		if (self_lo != self_hi && ja_lo != ja_hi) {
+			uint32_t jbst = exidx.SelfFromBdetSM[self_lo];
+			const uint32_t bdet_lo = tidxmap.BdetToDetOffset[jbst];
+			const uint32_t bdet_hi = tidxmap.BdetToDetOffset[jbst + 1];
 			// double alpha excitations
-			for (size_t ja = exidx.DoublesFromAdetOffset[ia]; ja < exidx.DoublesFromAdetOffset[ia + 1]; ja++) {
-				size_t jast = exidx.DoublesFromAdetSM[ja];
-				int64_t idxa = tidxmap.bdet_lower_bound(jbst, jast);
-				if (idxa >= 0) {
-					if (jast != tidxmap.BdetToAdetSM[idxa])
-						continue;
-					size_t jdet = tidxmap.BdetToDetSM[idxa];
+			for (uint32_t ja = ja_lo; ja < ja_hi; ja++) {
+				uint32_t jast = exidx.DoublesFromAdetSM[ja];
+				auto [found_a, idxa] = tidxmap.bdet_lower_bound(bdet_lo, bdet_hi, jast);
+				if (found_a) {
+					uint32_t jdet = tidxmap.BdetToDetSM[idxa];
 					this->correlation.TwoDiffCorrelation(this->det + idet * this->D_size,
 											this->wb[idet], this->twk[jdet],
 											exidx.DoublesAdetCrAnSM[ja],
@@ -171,23 +173,25 @@ public:
     // kernel entry point
     __device__ __host__ void operator()(size_t i)
     {
-		size_t iast = idxmap.BdetToAdetSM[i];
-		size_t idet = idxmap.BdetToDetSM[i];
-		size_t ib = idxmap.BdetIndex[i];
-		size_t ibst = ib;
-		if (idet % this->mpi_size_h != this->mpi_rank_h)
-			return;
+		uint32_t iast = idxmap.BdetToAdetSM[i];
+		uint32_t idet = idxmap.BdetToDetSM[i];
+		uint32_t ib   = idxmap.BdetIndex[i];
+		uint32_t ibst = ib;
 
-		if (exidx.SelfFromAdetOffset[iast] != exidx.SelfFromAdetOffset[iast + 1]) {
-			size_t jast = exidx.SelfFromAdetSM[exidx.SelfFromAdetOffset[iast]];
-			// single alpha excitations
-			for (size_t jb = exidx.SinglesFromBdetOffset[ib]; jb < exidx.SinglesFromBdetOffset[ib + 1]; jb++) {
-				size_t jbst = exidx.SinglesFromBdetSM[jb];
-				int64_t idxb = tidxmap.adet_lower_bound(jast, jbst);
-				if (idxb >= 0) {
-					if (jbst != tidxmap.AdetToBdetSM[idxb])
-						continue;
-					size_t jdet = tidxmap.AdetToDetSM[idxb];
+		const uint32_t self_lo = exidx.SelfFromAdetOffset[iast];
+		const uint32_t self_hi = exidx.SelfFromAdetOffset[iast + 1];
+		const uint32_t jb_lo   = exidx.SinglesFromBdetOffset[ib];
+		const uint32_t jb_hi   = exidx.SinglesFromBdetOffset[ib + 1];
+		if (self_lo != self_hi && jb_lo != jb_hi) {
+			uint32_t jast = exidx.SelfFromAdetSM[self_lo];
+			const uint32_t adet_lo = tidxmap.AdetToDetOffset[jast];
+			const uint32_t adet_hi = tidxmap.AdetToDetOffset[jast + 1];
+			// single beta excitations
+			for (uint32_t jb = jb_lo; jb < jb_hi; jb++) {
+				uint32_t jbst = exidx.SinglesFromBdetSM[jb];
+				auto [found_b, idxb] = tidxmap.adet_lower_bound(adet_lo, adet_hi, jbst);
+				if (found_b) {
+					uint32_t jdet = tidxmap.AdetToDetSM[idxb];
 					this->correlation.OneDiffCorrelation(this->det + idet * this->D_size,
 											this->wb[idet], this->twk[jdet],
 											exidx.SinglesBdetCrAnSM[jb],
@@ -219,23 +223,25 @@ public:
     // kernel entry point
     __device__ __host__ void operator()(size_t i)
     {
-		size_t iast = idxmap.BdetToAdetSM[i];
-		size_t idet = idxmap.BdetToDetSM[i];
-		size_t ib = idxmap.BdetIndex[i];
-		size_t ibst = ib;
-		if (idet % this->mpi_size_h != this->mpi_rank_h)
-			return;
+		uint32_t iast = idxmap.BdetToAdetSM[i];
+		uint32_t idet = idxmap.BdetToDetSM[i];
+		uint32_t ib   = idxmap.BdetIndex[i];
+		uint32_t ibst = ib;
 
-		if (exidx.SelfFromAdetOffset[iast] != exidx.SelfFromAdetOffset[iast + 1]) {
-			size_t jast = exidx.SelfFromAdetSM[exidx.SelfFromAdetOffset[iast]];
-			// double alpha excitations
-			for (size_t jb = exidx.DoublesFromBdetOffset[ib]; jb < exidx.DoublesFromBdetOffset[ib + 1]; jb++) {
-				size_t jbst = exidx.DoublesFromBdetSM[jb];
-				int64_t idxb = tidxmap.adet_lower_bound(jast, jbst);
-				if (idxb >= 0) {
-					if (jbst != tidxmap.AdetToBdetSM[idxb])
-						continue;
-					size_t jdet = tidxmap.AdetToDetSM[idxb];
+		const uint32_t self_lo = exidx.SelfFromAdetOffset[iast];
+		const uint32_t self_hi = exidx.SelfFromAdetOffset[iast + 1];
+		const uint32_t jb_lo   = exidx.DoublesFromBdetOffset[ib];
+		const uint32_t jb_hi   = exidx.DoublesFromBdetOffset[ib + 1];
+		if (self_lo != self_hi && jb_lo != jb_hi) {
+			uint32_t jast = exidx.SelfFromAdetSM[self_lo];
+			const uint32_t adet_lo = tidxmap.AdetToDetOffset[jast];
+			const uint32_t adet_hi = tidxmap.AdetToDetOffset[jast + 1];
+			// double beta excitations
+			for (uint32_t jb = jb_lo; jb < jb_hi; jb++) {
+				uint32_t jbst = exidx.DoublesFromBdetSM[jb];
+				auto [found_b, idxb] = tidxmap.adet_lower_bound(adet_lo, adet_hi, jbst);
+				if (found_b) {
+					uint32_t jdet = tidxmap.AdetToDetSM[idxb];
 					this->correlation.TwoDiffCorrelation(this->det + idet * this->D_size,
 											this->wb[idet], this->twk[jdet],
 											exidx.DoublesBdetCrAnSM[jb],
@@ -270,36 +276,31 @@ public:
     // kernel entry point
     __device__ __host__ void operator()(size_t i)
     {
-		size_t ibst = idxmap.AdetToBdetSM[i];
-		size_t idet = idxmap.AdetToDetSM[i];
-		size_t ia = idxmap.AdetIndex[i];
-		size_t iast = ia;
-		if (idet % this->mpi_size_h != this->mpi_rank_h)
-			return;
+		uint32_t ibst = idxmap.AdetToBdetSM[i];
+		uint32_t idet = idxmap.AdetToDetSM[i];
+		uint32_t ia   = idxmap.AdetIndex[i];
+		uint32_t iast = ia;
 
 		// alpha-beta two-particle excitations
-		for (size_t ja = exidx.SinglesFromAdetOffset[ia]; ja < exidx.SinglesFromAdetOffset[ia + 1]; ja++) {
-			size_t jast = exidx.SinglesFromAdetSM[ja];
-			size_t start_idx = 0;
-			size_t end_idx = tidxmap.AdetToDetOffset[jast + 1] - tidxmap.AdetToDetOffset[jast];
-			for (size_t k = exidx.SinglesFromBdetOffset[ibst]; k < exidx.SinglesFromBdetOffset[ibst + 1]; k++) {
-				size_t jbst = exidx.SinglesFromBdetSM[k];
-				if (start_idx >= end_idx)
-					break;
-				int64_t idxb = tidxmap.adet_lower_bound(jast, jbst, start_idx);
-				if (idxb >= 0) {
-					if (jbst != tidxmap.AdetToBdetSM[idxb])
-						continue;
-					start_idx = idxb - tidxmap.AdetToDetOffset[jast];
-					if (start_idx < end_idx) {
-						size_t jdet = tidxmap.AdetToDetSM[idxb];
-						this->correlation.TwoDiffCorrelation(this->det + idet * this->D_size,
-											this->wb[idet], this->twk[jdet],
-												exidx.SinglesAdetCrAnSM[ja],
-												exidx.SinglesBdetCrAnSM[k],
-												exidx.SinglesAdetCrAnSM[ja + exidx.size_single_adet],
-												exidx.SinglesBdetCrAnSM[k + exidx.size_single_bdet]);
-					}
+		const uint32_t ja_lo = exidx.SinglesFromAdetOffset[ia];
+		const uint32_t ja_hi = exidx.SinglesFromAdetOffset[ia + 1];
+		const uint32_t k_lo  = exidx.SinglesFromBdetOffset[ibst];
+		const uint32_t k_hi  = exidx.SinglesFromBdetOffset[ibst + 1];
+		if (k_lo != k_hi) for (uint32_t ja = ja_lo; ja < ja_hi; ja++) {
+			uint32_t jast = exidx.SinglesFromAdetSM[ja];
+			const uint32_t adet_lo = tidxmap.AdetToDetOffset[jast];
+			const uint32_t adet_hi = tidxmap.AdetToDetOffset[jast + 1];
+			for (uint32_t k = k_lo; k < k_hi; k++) {
+				uint32_t jbst = exidx.SinglesFromBdetSM[k];
+				auto [found_b, idxb] = tidxmap.adet_lower_bound(adet_lo, adet_hi, jbst);
+				if (found_b) {
+					uint32_t jdet = tidxmap.AdetToDetSM[idxb];
+					this->correlation.TwoDiffCorrelation(this->det + idet * this->D_size,
+										this->wb[idet], this->twk[jdet],
+											exidx.SinglesAdetCrAnSM[ja],
+											exidx.SinglesBdetCrAnSM[k],
+											exidx.SinglesAdetCrAnSM[ja + exidx.size_single_adet],
+											exidx.SinglesBdetCrAnSM[k + exidx.size_single_bdet]);
 				}
 			}
 		}
@@ -332,7 +333,7 @@ void MultGDBThrust<ElemT>::correlation(const std::vector<ElemT> & w_in,
 	thrust::device_vector<ElemT> w(w_in.size());
 	thrust::device_vector<ElemT> tw(w_in.size());
 	thrust::device_vector<ElemT> rw;
-	thrust::device_vector<size_t> tidxmap_storage;
+	thrust::device_vector<uint32_t> tidxmap_storage;
 	DetIndexMapThrust tidxmap;
 
     thrust::copy_n(w_in.begin(), w_in.size(), w.begin());
@@ -396,7 +397,7 @@ void MultGDBThrust<ElemT>::correlation(const std::vector<ElemT> & w_in,
 			sbd::MpiSlide(rw, tw, slide, this->b_comm());
 			sbd::gdb::MpiSlide(idxmap, idxmap_storage, tidxmap, tidxmap_storage, -exidx[0].slide, this->b_comm());
 
-			thrust::device_vector<size_t> ridxmap_storage;
+			thrust::device_vector<uint32_t> ridxmap_storage;
 			DetIndexMapThrust ridxmap;
 			ridxmap.copy(ridxmap_storage, tidxmap, tidxmap_storage);
 			sbd::gdb::MpiSlide(ridxmap, ridxmap_storage, tidxmap, tidxmap_storage, slide, this->b_comm());

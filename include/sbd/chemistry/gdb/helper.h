@@ -7,6 +7,7 @@
 
 #include "sbd/framework/type_def.h"
 #include "sbd/framework/mpi_utility.h"
+#include "sbd/framework/bit_manipulation.h"
 
 namespace sbd {
 
@@ -156,76 +157,110 @@ namespace sbd {
     }
 #endif
     
-    void getHalfDets(const std::vector<std::vector<size_t>> & det,
+    void getHalfDets(const sbd::det_vector<size_t> & det,
 		     size_t bit_length,
 		     size_t norb,
-		     std::vector<std::vector<size_t>> & adet,
-		     std::vector<std::vector<size_t>> & bdet,
+		     sbd::det_vector<size_t, sbd::det_kind::half> & adet,
+		     sbd::det_vector<size_t, sbd::det_kind::half> & bdet,
 		     std::vector<size_t> & adet_count,
 		     std::vector<size_t> & bdet_count) {
-      adet.resize(det.size());
-      bdet.resize(det.size());
-      for(size_t i=0; i < det.size(); i++) {
-	getAdet(det[i],bit_length,norb,adet[i]);
-	getBdet(det[i],bit_length,norb,bdet[i]);
+      const size_t N = det.size();
+      const int hdet_size = static_cast<int>((norb + bit_length - 1) / bit_length);
+      const int det_size  = static_cast<int>((2 * norb + bit_length - 1) / bit_length);
+      const size_t half_bl = bit_length / 2;
+
+      // Flat contiguous storage: row i occupies [i*hdet_size .. (i+1)*hdet_size).
+      // Eliminates per-det heap allocation of vector<vector<size_t>>.
+      std::vector<size_t> adet_flat(static_cast<size_t>(hdet_size) * N);
+      std::vector<size_t> bdet_flat(static_cast<size_t>(hdet_size) * N);
+
+      // Extract half-dets via bit masking rather than per-bit getocc/setocc loops.
+      // Alpha bit i is at even det position 2i; beta bit i is at odd position 2i+1.
+      // deinterleave(w) packs the 32 even-position bits of w into the lower 32 bits,
+      // matching the output of getAdet/getBdet so makeDetIndexMap lookups still work.
+      // Each adet/bdet word k receives 32 bits from det word 2k (lower) and 32 from
+      // det word 2k+1 (upper, shifted left by half_bl).
+      auto deinterleave = [](size_t w) -> size_t {
+        w = w & 0x5555555555555555ULL;
+        w = (w | (w >>  1)) & 0x3333333333333333ULL;
+        w = (w | (w >>  2)) & 0x0f0f0f0f0f0f0f0fULL;
+        w = (w | (w >>  4)) & 0x00ff00ff00ff00ffULL;
+        w = (w | (w >>  8)) & 0x0000ffff0000ffffULL;
+        w = (w | (w >> 16)) & 0x00000000ffffffffULL;
+        return w;
+      };
+
+      for (size_t i = 0; i < N; i++) {
+        size_t* arow = &adet_flat[static_cast<size_t>(hdet_size) * i];
+        size_t* brow = &bdet_flat[static_cast<size_t>(hdet_size) * i];
+        for (int k = 0; k < hdet_size; k++) {
+          size_t aw = 0, bw = 0;
+          if (2*k < det_size) {
+            aw  = deinterleave(det[i][2*k]);
+            bw  = deinterleave(det[i][2*k] >> 1);
+          }
+          if (2*k+1 < det_size) {
+            aw |= deinterleave(det[i][2*k+1]) << half_bl;
+            bw |= deinterleave(det[i][2*k+1] >> 1) << half_bl;
+          }
+          arow[k] = aw;
+          brow[k] = bw;
+        }
       }
-      /*
-      std::sort(adet.begin(),adet.end(),
-		[](const std::vector<size_t> & x,
-		   const std::vector<size_t> & y) {
-		  return x < y;
-		});
-      std::sort(bdet.begin(),bdet.end(),
-		[](const std::vector<size_t> & x,
-		   const std::vector<size_t> & y) {
-		  return x < y;
-		});
-      */
-      std::sort(adet.begin(),adet.end(),
-		[](const std::vector<size_t> & x,
-		   const std::vector<size_t> & y) {
-		  return sbd::less_from_back(x,y);
-		});
-      std::sort(bdet.begin(),bdet.end(),
-		[](const std::vector<size_t> & x,
-		   const std::vector<size_t> & y) {
-		  return sbd::less_from_back(x,y);
-		});
-      auto adet_sorted = adet;
-      auto bdet_sorted = bdet;
-      adet.erase(std::unique(adet.begin(),adet.end()),adet.end());
-      bdet.erase(std::unique(bdet.begin(),bdet.end()),bdet.end());
-      adet_count.resize(adet.size(),0);
-      bdet_count.resize(bdet.size(),0);
-      size_t u=0;
-      size_t count=0;
-      for(size_t k=0; k < adet_sorted.size(); k++) {
-	if( adet_sorted[k] != adet[u] ) {
-	  adet_count[u] = count;
-	  u++;
-	  count = 1;
-	} else {
-	  count++;
-	}
+
+      // Sort via pointer array: swaps 8-byte pointers, not 24-byte vector headers.
+      std::vector<size_t*> adet_ptrs(N), bdet_ptrs(N);
+      for (size_t i = 0; i < N; i++) {
+        adet_ptrs[i] = &adet_flat[static_cast<size_t>(hdet_size) * i];
+        bdet_ptrs[i] = &bdet_flat[static_cast<size_t>(hdet_size) * i];
       }
-      adet_count[adet.size()-1] = count;
-      u=0;
-      count=0;
-      for(size_t k=0; k < bdet_sorted.size(); k++) {
-	if( bdet_sorted[k] != bdet[u] ) {
-	  bdet_count[u] = count;
-	  u++;
-	  count=1;
-	} else {
-	  count++;
-	}
+      sbd::sort_from_back_t(adet_ptrs, 0, N, hdet_size - 1);
+      sbd::sort_from_back_t(bdet_ptrs, 0, N, hdet_size - 1);
+
+      // Row equality (custom == for ptr rows).
+      auto row_eq = [hdet_size](const size_t* x, const size_t* y) -> bool {
+        for (int k = 0; k < hdet_size; k++)
+          if (x[k] != y[k]) return false;
+        return true;
+      };
+
+      // Build unique adet + run-length counts in one pass (no copy of full sorted array).
+      adet.clear();  adet_count.clear();
+      if (N > 0) {
+        size_t count = 1;
+        for (size_t k = 1; k < N; k++) {
+          if (row_eq(adet_ptrs[k], adet_ptrs[k-1])) {
+            count++;
+          } else {
+            adet_count.push_back(count);
+            adet.emplace_back(adet_ptrs[k-1], adet_ptrs[k-1] + hdet_size);
+            count = 1;
+          }
+        }
+        adet_count.push_back(count);
+        adet.emplace_back(adet_ptrs[N-1], adet_ptrs[N-1] + hdet_size);
       }
-      bdet_count[bdet.size()-1] = count;
+
+      bdet.clear();  bdet_count.clear();
+      if (N > 0) {
+        size_t count = 1;
+        for (size_t k = 1; k < N; k++) {
+          if (row_eq(bdet_ptrs[k], bdet_ptrs[k-1])) {
+            count++;
+          } else {
+            bdet_count.push_back(count);
+            bdet.emplace_back(bdet_ptrs[k-1], bdet_ptrs[k-1] + hdet_size);
+            count = 1;
+          }
+        }
+        bdet_count.push_back(count);
+        bdet.emplace_back(bdet_ptrs[N-1], bdet_ptrs[N-1] + hdet_size);
+      }
     }
     
-    void makeDetIndexMap(const std::vector<std::vector<size_t>> & det,
-			 const std::vector<std::vector<size_t>> & adet,
-			 const std::vector<std::vector<size_t>> & bdet,
+    void makeDetIndexMap(const sbd::det_vector<size_t> & det,
+			 const sbd::det_vector<size_t, sbd::det_kind::half> & adet,
+			 const sbd::det_vector<size_t, sbd::det_kind::half> & bdet,
 			 const std::vector<size_t> & adet_count,
 			 const std::vector<size_t> & bdet_count,
 			 size_t bit_length,
@@ -268,14 +303,14 @@ namespace sbd {
 	*/
 	auto itia = std::lower_bound(adet.begin(),adet.end(),
 				     adet_temp,
-				     [](const std::vector<size_t> & lhs,
-					const std::vector<size_t> & rhs) {
+				     [](const auto & lhs,
+					const auto & rhs) {
 				       return sbd::less_from_back(lhs,rhs);
 				     });
 	auto itib = std::lower_bound(bdet.begin(),bdet.end(),
 				     bdet_temp,
-				     [](const std::vector<size_t> & lhs,
-					const std::vector<size_t> & rhs) {
+				     [](const auto & lhs,
+					const auto & rhs) {
 				       return sbd::less_from_back(lhs,rhs);
 				     });
 	if( itia == adet.end() || *itia != adet_temp ) {
@@ -293,9 +328,9 @@ namespace sbd {
       }
     }
     
-    void makeDetIndexMap(const std::vector<std::vector<size_t>> & det,
-			 const std::vector<std::vector<size_t>> & adet,
-			 const std::vector<std::vector<size_t>> & bdet,
+    void makeDetIndexMap(const sbd::det_vector<size_t> & det,
+			 const sbd::det_vector<size_t, sbd::det_kind::half> & adet,
+			 const sbd::det_vector<size_t, sbd::det_kind::half> & bdet,
 			 const std::vector<size_t> & adet_count,
 			 const std::vector<size_t> & bdet_count,
 			 size_t bit_length,
@@ -368,8 +403,9 @@ namespace sbd {
     }
     
     
-    void makeExcitationLookup(const std::vector<std::vector<size_t>> & hdet_bra,
-			      const std::vector<std::vector<size_t>> & hdet_ket,
+    template<typename HDetContainer>
+    void makeExcitationLookup(const HDetContainer & hdet_bra,
+			      const HDetContainer & hdet_ket,
 			      size_t bit_length,
 			      size_t norb,
 			      std::vector<std::vector<size_t>> & samedet,
@@ -422,10 +458,10 @@ namespace sbd {
       }
     }
     
-    void makeExcitationLookup(const std::vector<std::vector<size_t>> & adet_bra,
-			      const std::vector<std::vector<size_t>> & bdet_bra,
-			      const std::vector<std::vector<size_t>> & adet_ket,
-			      const std::vector<std::vector<size_t>> & bdet_ket,
+    void makeExcitationLookup(const sbd::det_vector<size_t, sbd::det_kind::half> & adet_bra,
+			      const sbd::det_vector<size_t, sbd::det_kind::half> & bdet_bra,
+			      const sbd::det_vector<size_t, sbd::det_kind::half> & adet_ket,
+			      const sbd::det_vector<size_t, sbd::det_kind::half> & bdet_ket,
 			      size_t bit_length,
 			      size_t norb,
 			      ExcitationLookup & exidx) {
@@ -679,7 +715,7 @@ namespace sbd {
       MPI_Comm_split(a_comm,b_comm_color,mpi_rank,&b_comm);
     }
     
-    void MakeHelpers(const std::vector<std::vector<size_t>> & det,
+    void MakeHelpers(const sbd::det_vector<size_t> & det,
 		     size_t bit_length,
 		     size_t norb,
 		     DetIndexMap & idxmap,
@@ -705,20 +741,25 @@ namespace sbd {
 	exidx[task-task_begin].slide = static_cast<int>(task);
       }
       
-      std::vector<std::vector<size_t>> adet;
-      std::vector<std::vector<size_t>> bdet;
+      sbd::det_vector<size_t, sbd::det_kind::half> adet;
+      sbd::det_vector<size_t, sbd::det_kind::half> bdet;
       std::vector<size_t> adet_count;
       std::vector<size_t> bdet_count;
       getHalfDets(det,bit_length,norb,adet,bdet,adet_count,bdet_count);
       makeDetIndexMap(det,adet,bdet,adet_count,bdet_count,
 		      bit_length,norb,idxmap);
-      
-      std::vector<std::vector<size_t>> ket_det;
-      std::vector<std::vector<size_t>> ket_adet;
-      std::vector<std::vector<size_t>> ket_bdet;
+
+      // Persistent scratch buffers for MpiSlide<det> flat packing.
+      // Reusing across the initial slide and 3 task-loop rounds avoids
+      // repeated zero-initialization of the 60.8 MB send/recv buffers.
+      std::vector<size_t> det_scratch_send, det_scratch_recv;
+
+      sbd::det_vector<size_t> ket_det;
+      sbd::det_vector<size_t, sbd::det_kind::half> ket_adet;
+      sbd::det_vector<size_t, sbd::det_kind::half> ket_bdet;
       if ( task_begin != static_cast<size_t>(0) ) {
 	int slide = - exidx[0].slide;
-	sbd::MpiSlide(det,ket_det,slide,b_comm);
+	sbd::MpiSlideWithScratch(det,ket_det,slide,b_comm,det_scratch_send,det_scratch_recv);
 	sbd::MpiSlide(adet,ket_adet,slide,b_comm);
 	sbd::MpiSlide(bdet,ket_bdet,slide,b_comm);
       } else {
@@ -753,16 +794,14 @@ namespace sbd {
 	dumpExcitationLookup(exidx_task_file,exidx[task-task_begin]);
 #endif
 	if( task != task_end-1 ) {
-	  std::vector<std::vector<size_t>> send_det;
-	  std::vector<std::vector<size_t>> send_adet;
-	  std::vector<std::vector<size_t>> send_bdet;
-	  std::swap(ket_det,send_det);
-	  std::swap(ket_adet,send_adet);
-	  std::swap(ket_bdet,send_bdet);
 	  int slide = exidx[task-task_begin].slide - exidx[task+1-task_begin].slide;
-	  sbd::MpiSlide(send_det,ket_det,slide,b_comm);
-	  sbd::MpiSlide(send_adet,ket_adet,slide,b_comm);
-	  sbd::MpiSlide(send_bdet,ket_bdet,slide,b_comm);
+	  // In-place slide: pass ket_det/ket_adet/ket_bdet as both A and B.
+	  // Safe because MpiSlideWithScratch packs A into scratch before B.resize(),
+	  // so the existing capacity survives intact until pack is done.
+	  // When ranks hold equal det counts (balanced), B.resize() is a no-op.
+	  sbd::MpiSlideWithScratch(ket_det,ket_det,slide,b_comm,det_scratch_send,det_scratch_recv);
+	  sbd::MpiSlide(ket_adet,ket_adet,slide,b_comm);
+	  sbd::MpiSlide(ket_bdet,ket_bdet,slide,b_comm);
 #ifdef SBD_DEBUG_HELPER
 	  DetIndexMap send_idxmap;
 	  sbd::gdb::MpiSlide(send_idxmap,ket_idxmap,slide,b_comm);
