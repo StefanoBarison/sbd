@@ -154,14 +154,16 @@ namespace sbd {
       return spin_mask;   // alpha pattern over open slots, in ascending-orbital slot order
     }
 
-    /// Build the rank-local single-spin projector V for target spin S_target and
-    /// spin projection Sz (n_up open-shell alphas is fixed per config by Sz).
+    /// Build the rank-local single-spin projector V for target spin multiplicity
+    /// (2S+1: 1=singlet, 2=doublet, 3=triplet, ...) and spin projection Sz
+    /// (n_up open-shell alphas is fixed per config by Sz).
     /// Requires b_comm_size == 1 (caller guards).
     template <typename ElemT, typename DetsContainer>
     SpinProjector build_config_projector(const DetsContainer & det,
                                          size_t bit_length, int norb,
-                                         int S_target, int Sz2 /* 2*Sz */) {
-      double s2_target = 0.25 * S_target * (S_target + 1) * 4.0; // = S(S+1)
+                                         int multiplicity, int Sz2 /* 2*Sz */) {
+      // multiplicity m = 2S+1 -> S = (m-1)/2 -> S(S+1) = (m^2 - 1)/4
+      double s2_target = 0.25 * (static_cast<double>(multiplicity) * multiplicity - 1.0);
       // group local det indices by (config pattern, open-slot arrangement mask)
       // key = config vector serialized; within a config, remember the arrangement.
       std::map<std::vector<int>, std::vector<std::pair<size_t, unsigned long long>>> by_config;

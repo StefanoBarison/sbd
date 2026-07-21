@@ -1,7 +1,8 @@
 """Example: drive the GDB single-spin (Option 2) solver through the Python wrapper.
 
 Loads the N2 (R=2.0, 6-31g, 10e/16o) FCIDUMP + a completed determinant file,
-then asks SBDGdbSolver for the 4 lowest TRIPLET roots (single_spin=1) using the
+then asks SBDGdbSolver for the 4 lowest TRIPLET roots (single_spin=3, i.e.
+spin multiplicity 2S+1=3) using the
 stored-matrix path (method=1). Prints per-root energies + <S^2>.
 
 Run:  python example_single_spin.py
@@ -25,7 +26,7 @@ FCIDUMP = "/Users/efa/Downloads/for_claude_n2/N2_R2.0_6-31g_10e_16o.dat"
 DETFILE = "/Users/efa/Documents/github/new_sqdrift-exc/single_spin_workflow/sbd_dets_top50.txt"
 
 NORB = 16
-TARGET_S = 1     # 0 = singlet, 1 = triplet, ...
+MULTIPLICITY = 3   # spin multiplicity 2S+1: 1=singlet, 2=doublet, 3=triplet, 4=quartet, ...
 NROOTS = 4
 
 
@@ -62,14 +63,14 @@ def main():
         strs_b.append(b)
     strs_a = np.array(strs_a, dtype=np.int64)
     strs_b = np.array(strs_b, dtype=np.int64)
-    print(f"loaded {len(strs_a)} determinants, target S={TARGET_S}, nroots={NROOTS}")
+    print(f"loaded {len(strs_a)} determinants, mult={MULTIPLICITY}, nroots={NROOTS}")
 
     solver = SBDGdbSolver(
         sbd_binary=DIAG,
         mpi_np=1,
         method=1,                 # stored matrix (fast for this size)
         nroots=NROOTS,
-        single_spin=TARGET_S,     # Option 2: project onto this total spin
+        single_spin=MULTIPLICITY,  # Option 2: target spin multiplicity 2S+1
         davidson_block=20,
         davidson_iterations=80,
         davidson_tolerance=1e-8,

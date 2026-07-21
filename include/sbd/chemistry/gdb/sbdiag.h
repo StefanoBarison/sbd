@@ -18,7 +18,7 @@ namespace sbd {
       int max_it = 1;
       int max_nb = 10;
       int nroots = 1;
-      int single_spin = -1;   // target total spin S (>=0) for Option-2 projection; -1 = off
+      int single_spin = -1;   // target spin MULTIPLICITY 2S+1 (1=singlet,2=doublet,3=triplet,...) for Option-2 projection; <1 = off
       double eps = 1.0e-4;
       double max_time = 86400.0;
       int init = 0;
@@ -366,7 +366,7 @@ namespace sbd {
 	sbd::Davidson(hii, w, device_mult,
 			max_it,max_nb,eps,max_time);
 #else
-	if( single_spin >= 0 ) {
+	if( single_spin >= 1 ) {
 	  // Option 2 (matrix-free): project onto target spin S. b_comm==1 only.
 	  if( b_comm_size > 1 ) {
 	    if( mpi_rank == 0 )
@@ -389,8 +389,7 @@ namespace sbd {
 	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
 					  single_spin, Sz2);
 	  if( mpi_rank == 0 )
-	    std::cout << " sbd: single_spin S=" << single_spin
-		      << " projected CSF dim = " << Vproj.total_csf << std::endl;
+	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;
 	  std::vector<double> Eroots;
 	  DavidsonMultiRootProjected(hii, Vproj, Wcsf, Eroots, det,
@@ -561,7 +560,7 @@ namespace sbd {
 		    << " sbd: start davidson" << std::endl;
 	}
 	auto time_start_david = std::chrono::high_resolution_clock::now();
-	if( single_spin >= 0 ) {
+	if( single_spin >= 1 ) {
 	  // Option 2 (stored matrix): project onto target spin S. b_comm==1 only.
 	  if( b_comm_size > 1 ) {
 	    if( mpi_rank == 0 )
@@ -584,8 +583,7 @@ namespace sbd {
 	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
 					  single_spin, Sz2);
 	  if( mpi_rank == 0 )
-	    std::cout << " sbd: single_spin S=" << single_spin
-		      << " projected CSF dim = " << Vproj.total_csf << std::endl;
+	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;
 	  std::vector<double> Eroots;
 	  DavidsonMultiRootProjectedStored(hii, Vproj, Wcsf, Eroots, det.size(),

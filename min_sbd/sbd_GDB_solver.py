@@ -268,7 +268,7 @@ class SBDGdbSolver:
                 ``pyscf.tools.fcidump.from_integrals``.
             norb: Number of spatial orbitals.
             nelec: ``(n_alpha, n_beta)``.
-            spin_sq: Must be ``None``; SBD has no spin-projection mechanism.
+            single_spin (solver ctor): target spin multiplicity 2S+1 (1=singlet,2=doublet,3=triplet,...); -1=off. spin_sq arg here must stay None.
             max_cycle: Accepted for interface compatibility but ignored; the
                 GDB binary has no ``--max_cycle`` flag.
 
