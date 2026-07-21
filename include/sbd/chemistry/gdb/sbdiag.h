@@ -17,6 +17,7 @@ namespace sbd {
       int method = 0;
       int max_it = 1;
       int max_nb = 10;
+      int nroots = 1;
       double eps = 1.0e-4;
       double max_time = 86400.0;
       int init = 0;
@@ -59,6 +60,9 @@ namespace sbd {
 	}
 	if ( std::string(argv[i]) == "--block" ) {
 	  sbd_data.max_nb = std::atoi(argv[++i]);
+	}
+	if ( std::string(argv[i]) == "--nroots" ) {
+	  sbd_data.nroots = std::atoi(argv[++i]);
 	}
 	if ( std::string(argv[i]) == "--tolerance" ) {
 	  sbd_data.eps = std::atof(argv[++i]);
@@ -159,6 +163,38 @@ namespace sbd {
        @param[out] one_p_rdm: one-particle reduced density matrix if sbd_data.do_rdm != 0
        @param[out] two_p_rdm: two-particle reduced density matrix if sbd_data.do_rdm != 0
      */
+
+    /**
+       Write per-root 1p/2p RDM files "1pRDM.<p>.txt" / "2pRDM.<p>.txt"
+       (spin-summed, same layout as the single-root writer in main.cc). Rank-0 only.
+    */
+    template <typename ElemT>
+    void WriteRdmFiles(int p, int L,
+		       const std::vector<std::vector<ElemT>> & one_p_rdm,
+		       const std::vector<std::vector<ElemT>> & two_p_rdm) {
+      std::ostringstream one_name; one_name << "1pRDM." << p << ".txt";
+      std::ostringstream two_name; two_name << "2pRDM." << p << ".txt";
+      std::ofstream ofs_one(one_name.str());
+      ofs_one.precision(16);
+      for(int io=0; io < L; io++)
+	for(int jo=0; jo < L; jo++)
+	  ofs_one << io << " " << jo << " "
+		  << GetReal(one_p_rdm[0][io+L*jo]) + GetReal(one_p_rdm[1][io+L*jo])
+		  << std::endl;
+      std::ofstream ofs_two(two_name.str());
+      ofs_two.precision(16);
+      for(int io=0; io < L; io++)
+	for(int jo=0; jo < L; jo++)
+	  for(int ia=0; ia < L; ia++)
+	    for(int ja=0; ja < L; ja++)
+	      ofs_two << io << " " << jo << " " << ia << " " << ja << " "
+		      << GetReal(two_p_rdm[0][io+L*jo+L*L*(ia+L*ja)])
+		       + GetReal(two_p_rdm[1][io+L*jo+L*L*(ia+L*ja)])
+		       + GetReal(two_p_rdm[2][io+L*jo+L*L*(ia+L*ja)])
+		       + GetReal(two_p_rdm[3][io+L*jo+L*L*(ia+L*ja)])
+		      << std::endl;
+    }
+
     template <typename ElemT>
     void diag(const MPI_Comm & comm,
 	      const SBD & sbd_data,
@@ -185,6 +221,7 @@ namespace sbd {
 #endif
       int max_it = sbd_data.max_it;
       int max_nb = sbd_data.max_nb;
+      int nroots = sbd_data.nroots;
       double eps = sbd_data.eps;
       double max_time = sbd_data.max_time;
       int init = sbd_data.init;
@@ -324,10 +361,49 @@ namespace sbd {
 	sbd::Davidson(hii, w, device_mult,
 			max_it,max_nb,eps,max_time);
 #else
+	if( nroots > 1 ) {
+	  // Multi-root (block Davidson-Liu). Seed W[0]=w (HF/current), W[1..] random.
+	  std::vector<std::vector<ElemT>> Wroots(nroots, w);
+	  for(int p=1; p < nroots; p++) {
+	    Randomize(seed + static_cast<size_t>(p), Wroots[p], b_comm, h_comm);
+	    MpiBcast(Wroots[p],0,t_comm);
+	  }
+	  std::vector<double> Eroots;
+	  DavidsonMultiRoot(hii,Wroots,Eroots,det,bit_length,static_cast<size_t>(L),
+			    idxmap,exidx,I0,I1,I2,
+			    h_comm,b_comm,t_comm,
+			    max_it,max_nb,nroots,eps);
+	  if( mpi_rank == 0 ) {
+	    std::cout.precision(12);
+	    for(int p=0; p < nroots; p++)
+	      std::cout << " sbd: MultiRoot E[" << p << "] = " << Eroots[p] << std::endl;
+	  }
+	  // Per-root energy + RDM; stream each root then free its vector.
+	  for(int p=0; p < nroots; p++) {
+	    std::vector<ElemT> vp(Wroots[p].size(),ElemT(0.0));
+	    mult(hii,Wroots[p],vp,bit_length,static_cast<size_t>(L),det,
+		 idxmap,exidx,I0,I1,I2,h_comm,b_comm,t_comm);
+	    ElemT Ep; InnerProduct(Wroots[p],vp,Ep,b_comm);
+	    if( do_rdm != 0 ) {
+	      std::vector<std::vector<ElemT>> one_p_rdm_p, two_p_rdm_p;
+	      Correlation(Wroots[p],det,bit_length,static_cast<size_t>(L),
+			  idxmap,exidx,h_comm,b_comm,t_comm,
+			  one_p_rdm_p,two_p_rdm_p);
+	      if( mpi_rank == 0 )
+		WriteRdmFiles(p,static_cast<int>(L),one_p_rdm_p,two_p_rdm_p);
+	    }
+	    if( mpi_rank == 0 )
+	      std::cout << " sbd: MultiRoot root " << p
+			<< " Energy = " << GetReal(Ep) << std::endl;
+	    if( p != 0 ) std::vector<ElemT>().swap(Wroots[p]);
+	  }
+	  w = Wroots[0];   // keep root 0 for the downstream single-vector flow
+	} else {
 	Davidson(hii,w,det,bit_length,static_cast<size_t>(L),
 		 idxmap,exidx,I0,I1,I2,
 		 h_comm,b_comm,t_comm,
 		 max_it,max_nb,eps);
+	}
 #endif
     if( sbd_data.timing_barriers ) MPI_Barrier(comm);
     auto time_end_david = std::chrono::high_resolution_clock::now();
