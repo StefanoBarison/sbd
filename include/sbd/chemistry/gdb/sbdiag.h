@@ -499,8 +499,43 @@ namespace sbd {
 		    << " sbd: start davidson" << std::endl;
 	}
 	auto time_start_david = std::chrono::high_resolution_clock::now();
+	if( nroots > 1 ) {
+	  // Multi-root (block Davidson-Liu), stored-matrix variant.
+	  std::vector<std::vector<ElemT>> Wroots(nroots, w);
+	  for(int p=1; p < nroots; p++) {
+	    Randomize(seed + static_cast<size_t>(p), Wroots[p], b_comm, h_comm);
+	    MpiBcast(Wroots[p],0,t_comm);
+	  }
+	  std::vector<double> Eroots;
+	  sbd::gdb::DavidsonMultiRoot(hii,ih,jh,hij,len,slide,Wroots,Eroots,
+				      h_comm,b_comm,t_comm,max_it,max_nb,nroots,eps);
+	  if( mpi_rank == 0 ) {
+	    std::cout.precision(12);
+	    for(int p=0; p < nroots; p++)
+	      std::cout << " sbd: MultiRoot E[" << p << "] = " << Eroots[p] << std::endl;
+	  }
+	  for(int p=0; p < nroots; p++) {
+	    std::vector<ElemT> vp(Wroots[p].size(),ElemT(0.0));
+	    sbd::gdb::mult(hii,ih,jh,hij,len,slide,Wroots[p],vp,h_comm,b_comm,t_comm);
+	    ElemT Ep; InnerProduct(Wroots[p],vp,Ep,b_comm);
+	    if( do_rdm != 0 ) {
+	      std::vector<std::vector<ElemT>> one_p_rdm_p, two_p_rdm_p;
+	      Correlation(Wroots[p],det,bit_length,static_cast<size_t>(L),
+			  idxmap,exidx,h_comm,b_comm,t_comm,
+			  one_p_rdm_p,two_p_rdm_p);
+	      if( mpi_rank == 0 )
+		WriteRdmFiles(p,static_cast<int>(L),one_p_rdm_p,two_p_rdm_p);
+	    }
+	    if( mpi_rank == 0 )
+	      std::cout << " sbd: MultiRoot root " << p
+			<< " Energy = " << GetReal(Ep) << std::endl;
+	    if( p != 0 ) std::vector<ElemT>().swap(Wroots[p]);
+	  }
+	  w = Wroots[0];
+	} else {
 	sbd::gdb::Davidson(hii,ih,jh,hij,len,slide,w,
 			   h_comm,b_comm,t_comm,max_it,max_nb,eps);
+	}
 	if( sbd_data.timing_barriers ) MPI_Barrier(comm);
 	auto time_end_david = std::chrono::high_resolution_clock::now();
 	auto elapsed_david_count = std::chrono::duration_cast<std::chrono::microseconds>(time_end_david-time_start_david).count();

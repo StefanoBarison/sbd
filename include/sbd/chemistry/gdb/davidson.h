@@ -882,6 +882,214 @@ namespace sbd {
       free(E);
     }
 
+    /**
+       Multi-root (block Davidson-Liu), STORED-MATRIX variant (method 1).
+       Same algorithm as the matrix-free DavidsonMultiRoot above, but the H*v
+       matvec uses the pre-built sparse Hamiltonian (ih,jh,hij,len,slide) via the
+       raw-index mult overload -- faster when the matrix fits in memory. The
+       local vector length is taken from hii (the local diagonal). Seeds W[0..]
+       on input; returns nroot eigvecs (W) + energies (Eout).
+    */
+    template <typename ElemT, typename RealT>
+    void DavidsonMultiRoot(const std::vector<ElemT> & hii,
+			   const std::vector<std::vector<size_t*>> & ih,
+			   const std::vector<std::vector<size_t*>> & jh,
+			   const std::vector<std::vector<ElemT*>> & hij,
+			   const std::vector<std::vector<size_t>> & len,
+			   const std::vector<int> & slide,
+			   std::vector<std::vector<ElemT>> & W,
+			   std::vector<RealT> & Eout,
+			   MPI_Comm h_comm,
+			   MPI_Comm b_comm,
+			   MPI_Comm t_comm,
+			   int max_iteration,
+			   int num_block,
+			   int nroot,
+			   RealT eps) {
+
+      RealT eps_reg  = 1.0e-12;
+      RealT tau_drop = 1.0e-6;
+
+      int mpi_rank_h; MPI_Comm_rank(h_comm,&mpi_rank_h);
+      int mpi_size_h; MPI_Comm_size(h_comm,&mpi_size_h);
+      int mpi_rank_b; MPI_Comm_rank(b_comm,&mpi_rank_b);
+      int mpi_size_b; MPI_Comm_size(b_comm,&mpi_size_b);
+      int mpi_rank_t; MPI_Comm_rank(t_comm,&mpi_rank_t);
+      int mpi_size_t; MPI_Comm_size(t_comm,&mpi_size_t);
+
+      size_t local_len = hii.size();
+      int nb = num_block;
+      int nb_min = nroot + std::max(nroot,10);
+      if( nb < nb_min ) nb = nb_min;
+      {
+	long long ll = static_cast<long long>(local_len);
+	long long gl = ll;
+	MPI_Allreduce(&ll,&gl,1,MPI_LONG_LONG,MPI_SUM,b_comm);
+	if( static_cast<long long>(nb) > gl ) nb = static_cast<int>(gl);
+      }
+      if( nb < nroot ) nb = nroot;
+      if( num_block != nb && mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0 ) {
+	std::cout << " DavidsonMultiRoot(stored): subspace size set to " << nb
+		  << " (nroot=" << nroot << ")" << std::endl;
+      }
+
+      std::vector<std::vector<ElemT>> v(nb, std::vector<ElemT>(local_len));
+      std::vector<std::vector<ElemT>> Hv(nb, std::vector<ElemT>(local_len));
+      std::vector<std::vector<ElemT>> Ritz(nroot, std::vector<ElemT>(local_len));
+      std::vector<ElemT> res(local_len);
+      std::vector<RealT> norm_r(nroot, RealT(0));
+      std::vector<ElemT> dii(hii);
+      GetTotalD(hii,dii,h_comm);
+
+      ElemT * H = (ElemT *) calloc((size_t)nb*nb,sizeof(ElemT));
+      ElemT * U = (ElemT *) calloc((size_t)nb*nb,sizeof(ElemT));
+      RealT * E = (RealT *) malloc((size_t)nb*sizeof(RealT));
+      char jobz = 'V';
+      char uplo = 'U';
+      ElemT volp(1.0/(mpi_size_h*mpi_size_t));
+
+      int nseed = nroot;
+      for(int p=0; p < nroot; p++) v[p] = W[p];
+      for(int p=0; p < nroot; p++) {
+	for(int q=0; q < p; q++) {
+	  ElemT olap; InnerProduct(v[q],v[p],olap,b_comm);
+	  olap *= ElemT(-1.0);
+#pragma omp parallel for
+	  for(size_t is=0; is < local_len; is++) v[p][is] += v[q][is]*olap;
+	}
+	RealT nrm; Normalize(v[p],nrm,b_comm);
+      }
+
+      bool do_continue = true;
+      for(int it=0; it < max_iteration && do_continue; it++) {
+	int ib = 0, m = 0, ncur = nseed;
+	while(true) {
+	  for(int jb = m; jb < ncur; jb++) {
+	    Zero(Hv[jb]);
+	    mult(hii,ih,jh,hij,len,slide,v[jb],Hv[jb],h_comm,b_comm,t_comm);
+	  }
+	  m = ncur; ib = ncur - 1;
+
+	  for(int jb=0; jb <= ib; jb++)
+	    for(int kb=0; kb <= ib; kb++)
+	      InnerProduct(v[jb],Hv[kb],H[jb+nb*kb],b_comm);
+	  for(int jb=0; jb <= ib; jb++)
+	    for(int kb=0; kb <= ib; kb++)
+	      U[jb+nb*kb] = H[jb+nb*kb];
+	  hp_numeric::MatHeev(jobz,uplo,ib+1,U,nb,E);
+
+	  bool all_converged = true;
+	  std::vector<int> unconverged;
+	  for(int p=0; p < nroot; p++) {
+	    ElemT x = U[0+nb*p];
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) Ritz[p][is] = v[0][is]*x;
+	    x = ElemT(-1.0) * U[0+nb*p];
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) res[is] = Hv[0][is]*x;
+	    for(int kb=1; kb <= ib; kb++) {
+	      x = U[kb+nb*p];
+#pragma omp parallel for
+	      for(size_t is=0; is < local_len; is++) Ritz[p][is] += v[kb][is]*x;
+	      x = ElemT(-1.0) * U[kb+nb*p];
+#pragma omp parallel for
+	      for(size_t is=0; is < local_len; is++) res[is] += Hv[kb][is]*x;
+	    }
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) res[is] += E[p]*Ritz[p][is];
+	    MpiAllreduce(Ritz[p],MPI_SUM,t_comm); MpiAllreduce(Ritz[p],MPI_SUM,h_comm);
+	    MpiAllreduce(res,MPI_SUM,t_comm);     MpiAllreduce(res,MPI_SUM,h_comm);
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) Ritz[p][is] *= volp;
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) res[is] *= volp;
+	    RealT nrmw; Normalize(Ritz[p],nrmw,b_comm);
+	    Normalize(res,norm_r[p],b_comm);
+	    if( norm_r[p] >= eps ) { all_converged = false; unconverged.push_back(p); }
+	  }
+
+	  if( mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0 ) {
+	    RealT maxr = RealT(0);
+	    for(int p=0;p<nroot;p++) if(norm_r[p]>maxr) maxr=norm_r[p];
+	    std::cout << " DavidsonMR(stored) iteration " << it << "." << ib
+		      << " (max_res=" << maxr << "):";
+	    for(int p=0; p < nroot; p++) std::cout << " " << E[p];
+	    std::cout << std::endl;
+	  }
+
+	  if( all_converged ) { do_continue = false; break; }
+
+	  int appended = 0;
+	  for(size_t u=0; u < unconverged.size(); u++) {
+	    if( ib + 1 + appended >= nb ) break;
+	    int p = unconverged[u];
+	    ElemT x0 = U[0+nb*p];
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) Ritz[p][is] = v[0][is]*x0;
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) res[is] = Hv[0][is]*(ElemT(-1.0)*x0);
+	    for(int kb=1; kb <= ib; kb++) {
+	      ElemT xk = U[kb+nb*p];
+#pragma omp parallel for
+	      for(size_t is=0; is < local_len; is++) Ritz[p][is] += v[kb][is]*xk;
+	      ElemT xkn = ElemT(-1.0)*U[kb+nb*p];
+#pragma omp parallel for
+	      for(size_t is=0; is < local_len; is++) res[is] += Hv[kb][is]*xkn;
+	    }
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) res[is] += E[p]*Ritz[p][is];
+	    MpiAllreduce(Ritz[p],MPI_SUM,t_comm); MpiAllreduce(Ritz[p],MPI_SUM,h_comm);
+	    MpiAllreduce(res,MPI_SUM,t_comm);     MpiAllreduce(res,MPI_SUM,h_comm);
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) Ritz[p][is] *= volp;
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) res[is] *= volp;
+	    RealT nrw; Normalize(Ritz[p],nrw,b_comm);
+	    RealT nrr; Normalize(res,nrr,b_comm);
+	    int slot = ib + 1 + appended;
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) {
+	      if( std::abs(E[p]-dii[is]) > eps_reg )
+		v[slot][is] = res[is]/(E[p] - dii[is]);
+	      else
+		v[slot][is] = res[is]/(E[p] - dii[is] - eps_reg);
+	    }
+	    for(int pass=0; pass < 2; pass++) {
+	      for(int kb=0; kb < slot; kb++) {
+		ElemT olap; InnerProduct(v[kb],v[slot],olap,b_comm);
+		olap *= ElemT(-1.0);
+#pragma omp parallel for
+		for(size_t is=0; is < local_len; is++) v[slot][is] += v[kb][is]*olap;
+	      }
+	    }
+	    RealT norm_v; Normalize(v[slot],norm_v,b_comm);
+	    if( norm_v < tau_drop ) continue;
+	    appended++;
+	  }
+	  if( appended == 0 ) break;
+	  ncur = ib + 1 + appended;
+	  if( ncur >= nb ) break;
+	}
+	if( !do_continue ) break;
+	for(int p=0; p < nroot; p++) v[p] = Ritz[p];
+	for(int p=0; p < nroot; p++) {
+	  for(int q=0; q < p; q++) {
+	    ElemT olap; InnerProduct(v[q],v[p],olap,b_comm);
+	    olap *= ElemT(-1.0);
+#pragma omp parallel for
+	    for(size_t is=0; is < local_len; is++) v[p][is] += v[q][is]*olap;
+	  }
+	  RealT nrm; Normalize(v[p],nrm,b_comm);
+	}
+	nseed = nroot;
+      }
+
+      W.resize(nroot);
+      Eout.resize(nroot);
+      for(int p=0; p < nroot; p++) { W[p] = Ritz[p]; Eout[p] = E[p]; }
+      free(H); free(U); free(E);
+    }
+
   } // end namespace gdb
 } // end namespace sbd
 
