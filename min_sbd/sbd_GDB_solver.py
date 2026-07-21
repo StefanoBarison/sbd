@@ -144,6 +144,7 @@ class SBDGdbSolver:
         davidson_iterations: int = 4,
         davidson_tolerance: float = 1e-4,
         nroots: int = 1,
+        single_spin: int = -1,
         method: int = 0,
         b_comm_size: int = 1,
         t_comm_size: int = 1,
@@ -228,6 +229,7 @@ class SBDGdbSolver:
         self.davidson_iterations = int(davidson_iterations)
         self.davidson_tolerance = float(davidson_tolerance)
         self.nroots = int(nroots)
+        self.single_spin = int(single_spin)
         self.method = int(method)
         self.b_comm_size = int(b_comm_size)
         self.t_comm_size = int(t_comm_size)
@@ -532,6 +534,7 @@ class SBDGdbSolver:
             "--iteration", str(self.davidson_iterations),
             "--tolerance", f"{self.davidson_tolerance:.6e}",
             "--nroots", str(self.nroots),
+            *(["--single_spin", str(self.single_spin)] if self.single_spin >= 0 else []),
             "--b_comm_size", str(self.b_comm_size),
             "--t_comm_size", str(self.t_comm_size),
             "--bit_length", str(self.bit_length),
