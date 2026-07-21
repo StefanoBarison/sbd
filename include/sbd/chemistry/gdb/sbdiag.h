@@ -18,6 +18,7 @@ namespace sbd {
       int max_it = 1;
       int max_nb = 10;
       int nroots = 1;
+      int single_spin = -1;   // target total spin S (>=0) for Option-2 projection; -1 = off
       double eps = 1.0e-4;
       double max_time = 86400.0;
       int init = 0;
@@ -63,6 +64,9 @@ namespace sbd {
 	}
 	if ( std::string(argv[i]) == "--nroots" ) {
 	  sbd_data.nroots = std::atoi(argv[++i]);
+	}
+	if ( std::string(argv[i]) == "--single_spin" ) {
+	  sbd_data.single_spin = std::atoi(argv[++i]);
 	}
 	if ( std::string(argv[i]) == "--tolerance" ) {
 	  sbd_data.eps = std::atof(argv[++i]);
@@ -222,6 +226,7 @@ namespace sbd {
       int max_it = sbd_data.max_it;
       int max_nb = sbd_data.max_nb;
       int nroots = sbd_data.nroots;
+      int single_spin = sbd_data.single_spin;
       double eps = sbd_data.eps;
       double max_time = sbd_data.max_time;
       int init = sbd_data.init;
@@ -361,7 +366,64 @@ namespace sbd {
 	sbd::Davidson(hii, w, device_mult,
 			max_it,max_nb,eps,max_time);
 #else
-	if( nroots > 1 ) {
+	if( single_spin >= 0 ) {
+	  // Option 2 (matrix-free): project onto target spin S. b_comm==1 only.
+	  if( b_comm_size > 1 ) {
+	    if( mpi_rank == 0 )
+	      std::cerr << " sbd: ERROR --single_spin requires b_comm_size == 1 "
+			<< "(configuration determinants scatter across b ranks); got "
+			<< b_comm_size << std::endl;
+	    MPI_Abort(comm, 1);
+	  }
+	  int nr = (nroots > 1) ? nroots : 1;
+	  int Sz2 = 0;
+	  if( !det.empty() ) {
+	    int na = 0, nb2 = 0;
+	    for(int p=0; p < static_cast<int>(L); p++) {
+	      if( getocc(det[0], bit_length, 2*p) )   na++;
+	      if( getocc(det[0], bit_length, 2*p+1) ) nb2++;
+	    }
+	    Sz2 = na - nb2;
+	  }
+	  SpinProjector Vproj =
+	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
+					  single_spin, Sz2);
+	  if( mpi_rank == 0 )
+	    std::cout << " sbd: single_spin S=" << single_spin
+		      << " projected CSF dim = " << Vproj.total_csf << std::endl;
+	  std::vector<std::vector<ElemT>> Wcsf;
+	  std::vector<double> Eroots;
+	  DavidsonMultiRootProjected(hii, Vproj, Wcsf, Eroots, det,
+				     bit_length, static_cast<size_t>(L),
+				     idxmap, exidx, I0, I1, I2,
+				     h_comm, b_comm, t_comm,
+				     max_it, max_nb, nr, eps);
+	  if( mpi_rank == 0 ) {
+	    std::cout.precision(12);
+	    for(int p=0; p < nr; p++)
+	      std::cout << " sbd: SingleSpin E[" << p << "] = " << Eroots[p] << std::endl;
+	  }
+	  for(int p=0; p < nr; p++) {
+	    std::vector<ElemT> wp;
+	    project_up(Vproj, Wcsf[p], wp, det.size());
+	    std::vector<ElemT> vp(det.size(), ElemT(0.0));
+	    mult(hii, wp, vp, bit_length, static_cast<size_t>(L), det,
+		 idxmap, exidx, I0, I1, I2, h_comm, b_comm, t_comm);
+	    ElemT Ep; InnerProduct(wp, vp, Ep, b_comm);
+	    if( do_rdm != 0 ) {
+	      std::vector<std::vector<ElemT>> one_p_rdm_p, two_p_rdm_p;
+	      Correlation(wp, det, bit_length, static_cast<size_t>(L),
+			  idxmap, exidx, h_comm, b_comm, t_comm,
+			  one_p_rdm_p, two_p_rdm_p);
+	      if( mpi_rank == 0 )
+		WriteRdmFiles(p, static_cast<int>(L), one_p_rdm_p, two_p_rdm_p);
+	    }
+	    if( mpi_rank == 0 )
+	      std::cout << " sbd: SingleSpin root " << p
+			<< " Energy = " << GetReal(Ep) << std::endl;
+	    if( p == 0 ) w = wp;
+	  }
+	} else if( nroots > 1 ) {
 	  // Multi-root (block Davidson-Liu). Seed W[0]=w (HF/current), W[1..] random.
 	  std::vector<std::vector<ElemT>> Wroots(nroots, w);
 	  for(int p=1; p < nroots; p++) {
@@ -499,7 +561,62 @@ namespace sbd {
 		    << " sbd: start davidson" << std::endl;
 	}
 	auto time_start_david = std::chrono::high_resolution_clock::now();
-	if( nroots > 1 ) {
+	if( single_spin >= 0 ) {
+	  // Option 2 (stored matrix): project onto target spin S. b_comm==1 only.
+	  if( b_comm_size > 1 ) {
+	    if( mpi_rank == 0 )
+	      std::cerr << " sbd: ERROR --single_spin requires b_comm_size == 1 "
+			<< "(configuration determinants scatter across b ranks); got "
+			<< b_comm_size << std::endl;
+	    MPI_Abort(comm, 1);
+	  }
+	  int nr = (nroots > 1) ? nroots : 1;
+	  int Sz2 = 0;
+	  if( !det.empty() ) {
+	    int na = 0, nb2 = 0;
+	    for(int p=0; p < static_cast<int>(L); p++) {
+	      if( getocc(det[0], bit_length, 2*p) )   na++;
+	      if( getocc(det[0], bit_length, 2*p+1) ) nb2++;
+	    }
+	    Sz2 = na - nb2;
+	  }
+	  SpinProjector Vproj =
+	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
+					  single_spin, Sz2);
+	  if( mpi_rank == 0 )
+	    std::cout << " sbd: single_spin S=" << single_spin
+		      << " projected CSF dim = " << Vproj.total_csf << std::endl;
+	  std::vector<std::vector<ElemT>> Wcsf;
+	  std::vector<double> Eroots;
+	  DavidsonMultiRootProjectedStored(hii, Vproj, Wcsf, Eroots, det.size(),
+					   ih, jh, hij, len, slide,
+					   h_comm, b_comm, t_comm,
+					   max_it, max_nb, nr, eps);
+	  if( mpi_rank == 0 ) {
+	    std::cout.precision(12);
+	    for(int p=0; p < nr; p++)
+	      std::cout << " sbd: SingleSpin E[" << p << "] = " << Eroots[p] << std::endl;
+	  }
+	  for(int p=0; p < nr; p++) {
+	    std::vector<ElemT> wp;
+	    project_up(Vproj, Wcsf[p], wp, det.size());
+	    std::vector<ElemT> vp(det.size(), ElemT(0.0));
+	    sbd::gdb::mult(hii, ih, jh, hij, len, slide, wp, vp, h_comm, b_comm, t_comm);
+	    ElemT Ep; InnerProduct(wp, vp, Ep, b_comm);
+	    if( do_rdm != 0 ) {
+	      std::vector<std::vector<ElemT>> one_p_rdm_p, two_p_rdm_p;
+	      Correlation(wp, det, bit_length, static_cast<size_t>(L),
+			  idxmap, exidx, h_comm, b_comm, t_comm,
+			  one_p_rdm_p, two_p_rdm_p);
+	      if( mpi_rank == 0 )
+		WriteRdmFiles(p, static_cast<int>(L), one_p_rdm_p, two_p_rdm_p);
+	    }
+	    if( mpi_rank == 0 )
+	      std::cout << " sbd: SingleSpin root " << p
+			<< " Energy = " << GetReal(Ep) << std::endl;
+	    if( p == 0 ) w = wp;
+	  }
+	} else if( nroots > 1 ) {
 	  // Multi-root (block Davidson-Liu), stored-matrix variant.
 	  std::vector<std::vector<ElemT>> Wroots(nroots, w);
 	  for(int p=1; p < nroots; p++) {

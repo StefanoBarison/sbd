@@ -17,6 +17,7 @@
 #endif
 #include "sbd/chemistry/gdb/occupation.h"
 #include "sbd/chemistry/gdb/correlation.h"
+#include "sbd/chemistry/gdb/single_spin.h"
 #include "sbd/chemistry/gdb/restart.h"
 #include "sbd/chemistry/gdb/carryover.h"
 #include "sbd/chemistry/gdb/expansion.h"
