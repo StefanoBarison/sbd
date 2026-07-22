@@ -49,8 +49,21 @@ themselves (same convention as qiskit-addon-sqd and the TPB wrapper).
 
 Spin handling
 -------------
-SBD has no spin-projection mechanism.  The ``spin_sq`` argument of
-``sci_solver_callable`` must be ``None``.
+Two ways to get single-spin roots (this branch): (1) diagonalize the (spin-mixed)
+basis with ``nroots`` and filter by ``parse_per_root_spin``; or (2) the projected
+Option-2 solver via ``single_spin`` = target multiplicity 2S+1 (1=singlet,
+2=doublet, 3=triplet, ...), which returns only that spin.  The ``spin_sq`` argument
+of ``sci_solver_callable`` is unused and must stay ``None``.
+
+Carryover
+---------
+``carryover_type`` (0=none, 1=weight truncation, 2/3=HCI heatbath expansion),
+``carryover_root`` (which converged root to carry over in multiroot/single-spin),
+and ``carryover_options`` (dict of extra ``--flag value`` pairs, e.g.
+``{"carryover_ratio": "0.1"}`` or ``{"heatbath_cutoff": "1e-4",
+"carryovername": "carryover"}``) are passed through to the binary.  Supply
+``carryovername`` in ``carryover_options`` if you want the carried determinants
+written to disk.
 
 Seed caveat
 -----------
@@ -145,6 +158,9 @@ class SBDGdbSolver:
         davidson_tolerance: float = 1e-4,
         nroots: int = 1,
         single_spin: int = -1,
+        carryover_type: int = 0,
+        carryover_root: int = 0,
+        carryover_options: dict | None = None,
         method: int = 0,
         b_comm_size: int = 1,
         t_comm_size: int = 1,
@@ -230,6 +246,9 @@ class SBDGdbSolver:
         self.davidson_tolerance = float(davidson_tolerance)
         self.nroots = int(nroots)
         self.single_spin = int(single_spin)
+        self.carryover_type = int(carryover_type)
+        self.carryover_root = int(carryover_root)
+        self.carryover_options = dict(carryover_options or {})
         self.method = int(method)
         self.b_comm_size = int(b_comm_size)
         self.t_comm_size = int(t_comm_size)
@@ -535,6 +554,11 @@ class SBDGdbSolver:
             "--tolerance", f"{self.davidson_tolerance:.6e}",
             "--nroots", str(self.nroots),
             *(["--single_spin", str(self.single_spin)] if self.single_spin >= 0 else []),
+            *(["--carryover_type", str(self.carryover_type),
+               "--carryover_root", str(self.carryover_root)]
+              if self.carryover_type > 0 else []),
+            *([tok for k, v in self.carryover_options.items()
+               for tok in (f"--{k}", str(v))] if self.carryover_type > 0 else []),
             "--b_comm_size", str(self.b_comm_size),
             "--t_comm_size", str(self.t_comm_size),
             "--bit_length", str(self.bit_length),

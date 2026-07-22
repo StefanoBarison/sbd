@@ -19,6 +19,7 @@ namespace sbd {
       int max_nb = 10;
       int nroots = 1;
       int single_spin = -1;   // target spin MULTIPLICITY 2S+1 (1=singlet,2=doublet,3=triplet,...) for Option-2 projection; <1 = off
+      int carryover_root = 0; // which converged root feeds carryover selection (multiroot/single-spin); clamped to [0,nroots-1]
       double eps = 1.0e-4;
       double max_time = 86400.0;
       int init = 0;
@@ -67,6 +68,9 @@ namespace sbd {
 	}
 	if ( std::string(argv[i]) == "--single_spin" ) {
 	  sbd_data.single_spin = std::atoi(argv[++i]);
+	}
+	if ( std::string(argv[i]) == "--carryover_root" ) {
+	  sbd_data.carryover_root = std::atoi(argv[++i]);
 	}
 	if ( std::string(argv[i]) == "--tolerance" ) {
 	  sbd_data.eps = std::atof(argv[++i]);
@@ -227,6 +231,7 @@ namespace sbd {
       int max_nb = sbd_data.max_nb;
       int nroots = sbd_data.nroots;
       int single_spin = sbd_data.single_spin;
+      int carryover_root = sbd_data.carryover_root;
       double eps = sbd_data.eps;
       double max_time = sbd_data.max_time;
       int init = sbd_data.init;
@@ -420,10 +425,11 @@ namespace sbd {
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: SingleSpin root " << p
 			<< " Energy = " << GetReal(Ep) << std::endl;
-	    if( p == 0 ) w = wp;
+	    if( p == std::min(std::max(carryover_root,0),nr-1) ) w = wp;
 	  }
 	} else if( nroots > 1 ) {
 	  // Multi-root (block Davidson-Liu). Seed W[0]=w (HF/current), W[1..] random.
+	  int cr = std::min(std::max(carryover_root,0), nroots-1);  // root to carry over
 	  std::vector<std::vector<ElemT>> Wroots(nroots, w);
 	  for(int p=1; p < nroots; p++) {
 	    Randomize(seed + static_cast<size_t>(p), Wroots[p], b_comm, h_comm);
@@ -456,9 +462,9 @@ namespace sbd {
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: MultiRoot root " << p
 			<< " Energy = " << GetReal(Ep) << std::endl;
-	    if( p != 0 ) std::vector<ElemT>().swap(Wroots[p]);
+	    if( p != cr ) std::vector<ElemT>().swap(Wroots[p]);
 	  }
-	  w = Wroots[0];   // keep root 0 for the downstream single-vector flow
+	  w = Wroots[cr];   // carry the chosen root into the downstream single-vector flow
 	} else {
 	Davidson(hii,w,det,bit_length,static_cast<size_t>(L),
 		 idxmap,exidx,I0,I1,I2,
@@ -612,10 +618,11 @@ namespace sbd {
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: SingleSpin root " << p
 			<< " Energy = " << GetReal(Ep) << std::endl;
-	    if( p == 0 ) w = wp;
+	    if( p == std::min(std::max(carryover_root,0),nr-1) ) w = wp;
 	  }
 	} else if( nroots > 1 ) {
 	  // Multi-root (block Davidson-Liu), stored-matrix variant.
+	  int cr = std::min(std::max(carryover_root,0), nroots-1);  // root to carry over
 	  std::vector<std::vector<ElemT>> Wroots(nroots, w);
 	  for(int p=1; p < nroots; p++) {
 	    Randomize(seed + static_cast<size_t>(p), Wroots[p], b_comm, h_comm);
@@ -644,9 +651,9 @@ namespace sbd {
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: MultiRoot root " << p
 			<< " Energy = " << GetReal(Ep) << std::endl;
-	    if( p != 0 ) std::vector<ElemT>().swap(Wroots[p]);
+	    if( p != cr ) std::vector<ElemT>().swap(Wroots[p]);
 	  }
-	  w = Wroots[0];
+	  w = Wroots[cr];
 	} else {
 	sbd::gdb::Davidson(hii,ih,jh,hij,len,slide,w,
 			   h_comm,b_comm,t_comm,max_it,max_nb,eps);
