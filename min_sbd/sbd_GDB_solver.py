@@ -292,7 +292,13 @@ class SBDGdbSolver:
                 GDB binary has no ``--max_cycle`` flag.
 
         Returns:
-            One :class:`experimental_SCIResult` per batch.
+            One entry per batch. With ``nroots == 1`` (default) each entry is a
+            single :class:`experimental_SCIResult` (unchanged contract). With
+            ``nroots > 1`` each entry is a **list** of ``nroots``
+            ``experimental_SCIResult`` (one per converged root, index-ordered by
+            ascending energy), each carrying that root's energy, ``spin_square``
+            (from ``1pRDM.<p>.txt`` when ``rdm=True``), and ``amplitudes`` (from
+            the per-root ``wf_root<p>`` wavefunction shards).
             ``energy`` is the electronic energy (ECORE=0).
             ``sci_state.amplitudes`` is a 1-D array of length M, aligned to
             the input ``(strs_a, strs_b)`` order.
@@ -417,57 +423,66 @@ class SBDGdbSolver:
                     f"--- stdout tail ---\n{tail}"
                 )
 
-            if self.rdm:
-                # In case we stored the RDM, we can use those to compute the spin square of the solution
-                rdm1_file = workdir / "1pRDM.txt"
-                rdm2_file = workdir / "2pRDM.txt"
-
+            def _spin_from_rdm(one_name: str, two_name: str):
+                """Compute <S^2> from a pair of RDM files in workdir, or None."""
+                if not self.rdm:
+                    return None
+                rdm1_file = workdir / one_name
+                rdm2_file = workdir / two_name
                 try:
-                    # We have to parse the RDMs to compute the spin square, since GDB doesn't print it out
-                    # The 1-RDM file has lines of the form "i j value" for the element <i|ρ|j>
                     rdm1 = np.zeros((norb, norb), dtype=np.float64)
-                    # Can we use np.loadtxt here?  Maybe, but let's be defensive in case of formatting issues and just parse line by line
                     with open(rdm1_file, "r") as f:
                         for line in f:
                             i, j, value = map(float, line.split())
                             rdm1[int(i), int(j)] = value
-                    # The 2-RDM file has lines of the form "i j k l value" for the element <ij|Γ|kl>
                     rdm2 = np.zeros((norb, norb, norb, norb), dtype=np.float64)
                     with open(rdm2_file, "r") as f:
                         for line in f:
                             i, j, k, l, value = map(float, line.split())
                             rdm2[int(i), int(j), int(k), int(l)] = value
-                    #rdm2 = -1* rdm2.transpose(0,3,2,1)
-                    
-                    # Now compute spin square
-                    spin_res = compute_spin_square(rdm1, rdm2)
-                except:
+                    return compute_spin_square(rdm1, rdm2)
+                except Exception:
                     warnings.warn(
-                        f"Failed to parse RDM files for spin square computation; setting spin_square=None.  Check {rdm1_file} and {rdm2_file} for details.",
-                        UserWarning,
-                        stacklevel=2,
+                        f"Failed to parse RDM files {rdm1_file}/{rdm2_file} for "
+                        "spin square; setting spin_square=None.",
+                        UserWarning, stacklevel=2,
                     )
-                    spin_res = None
+                    return None
 
-
-            energy       = _parse_gdb_energy(proc.stdout)
-            amplitudes   = self._recover_amplitudes(workdir, strs_a, strs_b, norb, M)
-            occ_a, occ_b = _compute_occupancies(strs_a, strs_b, amplitudes, norb)
-            _check_occupancy_consistency(occ_a, occ_b, proc.stdout, norb)
+            def _make_result(energy, savename, one_rdm, two_rdm):
+                amplitudes = self._recover_amplitudes(
+                    workdir, strs_a, strs_b, norb, M, savename=savename
+                )
+                occ_a, occ_b = _compute_occupancies(strs_a, strs_b, amplitudes, norb)
+                _check_occupancy_consistency(occ_a, occ_b, proc.stdout, norb)
+                return experimental_SCIResult(
+                    energy=energy,
+                    sci_state=experimental_SCIState(
+                        amplitudes=amplitudes,
+                        ci_strs_a=strs_a, ci_strs_b=strs_b,
+                        norb=norb, nelec=nelec,
+                    ),
+                    orbital_occupancies=(occ_a, occ_b),
+                    spin_square=_spin_from_rdm(one_rdm, two_rdm),
+                )
 
             succeeded = True
-            return experimental_SCIResult(
-                energy=energy,
-                sci_state=experimental_SCIState(
-                    amplitudes=amplitudes,
-                    ci_strs_a=strs_a,
-                    ci_strs_b=strs_b,
-                    norb=norb,
-                    nelec=nelec,
-                ),
-                orbital_occupancies=(occ_a, occ_b),
-                spin_square=spin_res if self.rdm else None,
-            )
+            if self.nroots > 1:
+                # Multi-root / single-spin: one result per root, each with its own
+                # energy (stdout), spin (1pRDM.<p>.txt), and amplitudes (savename_root<p>).
+                energies = _parse_gdb_multiroot_energies(proc.stdout)
+                results = []
+                for p in range(self.nroots):
+                    e_p = energies[p] if p < len(energies) else float("nan")
+                    results.append(_make_result(
+                        e_p, f"wf_root{p}", f"1pRDM.{p}.txt", f"2pRDM.{p}.txt"
+                    ))
+                return results
+            else:
+                # single root (root 0): unchanged contract
+                return _make_result(
+                    _parse_gdb_energy(proc.stdout), "wf", "1pRDM.txt", "2pRDM.txt"
+                )
 
         finally:
             should_clean = succeeded and self.clean_temp_dir
@@ -575,13 +590,14 @@ class SBDGdbSolver:
         strs_b: np.ndarray,
         norb: int,
         M: int,
+        savename: str = "wf",
     ) -> np.ndarray:
         amp_map = _read_gdb_wavefunction(
-            workdir, "wf", self.b_comm_size, norb, self.bit_length
+            workdir, savename, self.b_comm_size, norb, self.bit_length
         )
         if amp_map is None:
             warnings.warn(
-                f"Failed to read GDB wavefunction shards from {workdir}/wf*.bin. "
+                f"Failed to read GDB wavefunction shards from {workdir}/{savename}*.bin. "
                 "Returning a stub amplitudes array (1.0 at index 0). Downstream "
                 "carryover selection will behave as if the state is a single determinant.",
                 UserWarning,
@@ -801,6 +817,20 @@ def _check_occupancy_consistency(
 _GDB_ENERGY_RE = re.compile(
     r"sbd:\s+Energy\s*=\s*(?P<e>-?\d+\.\d+(?:[eE][+-]?\d+)?)"
 )
+# per-root energies for multi-root / single-spin runs:
+#   "sbd: MultiRoot E[<p>] = <e>"  or  "sbd: SingleSpin E[<p>] = <e>"
+_GDB_MULTIROOT_ENERGY_RE = re.compile(
+    r"sbd:\s+(?:MultiRoot|SingleSpin)\s+E\[(?P<p>\d+)\]\s*=\s*"
+    r"(?P<e>-?\d+\.\d+(?:[eE][+-]?\d+)?)"
+)
+
+
+def _parse_gdb_multiroot_energies(stdout: str) -> list[float]:
+    """Return per-root energies (index-ordered) from MultiRoot/SingleSpin lines."""
+    hits = {}
+    for m in _GDB_MULTIROOT_ENERGY_RE.finditer(stdout):
+        hits[int(m.group("p"))] = float(m.group("e"))
+    return [hits[p] for p in sorted(hits)]
 _GDB_DENSITY_RE = re.compile(
     r"sbd:\s+density\s*=\s*\[(?P<d>[^\n]*)"
 )

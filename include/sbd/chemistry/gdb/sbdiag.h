@@ -425,6 +425,9 @@ namespace sbd {
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: SingleSpin root " << p
 			<< " Energy = " << GetReal(Ep) << std::endl;
+	    if( !savename.empty() )
+	      SaveWavefunction(savename + "_root" + std::to_string(p),
+			       det, h_comm, b_comm, t_comm, wp);
 	    if( p == std::min(std::max(carryover_root,0),nr-1) ) w = wp;
 	  }
 	} else if( nroots > 1 ) {
@@ -462,6 +465,9 @@ namespace sbd {
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: MultiRoot root " << p
 			<< " Energy = " << GetReal(Ep) << std::endl;
+	    if( !savename.empty() )
+	      SaveWavefunction(savename + "_root" + std::to_string(p),
+			       det, h_comm, b_comm, t_comm, Wroots[p]);
 	    if( p != cr ) std::vector<ElemT>().swap(Wroots[p]);
 	  }
 	  w = Wroots[cr];   // carry the chosen root into the downstream single-vector flow
@@ -618,6 +624,9 @@ namespace sbd {
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: SingleSpin root " << p
 			<< " Energy = " << GetReal(Ep) << std::endl;
+	    if( !savename.empty() )
+	      SaveWavefunction(savename + "_root" + std::to_string(p),
+			       det, h_comm, b_comm, t_comm, wp);
 	    if( p == std::min(std::max(carryover_root,0),nr-1) ) w = wp;
 	  }
 	} else if( nroots > 1 ) {
@@ -651,6 +660,9 @@ namespace sbd {
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: MultiRoot root " << p
 			<< " Energy = " << GetReal(Ep) << std::endl;
+	    if( !savename.empty() )
+	      SaveWavefunction(savename + "_root" + std::to_string(p),
+			       det, h_comm, b_comm, t_comm, Wroots[p]);
 	    if( p != cr ) std::vector<ElemT>().swap(Wroots[p]);
 	  }
 	  w = Wroots[cr];
