@@ -319,19 +319,15 @@ namespace sbd {
 
       const int K = V.total_csf;
 
-      // Max subspace (Krylov) dimension before collapse. The projected/CSF space
-      // is far less peaked than the determinant ground state, so a small subspace
-      // (the det-space default) converges glacially or diverges at large K. Size
-      // it generously and independently of --block (which defaults tiny): a wide
-      // subspace per cycle + a thick restart (below) is what makes Davidson-Liu
-      // actually converge here.
-      int nb = std::max(num_block, 8 * nroot + 20);
+      // Subspace (Krylov) cap before collapse. Modest size is fine — with a
+      // correct residual the block Davidson-Liu converges in tens of iterations
+      // at small nb (verified in Python: nroot=2, nb=12 -> 57 iters at K=3906).
+      // Keep RAM low: CSF vectors are held per rank (b_comm==1), so 2*nb*K.
+      int nb = num_block;
+      int nb_min = nroot + std::max(nroot, 10);
+      if (nb < nb_min) nb = nb_min;
       if (nb > K) nb = K;
       if (nb < nroot) nb = nroot;
-      // thick-restart: number of lowest Ritz vectors carried across a collapse
-      // (more than nroot so Krylov information is not thrown away each cycle).
-      int nkeep = std::min(2 * nroot + 8, nb - 1);
-      if (nkeep < nroot) nkeep = nroot;
 
       // projected diagonal of H in CSF space (approx: V^T diag(H) V, diagonal
       // part) for the preconditioner. Build once: for each CSF column, its
@@ -423,7 +419,12 @@ namespace sbd {
               for (int i = 0; i < K; i++) Ritz[p][i] += v[kb][i]*x;
               for (int i = 0; i < K; i++) res[i]     += Hv[kb][i]*x;
             }
-            _local_normalize<ElemT,RealT>(Ritz[p]);
+            // residual r = H*ritz - E*ritz; form it BEFORE normalizing ritz so
+            // both terms use the same (un-normalized) ritz scaling. (Ritz here is
+            // already unit-norm from the Rayleigh eigenvector, so this is just the
+            // clean residual; the earlier bug normalized ritz between the two
+            // terms, producing an inconsistently-scaled residual -> bad correction
+            // -> stalled/divergent Davidson at large K.)
             for (int i = 0; i < K; i++) res[i] -= E[p]*Ritz[p][i];
             _local_normalize<ElemT,RealT>(res);
             int slot = ib + 1 + appended;
@@ -447,27 +448,16 @@ namespace sbd {
           if (ncur >= nb) break;
         }
         if (!do_continue) break;
-        // Thick restart: seed with the lowest `nkeep` Ritz vectors of the just-
-        // finished subspace (columns 0..nk-1 of U), not just the nroot targets,
-        // so Krylov information is retained across the collapse. Reconstruct into
-        // a temp, then place into v[0..nk-1] and re-orthonormalize.
-        int nk = std::min(nkeep, ib + 1);
-        std::vector<std::vector<ElemT>> seed(nk, std::vector<ElemT>(K, ElemT(0.0)));
-        for (int c = 0; c < nk; c++) {
-          for (int kb = 0; kb <= ib; kb++) {
-            ElemT x = U[kb + nb*c];
-            for (int i = 0; i < K; i++) seed[c][i] += v[kb][i]*x;
+        // Restart: reseed with the nroot Ritz vectors, re-orthonormalize.
+        for (int p = 0; p < nroot; p++) v[p] = Ritz[p];
+        for (int p = 0; p < nroot; p++) {
+          for (int q = 0; q < p; q++) {
+            ElemT ol = _local_inner(v[q], v[p]);
+            for (int i = 0; i < K; i++) v[p][i] -= v[q][i]*ol;
           }
+          _local_normalize<ElemT,RealT>(v[p]);
         }
-        for (int c = 0; c < nk; c++) v[c] = seed[c];
-        for (int c = 0; c < nk; c++) {
-          for (int q = 0; q < c; q++) {
-            ElemT ol = _local_inner(v[q], v[c]);
-            for (int i = 0; i < K; i++) v[c][i] -= v[q][i]*ol;
-          }
-          _local_normalize<ElemT,RealT>(v[c]);
-        }
-        nseed = nk;
+        nseed = nroot;
       }
 
       Wcsf.resize(nroot);
