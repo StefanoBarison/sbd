@@ -158,6 +158,7 @@ class SBDGdbSolver:
         davidson_tolerance: float = 1e-4,
         nroots: int = 1,
         single_spin: int = -1,
+        restart_keep: int | None = None,
         carryover_type: int = 0,
         carryover_root: int = 0,
         carryover_options: dict | None = None,
@@ -246,6 +247,7 @@ class SBDGdbSolver:
         self.davidson_tolerance = float(davidson_tolerance)
         self.nroots = int(nroots)
         self.single_spin = int(single_spin)
+        self.restart_keep = None if restart_keep is None else int(restart_keep)
         self.carryover_type = int(carryover_type)
         self.carryover_root = int(carryover_root)
         self.carryover_options = dict(carryover_options or {})
@@ -569,6 +571,7 @@ class SBDGdbSolver:
             "--tolerance", f"{self.davidson_tolerance:.6e}",
             "--nroots", str(self.nroots),
             *(["--single_spin", str(self.single_spin)] if self.single_spin >= 0 else []),
+            *(["--restart_keep", str(self.restart_keep)] if self.restart_keep is not None else []),
             *(["--carryover_type", str(self.carryover_type),
                "--carryover_root", str(self.carryover_root)]
               if self.carryover_type > 0 else []),
