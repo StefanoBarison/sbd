@@ -518,14 +518,54 @@ namespace sbd {
               if (std::abs(den) > eps_reg) vslot[i] = res[i]/den;
               else                          vslot[i] = res[i]/(den - eps_reg);
             }
-            // MGS (two passes) against all current basis + accepted corrections
-            for (int pass = 0; pass < 2; pass++)
-              for (int kb = 0; kb < slot; kb++) {
-                ElemT ol = _local_inner(v[kb], vslot);
-                const std::vector<ElemT> & vkb = v[kb];
-#pragma omp parallel for if(K > 4096)
-                for (int i = 0; i < K; i++) vslot[i] -= vkb[i]*ol;
+            // MGS (two passes) against all current basis + accepted corrections.
+            // Classical MGS keeps the kb loop sequential (each subtraction depends
+            // on the previous), but the two K-length loops per kb (inner product +
+            // axpy) were each spawning their own OpenMP region: ~4*slot fork/join
+            // barriers per correction over tiny K-length work. At many threads
+            // across NUMA sockets that dwarfs the work (correction+MGS regressed
+            // 29.7s -> 73.7s from 12 to 48 threads, K=113k). Fix: ONE persistent
+            // parallel region for the whole MGS; the K-loops run as omp-for inside
+            // it and the per-kb inner product reduces through a per-thread partial
+            // array (same pattern as the subspace build). Barriers remain (2*slot)
+            // but there is no fork/join or first-touch storm. Numerics identical:
+            // same order, same two passes, same Conjugate(v_kb).vslot dot.
+            if (K > 4096) {
+              const int nth = omp_get_max_threads();
+              std::vector<ElemT> mgs_partial(nth, ElemT(0.0));
+              ElemT ol_shared = ElemT(0.0);
+#pragma omp parallel
+              {
+                const int tid = omp_get_thread_num();
+                for (int pass = 0; pass < 2; pass++) {
+                  for (int kb = 0; kb < slot; kb++) {
+                    const std::vector<ElemT> & vkb = v[kb];
+                    ElemT loc = ElemT(0.0);
+#pragma omp for
+                    for (int i = 0; i < K; i++) loc += Conjugate(vkb[i]) * vslot[i];
+                    mgs_partial[tid] = loc;
+#pragma omp barrier
+#pragma omp single
+                    {
+                      ElemT s = ElemT(0.0);
+                      for (int t = 0; t < nth; ++t) s += mgs_partial[t];
+                      ol_shared = s;
+                    }
+                    // implicit barrier after single -> ol_shared visible to all
+                    const ElemT ol = ol_shared;
+#pragma omp for
+                    for (int i = 0; i < K; i++) vslot[i] -= vkb[i]*ol;
+                  }
+                }
               }
+            } else {
+              for (int pass = 0; pass < 2; pass++)
+                for (int kb = 0; kb < slot; kb++) {
+                  ElemT ol = _local_inner(v[kb], vslot);
+                  const std::vector<ElemT> & vkb = v[kb];
+                  for (int i = 0; i < K; i++) vslot[i] -= vkb[i]*ol;
+                }
+            }
             RealT nv = _local_normalize<ElemT,RealT>(v[slot]);
             if (nv < tau_drop) continue;
             appended++;
