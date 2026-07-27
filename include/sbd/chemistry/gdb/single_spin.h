@@ -23,6 +23,8 @@ Conventions: determinant bit 2p = alpha orbital p, 2p+1 = beta orbital p
 #include <functional>
 #include <map>
 #include <vector>
+#include <cstdlib>
+#include <omp.h>
 
 namespace sbd {
   namespace gdb {
@@ -221,6 +223,17 @@ namespace sbd {
       return V;
     }
 
+    // ---- optional per-phase timing (env SBD_SS_TIMING=1) ----------------------
+    // Zero overhead when off: one getenv at construction, a branch per phase.
+    struct SSTimers {
+      bool on = false;
+      double t_matvec=0, t_proj_up=0, t_mult=0, t_proj_down=0;
+      double t_subbuild=0, t_ritz=0, t_correct=0, t_restart=0;
+      long   n_matvec=0, n_inner=0;
+      SSTimers() { const char* e = std::getenv("SBD_SS_TIMING"); on = (e && e[0]=='1'); }
+    };
+    static inline double _wtime() { return MPI_Wtime(); }
+
     // ---- projected matvec y_csf = V^T (mult) (V x_csf) ------------------------
 
     /// Expand a CSF-space vector to determinant space: x_det = V x_csf (local).
@@ -228,7 +241,11 @@ namespace sbd {
     void project_up(const SpinProjector & V, const std::vector<ElemT> & x_csf,
                     std::vector<ElemT> & x_det, size_t ndet) {
       x_det.assign(ndet, ElemT(0.0));
-      for (size_t b = 0; b < V.blocks.size(); ++b) {
+      // Blocks own disjoint det indices (grouped by exact spatial config), so
+      // writing x_det[di] across blocks is race-free -> parallelize over blocks.
+      const long long nblk = static_cast<long long>(V.blocks.size());
+#pragma omp parallel for schedule(dynamic) if(nblk > 256)
+      for (long long b = 0; b < nblk; ++b) {
         const ConfigBlock & blk = V.blocks[b];
         int off = V.csf_offset[b];
         for (int r = 0; r < blk.block_dim; ++r) {
@@ -247,7 +264,11 @@ namespace sbd {
     void project_down(const SpinProjector & V, const std::vector<ElemT> & y_det,
                       std::vector<ElemT> & y_csf) {
       y_csf.assign(V.total_csf, ElemT(0.0));
-      for (size_t b = 0; b < V.blocks.size(); ++b) {
+      // Each block writes a disjoint y_csf[off .. off+n_csf) range (csf_offset is
+      // unique per block), so parallelizing over blocks is race-free.
+      const long long nblk = static_cast<long long>(V.blocks.size());
+#pragma omp parallel for schedule(dynamic) if(nblk > 256)
+      for (long long b = 0; b < nblk; ++b) {
         const ConfigBlock & blk = V.blocks[b];
         int off = V.csf_offset[b];
         for (int r = 0; r < blk.block_dim; ++r) {
@@ -265,19 +286,47 @@ namespace sbd {
     // norms are plain local reductions. mult() inside the matvec still uses the
     // t/h communicators for its own parallelism.
 
+    // ElemT may be complex, so we cannot use an OpenMP reduction clause on it
+    // directly. Accumulate per-thread partial sums into a scratch array and
+    // combine serially (thread count is small vs the K-length loop).
     template <typename ElemT>
     ElemT _local_inner(const std::vector<ElemT> & a, const std::vector<ElemT> & b) {
+      const size_t n = a.size();
+      if (n <= 4096) {   // small: parallel overhead not worth it
+        ElemT s = ElemT(0.0);
+        for (size_t i = 0; i < n; ++i) s += Conjugate(a[i]) * b[i];
+        return s;
+      }
+      int nth = omp_get_max_threads();
+      std::vector<ElemT> partial(nth, ElemT(0.0));
+#pragma omp parallel
+      {
+        int tid = omp_get_thread_num();
+        ElemT loc = ElemT(0.0);
+#pragma omp for
+        for (size_t i = 0; i < n; ++i) loc += Conjugate(a[i]) * b[i];
+        partial[tid] = loc;
+      }
       ElemT s = ElemT(0.0);
-      for (size_t i = 0; i < a.size(); ++i) s += Conjugate(a[i]) * b[i];
+      for (int t = 0; t < nth; ++t) s += partial[t];
       return s;
     }
 
     template <typename ElemT, typename RealT>
     RealT _local_normalize(std::vector<ElemT> & a) {
+      const size_t n = a.size();
       RealT n2 = RealT(0.0);
-      for (size_t i = 0; i < a.size(); ++i) n2 += GetReal(Conjugate(a[i]) * a[i]);
+      if (n <= 4096) {
+        for (size_t i = 0; i < n; ++i) n2 += GetReal(Conjugate(a[i]) * a[i]);
+      } else {
+#pragma omp parallel for reduction(+:n2)
+        for (size_t i = 0; i < n; ++i) n2 += GetReal(Conjugate(a[i]) * a[i]);
+      }
       RealT nrm = std::sqrt(n2);
-      if (nrm > RealT(0)) for (size_t i = 0; i < a.size(); ++i) a[i] /= nrm;
+      if (nrm > RealT(0)) {
+#pragma omp parallel for if(n > 4096)
+        for (size_t i = 0; i < n; ++i) a[i] /= nrm;
+      }
       return nrm;
     }
 
@@ -310,7 +359,8 @@ namespace sbd {
                                   int max_iteration,
                                   int num_block,
                                   int nroot,
-                                  RealT eps) {
+                                  RealT eps,
+                                  SSTimers * tmr = nullptr) {
       RealT eps_reg = 1.0e-12;
       RealT tau_drop = 1.0e-6;
       int mpi_rank_h; MPI_Comm_rank(h_comm,&mpi_rank_h);
@@ -333,7 +383,9 @@ namespace sbd {
       // part) for the preconditioner. Build once: for each CSF column, its
       // diagonal is sum_r coeffs[r,c]^2 * hii[det_index[r]] (rank-local).
       std::vector<RealT> ndiag(K, RealT(0));
-      for (size_t bidx = 0; bidx < V.blocks.size(); ++bidx) {
+      const long long nblk_diag = static_cast<long long>(V.blocks.size());
+#pragma omp parallel for schedule(dynamic) if(nblk_diag > 256)
+      for (long long bidx = 0; bidx < nblk_diag; ++bidx) {
         const ConfigBlock & blk = V.blocks[bidx];
         int off = V.csf_offset[bidx];
         for (int c = 0; c < blk.n_csf; ++c) {
@@ -373,24 +425,50 @@ namespace sbd {
           for (int jb = m; jb < ncur; jb++) matvec(v[jb], Hv[jb]);
           m = ncur; ib = ncur - 1;
 
-          for (int jb = 0; jb <= ib; jb++)
-            for (int kb = 0; kb <= ib; kb++)
-              H[jb + nb*kb] = _local_inner(v[jb], Hv[kb]);
-          for (int jb = 0; jb <= ib; jb++)
-            for (int kb = 0; kb <= ib; kb++)
-              U[jb + nb*kb] = H[jb + nb*kb];
+          double _ts = (tmr && tmr->on) ? _wtime() : 0.0;
+          // Subspace (Rayleigh) matrix H[jb,kb] = <v_jb, Hv_kb>. Parallelize ONCE
+          // over the flattened (jb,kb) pair index — each thread does full serial
+          // inner products for its pairs. The old code called _local_inner per
+          // pair, each spawning its own OMP region: ~nb^2 fork/join barriers per
+          // inner step over tiny K-length reductions -> catastrophic at many
+          // threads (measured subspace-build 0.18s serial -> 4.3s at 8 threads,
+          // K=3906; the 1120->3008s regression at K=113k/192 threads). One region
+          // amortizes the barrier over all pairs.
+          const int nv2 = (ib + 1) * (ib + 1);
+#pragma omp parallel for schedule(static) if(K > 4096)
+          for (int idx = 0; idx < nv2; ++idx) {
+            int jb = idx / (ib + 1);
+            int kb = idx % (ib + 1);
+            const std::vector<ElemT> & a = v[jb];
+            const std::vector<ElemT> & b = Hv[kb];
+            ElemT s = ElemT(0.0);
+            for (int i = 0; i < K; ++i) s += Conjugate(a[i]) * b[i];
+            H[jb + nb*kb] = s;
+            U[jb + nb*kb] = s;
+          }
+          if (tmr && tmr->on) tmr->n_inner += nv2;
           hp_numeric::MatHeev(jobz, uplo, ib+1, U, nb, E);
+          if (tmr && tmr->on) tmr->t_subbuild += _wtime() - _ts;
 
+          double _tr = (tmr && tmr->on) ? _wtime() : 0.0;
           bool all_converged = true;
           std::vector<int> unconverged;
           for (int p = 0; p < nroot; p++) {
-            for (int i = 0; i < K; i++) { Ritz[p][i] = ElemT(0.0); res[i] = ElemT(0.0); }
-            for (int kb = 0; kb <= ib; kb++) {
-              ElemT x = U[kb + nb*p];
-              for (int i = 0; i < K; i++) Ritz[p][i] += v[kb][i]*x;
-              for (int i = 0; i < K; i++) res[i]     += Hv[kb][i]*x;
+            // Ritz[p] = sum_kb U[kb,p] v[kb];  res = sum_kb U[kb,p] Hv[kb].
+            // Parallelize over the CSF index i (independent); loop order swapped
+            // so each i accumulates its full kb-sum in one thread iteration.
+            std::vector<ElemT> & Rp = Ritz[p];
+#pragma omp parallel for if(K > 4096)
+            for (int i = 0; i < K; i++) {
+              ElemT ri = ElemT(0.0), si = ElemT(0.0);
+              for (int kb = 0; kb <= ib; kb++) {
+                ElemT x = U[kb + nb*p];
+                ri += v[kb][i]*x;
+                si += Hv[kb][i]*x;
+              }
+              Rp[i] = ri;
+              res[i] = si - E[p]*ri;
             }
-            for (int i = 0; i < K; i++) res[i] -= E[p]*Ritz[p][i];
             RealT nrmw = _local_normalize<ElemT,RealT>(Ritz[p]);
             (void)nrmw;
             norm_r[p] = _local_normalize<ElemT,RealT>(res);
@@ -406,48 +484,59 @@ namespace sbd {
             std::cout << std::endl;
           }
 
+          if (tmr && tmr->on) tmr->t_ritz += _wtime() - _tr;
+
           if (all_converged) { do_continue = false; break; }
 
+          double _tc = (tmr && tmr->on) ? _wtime() : 0.0;
           int appended = 0;
           for (size_t u = 0; u < unconverged.size(); u++) {
             if (ib + 1 + appended >= nb) break;
             int p = unconverged[u];
-            // rebuild residual for root p
-            for (int i = 0; i < K; i++) { Ritz[p][i] = ElemT(0.0); res[i] = ElemT(0.0); }
-            for (int kb = 0; kb <= ib; kb++) {
-              ElemT x = U[kb + nb*p];
-              for (int i = 0; i < K; i++) Ritz[p][i] += v[kb][i]*x;
-              for (int i = 0; i < K; i++) res[i]     += Hv[kb][i]*x;
+            // rebuild residual for root p. residual r = H*ritz - E*ritz; form it
+            // with the same (un-normalized) ritz scaling on both terms (the old
+            // bug normalized ritz between the two terms -> inconsistent residual
+            // -> stalled/divergent Davidson at large K). Parallelize over i.
+            std::vector<ElemT> & Rp = Ritz[p];
+#pragma omp parallel for if(K > 4096)
+            for (int i = 0; i < K; i++) {
+              ElemT ri = ElemT(0.0), si = ElemT(0.0);
+              for (int kb = 0; kb <= ib; kb++) {
+                ElemT x = U[kb + nb*p];
+                ri += v[kb][i]*x;
+                si += Hv[kb][i]*x;
+              }
+              Rp[i] = ri;
+              res[i] = si - E[p]*ri;
             }
-            // residual r = H*ritz - E*ritz; form it BEFORE normalizing ritz so
-            // both terms use the same (un-normalized) ritz scaling. (Ritz here is
-            // already unit-norm from the Rayleigh eigenvector, so this is just the
-            // clean residual; the earlier bug normalized ritz between the two
-            // terms, producing an inconsistently-scaled residual -> bad correction
-            // -> stalled/divergent Davidson at large K.)
-            for (int i = 0; i < K; i++) res[i] -= E[p]*Ritz[p][i];
             _local_normalize<ElemT,RealT>(res);
             int slot = ib + 1 + appended;
+            std::vector<ElemT> & vslot = v[slot];
+#pragma omp parallel for if(K > 4096)
             for (int i = 0; i < K; i++) {
               RealT den = E[p] - ndiag[i];
-              if (std::abs(den) > eps_reg) v[slot][i] = res[i]/den;
-              else                          v[slot][i] = res[i]/(den - eps_reg);
+              if (std::abs(den) > eps_reg) vslot[i] = res[i]/den;
+              else                          vslot[i] = res[i]/(den - eps_reg);
             }
             // MGS (two passes) against all current basis + accepted corrections
             for (int pass = 0; pass < 2; pass++)
               for (int kb = 0; kb < slot; kb++) {
-                ElemT ol = _local_inner(v[kb], v[slot]);
-                for (int i = 0; i < K; i++) v[slot][i] -= v[kb][i]*ol;
+                ElemT ol = _local_inner(v[kb], vslot);
+                const std::vector<ElemT> & vkb = v[kb];
+#pragma omp parallel for if(K > 4096)
+                for (int i = 0; i < K; i++) vslot[i] -= vkb[i]*ol;
               }
             RealT nv = _local_normalize<ElemT,RealT>(v[slot]);
             if (nv < tau_drop) continue;
             appended++;
           }
+          if (tmr && tmr->on) tmr->t_correct += _wtime() - _tc;
           if (appended == 0) break;
           ncur = ib + 1 + appended;
           if (ncur >= nb) break;
         }
         if (!do_continue) break;
+        double _trs = (tmr && tmr->on) ? _wtime() : 0.0;
         // Restart: reseed with the nroot Ritz vectors, re-orthonormalize.
         for (int p = 0; p < nroot; p++) v[p] = Ritz[p];
         for (int p = 0; p < nroot; p++) {
@@ -458,6 +547,20 @@ namespace sbd {
           _local_normalize<ElemT,RealT>(v[p]);
         }
         nseed = nroot;
+        if (tmr && tmr->on) tmr->t_restart += _wtime() - _trs;
+      }
+
+      if (tmr && tmr->on && mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0) {
+        std::cout << "sbd: SS-TIMING (K=" << K << ", threads=" << omp_get_max_threads()
+                  << ")\n"
+                  << "  matvec total   = " << tmr->t_matvec   << " s (" << tmr->n_matvec << " calls)\n"
+                  << "    project_up   = " << tmr->t_proj_up  << " s\n"
+                  << "    mult (H*v)   = " << tmr->t_mult      << " s\n"
+                  << "    project_down = " << tmr->t_proj_down << " s\n"
+                  << "  subspace build = " << tmr->t_subbuild << " s (" << tmr->n_inner << " inner products)\n"
+                  << "  ritz+residual  = " << tmr->t_ritz     << " s\n"
+                  << "  correction+MGS = " << tmr->t_correct  << " s\n"
+                  << "  restart        = " << tmr->t_restart  << " s\n";
       }
 
       Wcsf.resize(nroot);
@@ -528,16 +631,29 @@ namespace sbd {
                                           int num_block,
                                           int nroot,
                                           RealT eps) {
+      SSTimers tm;
       auto matvec = [&](const std::vector<ElemT> & xc, std::vector<ElemT> & yc) {
         std::vector<ElemT> xdet, ydet(ndet, ElemT(0.0));
+        if (!tm.on) {
+          project_up(V, xc, xdet, ndet);
+          Zero(ydet);
+          mult(hii, ih, jh, hij, len, slide, xdet, ydet, h_comm, b_comm, t_comm);
+          project_down(V, ydet, yc);
+          return;
+        }
+        double t0 = _wtime();
         project_up(V, xc, xdet, ndet);
+        double t1 = _wtime(); tm.t_proj_up += t1 - t0;
         Zero(ydet);
         mult(hii, ih, jh, hij, len, slide, xdet, ydet, h_comm, b_comm, t_comm);
+        double t2 = _wtime(); tm.t_mult += t2 - t1;
         project_down(V, ydet, yc);
+        tm.t_proj_down += _wtime() - t2;
+        tm.t_matvec += _wtime() - t0; tm.n_matvec++;
       };
       _davidson_projected_core<ElemT,RealT>(hii, V, matvec, Wcsf, Eout,
                                             h_comm, b_comm, t_comm,
-                                            max_iteration, num_block, nroot, eps);
+                                            max_iteration, num_block, nroot, eps, &tm);
     }
 
   } // namespace gdb
