@@ -360,6 +360,7 @@ namespace sbd {
                                   int num_block,
                                   int nroot,
                                   RealT eps,
+                                  int nkeep,
                                   SSTimers * tmr = nullptr) {
       RealT eps_reg = 1.0e-12;
       RealT tau_drop = 1.0e-6;
@@ -378,6 +379,18 @@ namespace sbd {
       if (nb < nb_min) nb = nb_min;
       if (nb > K) nb = K;
       if (nb < nroot) nb = nroot;
+
+      // Thick-restart carryover: keep the lowest `nkeep` Ritz vectors at each
+      // subspace collapse (was: reseed only the nroot targets). Must keep at
+      // least nroot. Cap well below nb so each restart still leaves room to grow
+      // several correction vectors before the next collapse -- keeping too many
+      // (e.g. nb-1) starves the subspace of new directions and the solve stalls
+      // at a wrong eigenvalue. nb/2 is the standard thick-restart choice; allow
+      // up to 3*nb/4 for experimentation but never tighter than nroot.
+      int nkeep_cap = std::max(nroot, (3 * nb) / 4);
+      if (nkeep < nroot) nkeep = nroot;
+      if (nkeep > nkeep_cap) nkeep = nkeep_cap;
+      if (nkeep < 1) nkeep = 1;
 
       // projected diagonal of H in CSF space (approx: V^T diag(H) V, diagonal
       // part) for the preconditioner. Build once: for each CSF column, its
@@ -402,7 +415,7 @@ namespace sbd {
 
       std::vector<std::vector<ElemT>> v(nb, std::vector<ElemT>(K));
       std::vector<std::vector<ElemT>> Hv(nb, std::vector<ElemT>(K));
-      std::vector<std::vector<ElemT>> Ritz(nroot, std::vector<ElemT>(K));
+      std::vector<std::vector<ElemT>> Ritz(nkeep, std::vector<ElemT>(K));
       std::vector<ElemT> res(K);
       std::vector<RealT> norm_r(nroot, RealT(0));
 
@@ -413,6 +426,10 @@ namespace sbd {
 
       // seed: unit CSF vectors e_0..e_{nroot-1}, orthonormalized (they already are)
       int nseed = nroot;
+      // Number of leading seed vectors whose Hv is already valid (thick restart
+      // carries Hv for the kept Ritz vectors, so they need no fresh matvec). 0 at
+      // the initial unit-vector seed.
+      int nhv_valid = 0;
       for (int p = 0; p < nroot; p++) {
         std::fill(v[p].begin(), v[p].end(), ElemT(0.0));
         if (p < K) v[p][p] = ElemT(1.0);
@@ -420,10 +437,11 @@ namespace sbd {
 
       bool do_continue = true;
       for (int it = 0; it < max_iteration && do_continue; it++) {
-        int ib = 0, m = 0, ncur = nseed;
+        int ib = 0, m = nhv_valid, ncur = nseed;
         while (true) {
           for (int jb = m; jb < ncur; jb++) matvec(v[jb], Hv[jb]);
           m = ncur; ib = ncur - 1;
+          nhv_valid = 0;  // consumed; only the first cycle after a restart carries Hv
 
           double _ts = (tmr && tmr->on) ? _wtime() : 0.0;
           // Subspace (Rayleigh) matrix H[jb,kb] = <v_jb, Hv_kb>. Parallelize ONCE
@@ -577,16 +595,45 @@ namespace sbd {
         }
         if (!do_continue) break;
         double _trs = (tmr && tmr->on) ? _wtime() : 0.0;
-        // Restart: reseed with the nroot Ritz vectors, re-orthonormalize.
-        for (int p = 0; p < nroot; p++) v[p] = Ritz[p];
-        for (int p = 0; p < nroot; p++) {
-          for (int q = 0; q < p; q++) {
-            ElemT ol = _local_inner(v[q], v[p]);
-            for (int i = 0; i < K; i++) v[p][i] -= v[q][i]*ol;
+        // Thick restart: reseed with the lowest `keep` Ritz vectors (not just the
+        // nroot targets), so the collapsed subspace restarts from `keep` instead
+        // of climbing from nroot again -> fewer, shorter re-climbs.
+        //
+        // The key to a NET matvec saving is that we carry the Ritz vectors' Hv
+        // too, as the SAME linear combination of the existing basis Hv:
+        //   Ritz[p]  = sum_kb U[kb,p] v[kb],   H*Ritz[p] = sum_kb U[kb,p] Hv[kb].
+        // By linearity these are consistent with NO fresh matvec. The kept Ritz
+        // vectors are eigenvectors of the symmetric Rayleigh matrix, hence already
+        // mutually orthonormal to working precision, so we do NOT re-orthonormalize
+        // (that would perturb v and break the v<->Hv correspondence). nhv_valid
+        // then tells the next inner cycle to skip re-matvec-ing them. Without the
+        // Hv carry, reseeding `keep` vectors would cost `keep` matvecs per restart
+        // and make thick restart slower, not faster.
+        //
+        // Reconstruct into scratch buffers first (Ritz[0..nroot) already hold the
+        // v-combo from this step's Ritz loop, but we need Hv for all and must not
+        // alias v/Hv while combining). Build combos over the pre-collapse basis.
+        int keep = std::min(nkeep, ib + 1);
+        std::vector<std::vector<ElemT>> Vnew(keep, std::vector<ElemT>(K));
+        std::vector<std::vector<ElemT>> HVnew(keep, std::vector<ElemT>(K));
+        for (int p = 0; p < keep; p++) {
+          std::vector<ElemT> & vp = Vnew[p];
+          std::vector<ElemT> & hp = HVnew[p];
+#pragma omp parallel for if(K > 4096)
+          for (int i = 0; i < K; i++) {
+            ElemT ri = ElemT(0.0), hi = ElemT(0.0);
+            for (int kb = 0; kb <= ib; kb++) {
+              ElemT x = U[kb + nb*p];
+              ri += v[kb][i]  * x;
+              hi += Hv[kb][i] * x;
+            }
+            vp[i] = ri;
+            hp[i] = hi;
           }
-          _local_normalize<ElemT,RealT>(v[p]);
         }
-        nseed = nroot;
+        for (int p = 0; p < keep; p++) { v[p] = Vnew[p]; Hv[p] = HVnew[p]; }
+        nseed = keep;
+        nhv_valid = keep;   // Hv[0..keep) already valid -> next cycle skips their matvec
         if (tmr && tmr->on) tmr->t_restart += _wtime() - _trs;
       }
 
@@ -632,7 +679,8 @@ namespace sbd {
                                     int max_iteration,
                                     int num_block,
                                     int nroot,
-                                    RealT eps) {
+                                    RealT eps,
+                                    int nkeep) {
       const size_t ndet = det.size();
       auto matvec = [&](const std::vector<ElemT> & xc, std::vector<ElemT> & yc) {
         std::vector<ElemT> xdet, ydet(ndet, ElemT(0.0));
@@ -644,7 +692,8 @@ namespace sbd {
       };
       _davidson_projected_core<ElemT,RealT>(hii, V, matvec, Wcsf, Eout,
                                             h_comm, b_comm, t_comm,
-                                            max_iteration, num_block, nroot, eps);
+                                            max_iteration, num_block, nroot, eps,
+                                            nkeep);
     }
 
     /**
@@ -670,7 +719,8 @@ namespace sbd {
                                           int max_iteration,
                                           int num_block,
                                           int nroot,
-                                          RealT eps) {
+                                          RealT eps,
+                                          int nkeep) {
       SSTimers tm;
       auto matvec = [&](const std::vector<ElemT> & xc, std::vector<ElemT> & yc) {
         std::vector<ElemT> xdet, ydet(ndet, ElemT(0.0));
@@ -693,7 +743,8 @@ namespace sbd {
       };
       _davidson_projected_core<ElemT,RealT>(hii, V, matvec, Wcsf, Eout,
                                             h_comm, b_comm, t_comm,
-                                            max_iteration, num_block, nroot, eps, &tm);
+                                            max_iteration, num_block, nroot, eps,
+                                            nkeep, &tm);
     }
 
   } // namespace gdb

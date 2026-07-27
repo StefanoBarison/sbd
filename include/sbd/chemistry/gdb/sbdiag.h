@@ -20,6 +20,7 @@ namespace sbd {
       int nroots = 1;
       int single_spin = -1;   // target spin MULTIPLICITY 2S+1 (1=singlet,2=doublet,3=triplet,...) for Option-2 projection; <1 = off
       int carryover_root = 0; // which converged root feeds carryover selection (multiroot/single-spin); clamped to [0,nroots-1]
+      int restart_keep = -1;  // thick-restart: #Ritz vectors kept at each subspace collapse (single-spin); <1 => default max(nroots, block/2)
       double eps = 1.0e-4;
       double max_time = 86400.0;
       int init = 0;
@@ -71,6 +72,9 @@ namespace sbd {
 	}
 	if ( std::string(argv[i]) == "--carryover_root" ) {
 	  sbd_data.carryover_root = std::atoi(argv[++i]);
+	}
+	if ( std::string(argv[i]) == "--restart_keep" ) {
+	  sbd_data.restart_keep = std::atoi(argv[++i]);
 	}
 	if ( std::string(argv[i]) == "--tolerance" ) {
 	  sbd_data.eps = std::atof(argv[++i]);
@@ -232,6 +236,7 @@ namespace sbd {
       int nroots = sbd_data.nroots;
       int single_spin = sbd_data.single_spin;
       int carryover_root = sbd_data.carryover_root;
+      int restart_keep = sbd_data.restart_keep;
       double eps = sbd_data.eps;
       double max_time = sbd_data.max_time;
       int init = sbd_data.init;
@@ -397,11 +402,14 @@ namespace sbd {
 	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;
 	  std::vector<double> Eroots;
+	  int rkeep = (restart_keep >= 1) ? restart_keep : std::max(nr, max_nb/2);
+	  if( mpi_rank == 0 )
+	    std::cout << " sbd: thick-restart keep = " << rkeep << std::endl;
 	  DavidsonMultiRootProjected(hii, Vproj, Wcsf, Eroots, det,
 				     bit_length, static_cast<size_t>(L),
 				     idxmap, exidx, I0, I1, I2,
 				     h_comm, b_comm, t_comm,
-				     max_it, max_nb, nr, eps);
+				     max_it, max_nb, nr, eps, rkeep);
 	  if( mpi_rank == 0 ) {
 	    std::cout.precision(12);
 	    for(int p=0; p < nr; p++)
@@ -598,10 +606,13 @@ namespace sbd {
 	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;
 	  std::vector<double> Eroots;
+	  int rkeep = (restart_keep >= 1) ? restart_keep : std::max(nr, max_nb/2);
+	  if( mpi_rank == 0 )
+	    std::cout << " sbd: thick-restart keep = " << rkeep << std::endl;
 	  DavidsonMultiRootProjectedStored(hii, Vproj, Wcsf, Eroots, det.size(),
 					   ih, jh, hij, len, slide,
 					   h_comm, b_comm, t_comm,
-					   max_it, max_nb, nr, eps);
+					   max_it, max_nb, nr, eps, rkeep);
 	  if( mpi_rank == 0 ) {
 	    std::cout.precision(12);
 	    for(int p=0; p < nr; p++)
