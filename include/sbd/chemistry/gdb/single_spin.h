@@ -635,7 +635,16 @@ namespace sbd {
             hp[i] = hi;
           }
         }
-        // Re-orthonormalize {Vnew} by MGS, mirroring every op onto {HVnew}.
+        // Re-orthonormalize {Vnew} by MGS, mirroring every op onto {HVnew}. TWO
+        // passes (DGKS): a single MGS pass leaves residual non-orthogonality that,
+        // for the many near-degenerate kept Ritz vectors at large K, is enough to
+        // make the standard (no-overlap) Rayleigh-Ritz return a spurious eigenvalue
+        // -- the exact failure seen at K=113394 (keep=15 wrong, keep=1 fine because
+        // one vector has nothing to orthogonalize against). Both K sizes run the
+        // same code; only the accumulated rounding over the larger vectors differs,
+        // so the second pass is what makes it robust. Every subtraction/scale is
+        // applied identically to HVnew, so Hv stays = H v with no fresh matvec.
+        for (int pass = 0; pass < 2; pass++)
         for (int p = 0; p < keep; p++) {
           for (int q = 0; q < p; q++) {
             ElemT ol = _local_inner(Vnew[q], Vnew[p]);   // <v_q, v_p>
