@@ -382,15 +382,42 @@ namespace sbd {
 
       // Thick-restart carryover: keep the lowest `nkeep` Ritz vectors at each
       // subspace collapse (was: reseed only the nroot targets). Must keep at
-      // least nroot. Cap well below nb so each restart still leaves room to grow
-      // several correction vectors before the next collapse -- keeping too many
-      // (e.g. nb-1) starves the subspace of new directions and the solve stalls
-      // at a wrong eigenvalue. nb/2 is the standard thick-restart choice; allow
-      // up to 3*nb/4 for experimentation but never tighter than nroot.
-      int nkeep_cap = std::max(nroot, (3 * nb) / 4);
+      // least nroot.
       if (nkeep < nroot) nkeep = nroot;
-      if (nkeep > nkeep_cap) nkeep = nkeep_cap;
       if (nkeep < 1) nkeep = 1;
+
+      // Auto-size nb from nkeep to preserve per-cycle Krylov growth.
+      //
+      // The correction loop appends new directions until (ib+1) reaches nb, so
+      // each restart grows the subspace by exactly (nb - nseed) = (nb - nkeep)
+      // vectors before the next collapse. If nkeep is large relative to nb the
+      // growth room (nb - nkeep) shrinks and the solve stalls at a wrong
+      // eigenvalue (the K=113394 failure: keep=15/nb=30 -> 15 growth slots
+      // stalled; keep=1/nb=30 -> 29 slots converged to -108.8435).
+      //
+      // Rather than clamp nkeep down (which throws away the matvec-count win of
+      // a large carry), grow nb up so the growth room stays fixed at the value
+      // the user's num_block implied with a minimal carry: growth = nb - nroot.
+      // Then nb_effective = nkeep + growth, so (nb - nkeep) == growth for any
+      // nkeep. keep=nroot reproduces the old nb exactly; larger keep just widens
+      // the subspace. Cost is RAM only (2*nb*K per rank), bounded by K.
+      {
+        int growth = nb - nroot;               // directions/cycle user intended
+        if (growth < 1) growth = 1;
+        int nb_need = nkeep + growth;
+        if (nb < nb_need) nb = nb_need;
+        if (nb > K) nb = K;
+        // nkeep must still leave at least one growth slot after the K clamp.
+        if (nkeep > nb - 1) nkeep = nb - 1;
+        if (nkeep < nroot) nkeep = std::min(nroot, nb - 1);
+        if (nkeep < 1) nkeep = 1;
+      }
+
+      if (mpi_rank_h == 0 && mpi_rank_t == 0 && mpi_rank_b == 0) {
+        std::cout << "sbd(ss): nb=" << nb << " keep=" << nkeep
+                  << " growth=" << (nb - nkeep) << " (K=" << K << ")"
+                  << std::endl;
+      }
 
       // projected diagonal of H in CSF space (approx: V^T diag(H) V, diagonal
       // part) for the preconditioner. Build once: for each CSF column, its
