@@ -602,17 +602,21 @@ namespace sbd {
         // The key to a NET matvec saving is that we carry the Ritz vectors' Hv
         // too, as the SAME linear combination of the existing basis Hv:
         //   Ritz[p]  = sum_kb U[kb,p] v[kb],   H*Ritz[p] = sum_kb U[kb,p] Hv[kb].
-        // By linearity these are consistent with NO fresh matvec. The kept Ritz
-        // vectors are eigenvectors of the symmetric Rayleigh matrix, hence already
-        // mutually orthonormal to working precision, so we do NOT re-orthonormalize
-        // (that would perturb v and break the v<->Hv correspondence). nhv_valid
-        // then tells the next inner cycle to skip re-matvec-ing them. Without the
-        // Hv carry, reseeding `keep` vectors would cost `keep` matvecs per restart
-        // and make thick restart slower, not faster.
+        // By linearity these are consistent with NO fresh matvec. nhv_valid then
+        // tells the next inner cycle to skip re-matvec-ing them. Without the Hv
+        // carry, reseeding `keep` vectors would cost `keep` matvecs per restart and
+        // make thick restart slower, not faster.
         //
-        // Reconstruct into scratch buffers first (Ritz[0..nroot) already hold the
-        // v-combo from this step's Ritz loop, but we need Hv for all and must not
-        // alias v/Hv while combining). Build combos over the pre-collapse basis.
+        // The kept Ritz vectors are eigenvectors of the symmetric Rayleigh matrix,
+        // so orthonormal in exact arithmetic -- but at large K rounding lets that
+        // drift, and the inner loop's Rayleigh-Ritz uses a STANDARD eigensolve that
+        // assumes an orthonormal basis (no overlap matrix). A non-orthonormal seed
+        // then yields spurious eigenvalues (observed: correct energy at K=3906, but
+        // a nonsense -19.47 at K=113394). Fix: re-orthonormalize the carried block
+        // with modified Gram-Schmidt, applying the SAME scale/subtract operations
+        // to Hv as to v -- since Hv[p] = H v[p] and H is linear, an identical linear
+        // combination of the v's is mirrored by that combination of the Hv's, so
+        // the v<->Hv correspondence is preserved exactly and still needs no matvec.
         int keep = std::min(nkeep, ib + 1);
         std::vector<std::vector<ElemT>> Vnew(keep, std::vector<ElemT>(K));
         std::vector<std::vector<ElemT>> HVnew(keep, std::vector<ElemT>(K));
@@ -629,6 +633,23 @@ namespace sbd {
             }
             vp[i] = ri;
             hp[i] = hi;
+          }
+        }
+        // Re-orthonormalize {Vnew} by MGS, mirroring every op onto {HVnew}.
+        for (int p = 0; p < keep; p++) {
+          for (int q = 0; q < p; q++) {
+            ElemT ol = _local_inner(Vnew[q], Vnew[p]);   // <v_q, v_p>
+#pragma omp parallel for if(K > 4096)
+            for (int i = 0; i < K; i++) {
+              Vnew[p][i]  -= Vnew[q][i]  * ol;
+              HVnew[p][i] -= HVnew[q][i] * ol;   // same subtraction => Hv stays = H v
+            }
+          }
+          RealT nrm = _local_normalize<ElemT,RealT>(Vnew[p]);   // v_p /= |v_p|
+          if (nrm > RealT(0)) {
+            RealT inv = RealT(1) / nrm;
+#pragma omp parallel for if(K > 4096)
+            for (int i = 0; i < K; i++) HVnew[p][i] *= inv;     // scale Hv identically
           }
         }
         for (int p = 0; p < keep; p++) { v[p] = Vnew[p]; Hv[p] = HVnew[p]; }
