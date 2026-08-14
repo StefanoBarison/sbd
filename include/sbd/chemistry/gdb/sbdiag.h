@@ -26,6 +26,16 @@ namespace sbd {
       int init = 0;
       int do_shuffle = 0;
       int do_rdm = 0;
+      // Which roots get a per-root RDM computed and written when do_rdm != 0.
+      //   -1 (default) = every root, i.e. the historical behaviour
+      //   >= 0         = only that root index
+      // Each per-root RDM costs a full Correlation() pass over the determinant
+      // space -- comparable to the whole Davidson solve at large K (measured:
+      // ~38 s/root at K=113394, versus a 52 s solve). For runs that only need
+      // energies plus the carryover determinants, restricting this to the
+      // carryover root (or to none, via --rdm 0) is the single largest
+      // wall-clock saving available.
+      int rdm_root = -1;
       int carryover_type = 0;
       double ratio = 0.0;
       double threshold = 0.01;
@@ -103,6 +113,9 @@ namespace sbd {
 	if ( std::string(argv[i]) == "--rdm" ) {
 	  sbd_data.do_rdm = std::atoi(argv[++i]);
 	}
+	if ( std::string(argv[i]) == "--rdm_root" ) {
+	  sbd_data.rdm_root = std::atoi(argv[++i]);
+	}
 	if ( std::string(argv[i]) == "--bit_length" ) {
 	  sbd_data.bit_length = std::atoi(argv[++i]);
 	}
@@ -148,6 +161,10 @@ namespace sbd {
       std::cout << "# do equal-bra_a redistribution: " << sbd_data.do_redist_alpha_eq << std::endl;
       if( sbd_data.do_rdm != 0.0 ) {
 	std::cout << "# do rdm: " << sbd_data.do_rdm << std::endl;
+	std::cout << "# rdm roots: "
+		  << ( sbd_data.rdm_root < 0 ? std::string("all")
+		       : std::string("only root ") + std::to_string(sbd_data.rdm_root) )
+		  << std::endl;
       }
       if( sbd_data.carryover_type == 0 ) {
 	std::cout << "# carryover type: none" << std::endl;
@@ -243,6 +260,16 @@ namespace sbd {
       size_t seed = sbd_data.seed;
       int do_shuffle = sbd_data.do_shuffle;
       int do_rdm = sbd_data.do_rdm;
+      const int rdm_root = sbd_data.rdm_root;
+      // true when root p should get its own Correlation() + WriteRdmFiles pass
+      auto rdm_for_root = [do_rdm, rdm_root](int p) {
+	return do_rdm != 0 && ( rdm_root < 0 || rdm_root == p );
+      };
+      // Set once a multi-root / single-spin branch has already filled
+      // one_p_rdm / two_p_rdm for the carryover wavefunction, so the standalone
+      // rdm stage below does not repeat that Correlation() pass on the same
+      // vector (measured duplicate: ~38 s at K=113394).
+      bool rdm_cached = false;
       double ratio = sbd_data.ratio;
       double threshold = sbd_data.threshold;
       int co_type = sbd_data.carryover_type;
@@ -432,13 +459,21 @@ namespace sbd {
 	    mult(hii, wp, vp, bit_length, static_cast<size_t>(L), det,
 		 idxmap, exidx, I0, I1, I2, h_comm, b_comm, t_comm);
 	    ElemT Ep; InnerProduct(wp, vp, Ep, b_comm);
-	    if( do_rdm != 0 ) {
-	      std::vector<std::vector<ElemT>> one_p_rdm_p, two_p_rdm_p;
+	    const bool _is_co_root = ( p == std::min(std::max(carryover_root,0),nr-1) );
+	    if( rdm_for_root(p) ) {
+	      // Write straight into the function's output RDMs when this is the
+	      // carryover root, so the standalone rdm stage below can reuse them
+	      // instead of running a second identical Correlation() pass. No extra
+	      // memory: those buffers exist for the whole call either way.
+	      std::vector<std::vector<ElemT>> one_p_rdm_local, two_p_rdm_local;
+	      std::vector<std::vector<ElemT>> & o_rdm = _is_co_root ? one_p_rdm : one_p_rdm_local;
+	      std::vector<std::vector<ElemT>> & t_rdm = _is_co_root ? two_p_rdm : two_p_rdm_local;
 	      Correlation(wp, det, bit_length, static_cast<size_t>(L),
 			  idxmap, exidx, h_comm, b_comm, t_comm,
-			  one_p_rdm_p, two_p_rdm_p);
+			  o_rdm, t_rdm);
+	      if( _is_co_root ) rdm_cached = true;
 	      if( mpi_rank == 0 )
-		WriteRdmFiles(p, static_cast<int>(L), one_p_rdm_p, two_p_rdm_p);
+		WriteRdmFiles(p, static_cast<int>(L), o_rdm, t_rdm);
 	    }
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: SingleSpin root " << p
@@ -483,13 +518,19 @@ namespace sbd {
 	    mult(hii,Wroots[p],vp,bit_length,static_cast<size_t>(L),det,
 		 idxmap,exidx,I0,I1,I2,h_comm,b_comm,t_comm);
 	    ElemT Ep; InnerProduct(Wroots[p],vp,Ep,b_comm);
-	    if( do_rdm != 0 ) {
-	      std::vector<std::vector<ElemT>> one_p_rdm_p, two_p_rdm_p;
+	    if( rdm_for_root(p) ) {
+	      // Write into the output RDMs for the carryover root so the standalone
+	      // rdm stage below can reuse them instead of recomputing (no extra
+	      // memory -- those buffers live for the whole call regardless).
+	      std::vector<std::vector<ElemT>> one_p_rdm_local, two_p_rdm_local;
+	      std::vector<std::vector<ElemT>> & o_rdm = ( p == cr ) ? one_p_rdm : one_p_rdm_local;
+	      std::vector<std::vector<ElemT>> & t_rdm = ( p == cr ) ? two_p_rdm : two_p_rdm_local;
 	      Correlation(Wroots[p],det,bit_length,static_cast<size_t>(L),
 			  idxmap,exidx,h_comm,b_comm,t_comm,
-			  one_p_rdm_p,two_p_rdm_p);
+			  o_rdm,t_rdm);
+	      if( p == cr ) rdm_cached = true;
 	      if( mpi_rank == 0 )
-		WriteRdmFiles(p,static_cast<int>(L),one_p_rdm_p,two_p_rdm_p);
+		WriteRdmFiles(p,static_cast<int>(L),o_rdm,t_rdm);
 	    }
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: MultiRoot root " << p
@@ -658,13 +699,21 @@ namespace sbd {
 	    std::vector<ElemT> vp(det.size(), ElemT(0.0));
 	    sbd::gdb::mult(hii, ih, jh, hij, len, slide, wp, vp, h_comm, b_comm, t_comm);
 	    ElemT Ep; InnerProduct(wp, vp, Ep, b_comm);
-	    if( do_rdm != 0 ) {
-	      std::vector<std::vector<ElemT>> one_p_rdm_p, two_p_rdm_p;
+	    const bool _is_co_root = ( p == std::min(std::max(carryover_root,0),nr-1) );
+	    if( rdm_for_root(p) ) {
+	      // Write straight into the function's output RDMs when this is the
+	      // carryover root, so the standalone rdm stage below can reuse them
+	      // instead of running a second identical Correlation() pass. No extra
+	      // memory: those buffers exist for the whole call either way.
+	      std::vector<std::vector<ElemT>> one_p_rdm_local, two_p_rdm_local;
+	      std::vector<std::vector<ElemT>> & o_rdm = _is_co_root ? one_p_rdm : one_p_rdm_local;
+	      std::vector<std::vector<ElemT>> & t_rdm = _is_co_root ? two_p_rdm : two_p_rdm_local;
 	      Correlation(wp, det, bit_length, static_cast<size_t>(L),
 			  idxmap, exidx, h_comm, b_comm, t_comm,
-			  one_p_rdm_p, two_p_rdm_p);
+			  o_rdm, t_rdm);
+	      if( _is_co_root ) rdm_cached = true;
 	      if( mpi_rank == 0 )
-		WriteRdmFiles(p, static_cast<int>(L), one_p_rdm_p, two_p_rdm_p);
+		WriteRdmFiles(p, static_cast<int>(L), o_rdm, t_rdm);
 	    }
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: SingleSpin root " << p
@@ -705,13 +754,19 @@ namespace sbd {
 	    std::vector<ElemT> vp(Wroots[p].size(),ElemT(0.0));
 	    sbd::gdb::mult(hii,ih,jh,hij,len,slide,Wroots[p],vp,h_comm,b_comm,t_comm);
 	    ElemT Ep; InnerProduct(Wroots[p],vp,Ep,b_comm);
-	    if( do_rdm != 0 ) {
-	      std::vector<std::vector<ElemT>> one_p_rdm_p, two_p_rdm_p;
+	    if( rdm_for_root(p) ) {
+	      // Write into the output RDMs for the carryover root so the standalone
+	      // rdm stage below can reuse them instead of recomputing (no extra
+	      // memory -- those buffers live for the whole call regardless).
+	      std::vector<std::vector<ElemT>> one_p_rdm_local, two_p_rdm_local;
+	      std::vector<std::vector<ElemT>> & o_rdm = ( p == cr ) ? one_p_rdm : one_p_rdm_local;
+	      std::vector<std::vector<ElemT>> & t_rdm = ( p == cr ) ? two_p_rdm : two_p_rdm_local;
 	      Correlation(Wroots[p],det,bit_length,static_cast<size_t>(L),
 			  idxmap,exidx,h_comm,b_comm,t_comm,
-			  one_p_rdm_p,two_p_rdm_p);
+			  o_rdm,t_rdm);
+	      if( p == cr ) rdm_cached = true;
 	      if( mpi_rank == 0 )
-		WriteRdmFiles(p,static_cast<int>(L),one_p_rdm_p,two_p_rdm_p);
+		WriteRdmFiles(p,static_cast<int>(L),o_rdm,t_rdm);
 	    }
 	    if( mpi_rank == 0 )
 	      std::cout << " sbd: MultiRoot root " << p
@@ -812,6 +867,14 @@ namespace sbd {
 		    << " sbd: start rdm calculation" << std::endl;
 	}
 	auto time_start_rdm = std::chrono::high_resolution_clock::now();
+	// A multi-root / single-spin branch above may already have computed the
+	// RDMs for exactly this wavefunction (w is the carryover root's vector).
+	// Recomputing them is a full extra Correlation() pass -- skip it.
+	if( rdm_cached ) {
+	  if( mpi_rank == 0 )
+	    std::cout << " sbd: reusing per-root RDM for the carryover root "
+		      << "(skipping duplicate Correlation)" << std::endl;
+	} else {
 #ifdef SBD_THRUST
 	device_mult.correlation(w,one_p_rdm,two_p_rdm);
 #else
@@ -819,6 +882,7 @@ namespace sbd {
 		    idxmap,exidx,h_comm,b_comm,t_comm,
 		    one_p_rdm,two_p_rdm);
 #endif
+	}
 	density.resize(2*L);
 	for(size_t io=0; io < L; io++) {
 	  density[2*io+0] = GetReal(one_p_rdm[0][io+L*io]);
