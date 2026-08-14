@@ -55,6 +55,32 @@ Option-2 solver via ``single_spin`` = target multiplicity 2S+1 (1=singlet,
 2=doublet, 3=triplet, ...), which returns only that spin.  The ``spin_sq`` argument
 of ``sci_solver_callable`` is unused and must stay ``None``.
 
+Thick restart (``restart_keep``)
+-------------------------------
+Number of lowest Ritz vectors carried across each Davidson subspace collapse.
+``None`` (default) lets the binary pick ``max(nroots, davidson_block // 2)``,
+which is the tuned heuristic -- prefer that unless you are deliberately
+scanning the parameter.
+
+Set it too small and the solver discards most of the subspace at every collapse
+and re-climbs it: with ``restart_keep=7``, ``nroots=4`` and
+``davidson_block=20`` the subspace reaches ~19 vectors, collapses to 7, and
+rebuilds -- ~63% thrown away per cycle.  Raising it to 15 at K=113394 cut the
+matvec count 127 -> 104.
+
+Expect the *matvec count* to improve, not necessarily wall-clock.  In the same
+K=113394 test the total ``end davidson`` time went 184 s -> 193 s despite the
+lower matvec count, because with ``nroots=4`` and ``rdm=True`` most of that
+figure is post-solve work (one full ``H*v`` plus a ``Correlation`` call per
+root, outside the Davidson loop), not the iteration itself.  Per-phase
+instrumentation of the loop at that size showed the loop is only ~52 s of the
+~205 s, is 87% matvec, and is >99.9% accounted -- so there is little left to
+tune inside it.  Set ``SBD_SS_TIMING=1`` to print that breakdown.
+
+The rule of thumb from PERFORMANCE_LOG.md is ``restart_keep ~ nb/2``; the binary
+auto-grows ``nb`` to ``restart_keep + (davidson_block - nroots)`` so a larger
+keep does not steal growth room, it only costs RAM (``2 * nb * n_csf`` doubles).
+
 Carryover
 ---------
 ``carryover_type`` (0=none, 1=weight truncation, 2/3=HCI heatbath expansion),
@@ -248,6 +274,30 @@ class SBDGdbSolver:
         self.nroots = int(nroots)
         self.single_spin = int(single_spin)
         self.restart_keep = None if restart_keep is None else int(restart_keep)
+        # A restart_keep well below nb/2 makes the solver discard most of the
+        # subspace at every collapse and re-climb it, which costs matvecs
+        # superlinearly in the number of roots. See the "Thick restart" section
+        # of the module docstring for the measured K=113394 case.
+        # Warn only when restart_keep leaves less history than the binary's own
+        # default would, i.e. below max(nroots, davidson_block // 2). Values at
+        # or above that default are legitimate tuning choices and stay silent.
+        if self.restart_keep is not None:
+            _default_keep = max(self.nroots, self.davidson_block // 2)
+            if self.restart_keep < _default_keep:
+                _growth = max(1, self.davidson_block - self.nroots)
+                _nb_eff = self.restart_keep + _growth
+                warnings.warn(
+                    f"restart_keep={self.restart_keep} is below the tuned "
+                    f"default max(nroots, davidson_block//2)={_default_keep} "
+                    f"(nroots={self.nroots}, davidson_block="
+                    f"{self.davidson_block}). The solver will collapse to "
+                    f"{self.restart_keep} of ~{_nb_eff} subspace vectors at each "
+                    f"restart and rebuild the rest, costing extra matvecs per "
+                    f"cycle. Pass restart_keep=None for the default, or a value "
+                    f">= {_default_keep}.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         self.carryover_type = int(carryover_type)
         self.carryover_root = int(carryover_root)
         self.carryover_options = dict(carryover_options or {})
