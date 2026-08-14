@@ -202,6 +202,7 @@ class SBDGdbSolver:
         canonicalize_fcidump: bool = True,
         # RDM handling
         rdm: bool = False,
+        rdm_root: int | None = None,
     ):
         """
         Args:
@@ -233,6 +234,22 @@ class SBDGdbSolver:
             canonicalize_fcidump: When ``fcidump_path`` is set, roundtrip it
                 through pyscf to force ECORE=0 before use.
             rdm: Whether to compute the 1/2-RDM (``--rdm True``) or not (``--rdm False``, default).
+            rdm_root: Which root gets a per-root RDM when ``rdm=True``.
+                ``None`` (default) computes one for every root, matching the
+                binary's default.  An integer restricts it to that root index.
+
+                This is usually the largest single wall-clock lever in a run:
+                each per-root RDM is a full ``Correlation()`` pass over the
+                determinant space, comparable in cost to the whole Davidson
+                solve.  At K=113394 with ``nroots=4`` the per-root RDMs took
+                ~150 s of a ~295 s run.  If you only need energies plus the
+                carryover determinants, set ``rdm=False``; if you need one
+                RDM, set ``rdm_root`` to that root.  Choosing ``rdm_root``
+                equal to ``carryover_root`` is cheapest, because the binary
+                then reuses that RDM instead of recomputing it for the
+                carryover wavefunction (worth a further ~38 s at that size).
+                ``rdm_root`` is independent of ``carryover_root``, so
+                carryover can still be taken from any root.
         """
         if sbd_binary is None:
             repo_root = Path(__file__).resolve().parents[5]
@@ -312,6 +329,7 @@ class SBDGdbSolver:
         self.extra_cli_args = list(extra_cli_args or [])
         self.canonicalize_fcidump = bool(canonicalize_fcidump)
         self.rdm = bool(rdm)
+        self.rdm_root = None if rdm_root is None else int(rdm_root)
 
     # ---------------------------------------------------------------------- #
     # Public API
@@ -481,6 +499,11 @@ class SBDGdbSolver:
                     return None
                 rdm1_file = workdir / one_name
                 rdm2_file = workdir / two_name
+                # With rdm_root set, only that root's RDM files exist. Absent
+                # files are then expected, not a failure -- return None quietly
+                # rather than warning once per skipped root.
+                if self.rdm_root is not None and not rdm1_file.exists():
+                    return None
                 try:
                     rdm1 = np.zeros((norb, norb), dtype=np.float64)
                     with open(rdm1_file, "r") as f:
@@ -632,6 +655,8 @@ class SBDGdbSolver:
             "--bit_length", str(self.bit_length),
             "--do_redist_det", "1" if self.do_redist_det else "0",
             "--rdm", "1" if self.rdm else "0",
+            *(["--rdm_root", str(self.rdm_root)]
+              if (self.rdm and self.rdm_root is not None) else []),
             "--savename", "wf",
             *self.extra_cli_args,
         ]
