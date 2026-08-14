@@ -395,9 +395,18 @@ namespace sbd {
 	    }
 	    Sz2 = na - nb2;
 	  }
+	  // SBD_SS_TIMING also reports the phases OUTSIDE the Davidson loop --
+	  // "end davidson" brackets the projector build and the per-root
+	  // post-processing below, not just the solve. See the stored-matrix
+	  // branch for the measured split.
+	  const bool ss_tm = [](){ const char* e = std::getenv("SBD_SS_TIMING");
+				   return e && e[0]=='1'; }();
+	  double _t_vbuild = 0.0, _t_post = 0.0;
+	  double _tv0 = ss_tm ? MPI_Wtime() : 0.0;
 	  SpinProjector Vproj =
 	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
 					  single_spin, Sz2);
+	  if( ss_tm ) _t_vbuild = MPI_Wtime() - _tv0;
 	  if( mpi_rank == 0 )
 	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;
@@ -415,6 +424,7 @@ namespace sbd {
 	    for(int p=0; p < nr; p++)
 	      std::cout << " sbd: SingleSpin E[" << p << "] = " << Eroots[p] << std::endl;
 	  }
+	  double _tp0 = ss_tm ? MPI_Wtime() : 0.0;
 	  for(int p=0; p < nr; p++) {
 	    std::vector<ElemT> wp;
 	    project_up(Vproj, Wcsf[p], wp, det.size());
@@ -437,6 +447,17 @@ namespace sbd {
 	      SaveWavefunction(savename + "_root" + std::to_string(p),
 			       det, h_comm, b_comm, t_comm, wp);
 	    if( p == std::min(std::max(carryover_root,0),nr-1) ) w = wp;
+	  }
+	  if( ss_tm ) {
+	    _t_post = MPI_Wtime() - _tp0;
+	    if( mpi_rank == 0 )
+	      std::cout << "sbd: SS-TIMING (outside the Davidson loop)\n"
+			<< "  build_config_projector = " << _t_vbuild << " s\n"
+			<< "  per-root postprocess   = " << _t_post
+			<< " s (" << nr << " roots: project_up + H*v + InnerProduct"
+			<< (do_rdm != 0 ? " + Correlation + WriteRdmFiles" : "")
+			<< (savename.empty() ? "" : " + SaveWavefunction") << ")\n"
+			<< "  NOTE: 'end davidson' brackets these plus the solve loop.\n";
 	  }
 	} else if( nroots > 1 ) {
 	  // Multi-root (block Davidson-Liu). Seed W[0]=w (HF/current), W[1..] random.
@@ -599,9 +620,19 @@ namespace sbd {
 	    }
 	    Sz2 = na - nb2;
 	  }
+	  // SBD_SS_TIMING also reports the phases OUTSIDE the Davidson loop.
+	  // Necessary because "end davidson" brackets far more than the solve: at
+	  // K=113394 / nroots=4 / rdm=1 the loop itself was only ~52 s of ~205 s,
+	  // the rest being the projector build and the per-root post-processing
+	  // below (one full H*v plus Correlation per root).
+	  const bool ss_tm = [](){ const char* e = std::getenv("SBD_SS_TIMING");
+				   return e && e[0]=='1'; }();
+	  double _t_vbuild = 0.0, _t_post = 0.0;
+	  double _tv0 = ss_tm ? MPI_Wtime() : 0.0;
 	  SpinProjector Vproj =
 	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
 					  single_spin, Sz2);
+	  if( ss_tm ) _t_vbuild = MPI_Wtime() - _tv0;
 	  if( mpi_rank == 0 )
 	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;
@@ -610,6 +641,8 @@ namespace sbd {
 	  if( mpi_rank == 0 )
 	    std::cout << " sbd: thick-restart keep = " << rkeep << std::endl;
 	  DavidsonMultiRootProjectedStored(hii, Vproj, Wcsf, Eroots, det.size(),
+					   det, bit_length, static_cast<size_t>(L),
+					   I0, I1, I2,
 					   ih, jh, hij, len, slide,
 					   h_comm, b_comm, t_comm,
 					   max_it, max_nb, nr, eps, rkeep);
@@ -618,6 +651,7 @@ namespace sbd {
 	    for(int p=0; p < nr; p++)
 	      std::cout << " sbd: SingleSpin E[" << p << "] = " << Eroots[p] << std::endl;
 	  }
+	  double _tp0 = ss_tm ? MPI_Wtime() : 0.0;
 	  for(int p=0; p < nr; p++) {
 	    std::vector<ElemT> wp;
 	    project_up(Vproj, Wcsf[p], wp, det.size());
@@ -639,6 +673,17 @@ namespace sbd {
 	      SaveWavefunction(savename + "_root" + std::to_string(p),
 			       det, h_comm, b_comm, t_comm, wp);
 	    if( p == std::min(std::max(carryover_root,0),nr-1) ) w = wp;
+	  }
+	  if( ss_tm ) {
+	    _t_post = MPI_Wtime() - _tp0;
+	    if( mpi_rank == 0 )
+	      std::cout << "sbd: SS-TIMING (outside the Davidson loop)\n"
+			<< "  build_config_projector = " << _t_vbuild << " s\n"
+			<< "  per-root postprocess   = " << _t_post
+			<< " s (" << nr << " roots: project_up + H*v + InnerProduct"
+			<< (do_rdm != 0 ? " + Correlation + WriteRdmFiles" : "")
+			<< (savename.empty() ? "" : " + SaveWavefunction") << ")\n"
+			<< "  NOTE: 'end davidson' brackets these plus the solve loop.\n";
 	  }
 	} else if( nroots > 1 ) {
 	  // Multi-root (block Davidson-Liu), stored-matrix variant.

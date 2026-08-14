@@ -20,6 +20,7 @@ Conventions: determinant bit 2p = alpha orbital p, 2p+1 = beta orbital p
 #ifndef SBD_CHEMISTRY_GDB_SINGLE_SPIN_H
 #define SBD_CHEMISTRY_GDB_SINGLE_SPIN_H
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <vector>
@@ -44,6 +45,9 @@ namespace sbd {
       std::vector<ConfigBlock> blocks;
       std::vector<int> csf_offset;
       int total_csf = 0;
+      /// Largest block_dim over all blocks. Number of probe matvecs needed to
+      /// extract the exact block-diagonal of the projected Hamiltonian.
+      int max_block_dim = 0;
     };
 
     // ---- canonical per-n_open S^2 block (orbital-independent), cached ----------
@@ -188,6 +192,11 @@ namespace sbd {
         int n_open = 0;
         for (int c : config) if (c == 1) ++n_open;
         int n_up = (n_open + Sz2) / 2;   // alpha among open shells; Sz2 = 2*Sz
+        // Sz2 is taken from det[0] by the caller and assumed common to all dets.
+        // If a config's open-shell count has the wrong parity for that Sz, the
+        // determinant list is not a single Sz sector and n_up would be silently
+        // wrong (truncating division) -- skip rather than build a bad block.
+        if (((n_open + Sz2) % 2) != 0 || n_up < 0 || n_up > n_open) continue;
 
         if (coeff_cache.find(n_open) == coeff_cache.end()) {
           int bd, nc;
@@ -215,6 +224,7 @@ namespace sbd {
           if (it != mask_to_row.end()) blk.det_indices[it->second] = pr.first;
         }
         blk.coeffs = coeff_cache[n_open];   // (block_dim x n_csf) row-major
+        if (block_dim > V.max_block_dim) V.max_block_dim = block_dim;
         V.blocks.push_back(std::move(blk));
         V.csf_offset.push_back(running);
         running += n_csf;
@@ -230,9 +240,125 @@ namespace sbd {
       double t_matvec=0, t_proj_up=0, t_mult=0, t_proj_down=0;
       double t_subbuild=0, t_ritz=0, t_correct=0, t_restart=0;
       long   n_matvec=0, n_inner=0;
+      // --- finer breakdown, added to close the "unaccounted time" gap -----------
+      // The coarse timers above covered only ~23% of the measured davidson wall
+      // time at K=113394 (45 s of 194 s), so the dominant cost was invisible.
+      // These split the two loops that were previously lumped or untimed:
+      //   ritz block   : t_ritz_build (Ritz+res assembly) + t_ritz_norm
+      //                  (_local_normalize of Ritz[p] and res)
+      //   correct block: t_corr_ritz (the DUPLICATE Ritz/res rebuild per
+      //                  unconverged root) + t_corr_norm + t_corr_prec
+      //                  (preconditioner divide) + t_corr_mgs (two-pass MGS)
+      //   t_mv_outer   : wall time of the matvec() callback as seen by the
+      //                  driver, counted for BOTH method 0 and method 1 (the
+      //                  per-phase project_up/mult/project_down split is only
+      //                  filled in by the stored-matrix path).
+      //   t_loop_total : whole inner-cycle loop, so unaccounted =
+      //                  t_loop_total - (sum of the parts).
+      double t_ritz_build=0, t_ritz_norm=0;
+      double t_corr_ritz=0, t_corr_norm=0, t_corr_prec=0, t_corr_mgs=0;
+      double t_mv_outer=0, t_loop_total=0, t_seed=0, t_ndiag=0;
+      long   n_corr_ritz=0;   // duplicate-rebuild count (nroot-weighted)
       SSTimers() { const char* e = std::getenv("SBD_SS_TIMING"); on = (e && e[0]=='1'); }
     };
     static inline double _wtime() { return MPI_Wtime(); }
+
+    // ---- exact projected diagonal (preconditioner) ----------------------------
+
+    /**
+       Exact diagonal of the projected Hamiltonian, H^csf_cc = sum_{r,r'} V_rc
+       V_r'c H_rr', for use as the Davidson preconditioner.
+
+       Why this must be exact: the earlier version used only the r == r' terms,
+       i.e. the diagonal of V^T diag(H) V. The dropped r != r' terms are exactly
+       the determinant pairs WITHIN one spatial configuration -- dets differing
+       only by a spin flip among the open shells. Their Hamiltonian elements are
+       the exchange integrals, which are large and predominantly negative, so
+       omitting them biases every preconditioner denominator (E[p] - ndiag[i])
+       in the same direction. The projected solve stays single-S regardless (V is
+       exact and fixed), but Davidson stalls on a plateau and reports a converged
+       Ritz value ABOVE the true root -- i.e. correct spin, wrong (too high)
+       energy, worsening with K. This is the "spin-averaged preconditioner"
+       requirement of Fales/Hohenstein/Levine, JCTC 13, 4162 (2017), Sec. 2.6:
+       the preconditioner must average the exchange integrals WITHIN a
+       spin-coupling set, and a ConfigBlock is precisely one such set.
+
+       How: H^csf restricted to one block is V_b^T H_bb V_b, where H_bb is the
+       block's det-det submatrix. We build H_bb directly with the general
+       Hij(DetA,DetB,...) primitive from chemistry/basic/determinants.h, which
+       carries SBD's own parity/phase conventions (the same OneExcite/TwoExcite
+       used by mult()), so no phase logic is duplicated here.
+
+       Cost: sum over blocks of block_dim^2 Hij evaluations, once, before the
+       iteration. block_dim = C(n_open, n_up) is small (open shells per
+       configuration), and sum(block_dim) == ndet, so this is O(max_block_dim *
+       ndet) element evaluations -- negligible next to the solve.
+
+       (An earlier attempt batched this as max_block_dim probe matvecs, exploiting
+       that blocks own disjoint determinant sets. That is WRONG: H couples
+       determinants of DIFFERENT configurations, so probing row r of every block
+       at once contaminates each block's readback with cross-block elements. A
+       numerical check showed errors of order the matrix elements themselves.
+       Probing one block at a time would be exact but costs sum(block_dim)
+       matvecs; direct Hij is both exact and far cheaper.)
+
+       Diagonal elements are taken from the precomputed hii to stay bit-identical
+       with the determinant-space solver's diagonal.
+    */
+    template <typename ElemT, typename RealT, typename DetsContainer>
+    void build_projected_diagonal(const SpinProjector & V,
+                                  const std::vector<ElemT> & hii,
+                                  const DetsContainer & det,
+                                  size_t bit_length,
+                                  size_t norb,
+                                  const ElemT & I0,
+                                  const oneInt<ElemT> & I1,
+                                  const twoInt<ElemT> & I2,
+                                  std::vector<RealT> & ndiag) {
+      const int K = V.total_csf;
+      ndiag.assign(K, RealT(0));
+      const long long nblk = static_cast<long long>(V.blocks.size());
+
+#pragma omp parallel for schedule(dynamic) if(nblk > 64)
+      for (long long b = 0; b < nblk; ++b) {
+        const ConfigBlock & blk = V.blocks[b];
+        const int d = blk.block_dim;
+        const int off = V.csf_offset[b];
+
+        // dense intra-block det-det submatrix H_bb (d x d, symmetric)
+        std::vector<double> Hbb(static_cast<size_t>(d) * d, 0.0);
+        for (int r = 0; r < d; ++r) {
+          const size_t di = blk.det_indices[r];
+          if (di == static_cast<size_t>(-1)) continue;
+          Hbb[static_cast<size_t>(r) * d + r] = GetReal(hii[di]);
+          for (int rp = r + 1; rp < d; ++rp) {
+            const size_t dj = blk.det_indices[rp];
+            if (dj == static_cast<size_t>(-1)) continue;
+            size_t orbDiff = 0;
+            ElemT h = Hij(det[di], det[dj], bit_length, norb, I0, I1, I2, orbDiff);
+            const double hv = GetReal(h);
+            Hbb[static_cast<size_t>(r) * d + rp] = hv;
+            Hbb[static_cast<size_t>(rp) * d + r] = hv;   // H is symmetric
+          }
+        }
+
+        // ndiag[off+c] = sum_{r,r'} V_rc V_r'c H_bb[r,r']
+        for (int c = 0; c < blk.n_csf; ++c) {
+          double acc = 0.0;
+          for (int r = 0; r < d; ++r) {
+            if (blk.det_indices[r] == static_cast<size_t>(-1)) continue;
+            const double vr = blk.coeffs[static_cast<size_t>(r) * blk.n_csf + c];
+            if (vr == 0.0) continue;
+            for (int rp = 0; rp < d; ++rp) {
+              if (blk.det_indices[rp] == static_cast<size_t>(-1)) continue;
+              acc += vr * blk.coeffs[static_cast<size_t>(rp) * blk.n_csf + c]
+                        * Hbb[static_cast<size_t>(r) * d + rp];
+            }
+          }
+          ndiag[off + c] = static_cast<RealT>(acc);
+        }
+      }
+    }
 
     // ---- projected matvec y_csf = V^T (mult) (V x_csf) ------------------------
 
@@ -361,7 +487,8 @@ namespace sbd {
                                   int nroot,
                                   RealT eps,
                                   int nkeep,
-                                  SSTimers * tmr = nullptr) {
+                                  SSTimers * tmr = nullptr,
+                                  const std::vector<RealT> * ndiag_exact = nullptr) {
       RealT eps_reg = 1.0e-12;
       RealT tau_drop = 1.0e-6;
       int mpi_rank_h; MPI_Comm_rank(h_comm,&mpi_rank_h);
@@ -419,25 +546,43 @@ namespace sbd {
                   << std::endl;
       }
 
-      // projected diagonal of H in CSF space (approx: V^T diag(H) V, diagonal
-      // part) for the preconditioner. Build once: for each CSF column, its
-      // diagonal is sum_r coeffs[r,c]^2 * hii[det_index[r]] (rank-local).
-      std::vector<RealT> ndiag(K, RealT(0));
-      const long long nblk_diag = static_cast<long long>(V.blocks.size());
+      // Projected diagonal of H in CSF space, for the preconditioner.
+      //
+      // Prefer the EXACT block diagonal supplied by build_projected_diagonal():
+      //   ndiag[off+c] = sum_{r,r'} V_rc V_r'c H_rr'
+      // The r != r' terms are the intra-configuration (spin-flip) exchange
+      // elements; dropping them biases every denominator (E[p] - ndiag[i]) the
+      // same way and stalls Davidson above the true root -- correct spin, too
+      // high energy, worse with K. See build_projected_diagonal().
+      //
+      // Fallback (only if no exact diagonal was supplied): the old approximation
+      // V^T diag(H) V, kept so the core still runs standalone.
+      std::vector<RealT> ndiag;
+      if (ndiag_exact != nullptr &&
+          static_cast<int>(ndiag_exact->size()) == K) {
+        ndiag = *ndiag_exact;
+      } else {
+        ndiag.assign(K, RealT(0));
+        const long long nblk_diag = static_cast<long long>(V.blocks.size());
 #pragma omp parallel for schedule(dynamic) if(nblk_diag > 256)
-      for (long long bidx = 0; bidx < nblk_diag; ++bidx) {
-        const ConfigBlock & blk = V.blocks[bidx];
-        int off = V.csf_offset[bidx];
-        for (int c = 0; c < blk.n_csf; ++c) {
-          RealT acc = RealT(0);
-          for (int r = 0; r < blk.block_dim; ++r) {
-            size_t di = blk.det_indices[r];
-            if (di == static_cast<size_t>(-1)) continue;
-            RealT cr = static_cast<RealT>(blk.coeffs[static_cast<size_t>(r)*blk.n_csf + c]);
-            acc += cr * cr * GetReal(hii[di]);
+        for (long long bidx = 0; bidx < nblk_diag; ++bidx) {
+          const ConfigBlock & blk = V.blocks[bidx];
+          int off = V.csf_offset[bidx];
+          for (int c = 0; c < blk.n_csf; ++c) {
+            RealT acc = RealT(0);
+            for (int r = 0; r < blk.block_dim; ++r) {
+              size_t di = blk.det_indices[r];
+              if (di == static_cast<size_t>(-1)) continue;
+              RealT cr = static_cast<RealT>(blk.coeffs[static_cast<size_t>(r)*blk.n_csf + c]);
+              acc += cr * cr * GetReal(hii[di]);
+            }
+            ndiag[off + c] = acc;
           }
-          ndiag[off + c] = acc;
         }
+        if (mpi_rank_h == 0 && mpi_rank_t == 0 && mpi_rank_b == 0)
+          std::cout << "sbd(ss): WARNING using approximate preconditioner "
+                    << "(V^T diag(H) V); energies may converge above the true root"
+                    << std::endl;
       }
 
       std::vector<std::vector<ElemT>> v(nb, std::vector<ElemT>(K));
@@ -451,22 +596,52 @@ namespace sbd {
       RealT * E = (RealT *) malloc((size_t)nb * sizeof(RealT));
       char jobz = 'V', uplo = 'U';
 
-      // seed: unit CSF vectors e_0..e_{nroot-1}, orthonormalized (they already are)
+      // Seed: unit CSF vectors on the nroot LOWEST-ndiag CSFs.
+      //
+      // Was: e_0..e_{nroot-1}, i.e. the first nroot CSFs in whatever order
+      // std::map<std::vector<int>> happened to emit configurations. That is an
+      // arbitrary (often high-energy) corner of the space with no relation to the
+      // target roots, so the solve wastes iterations climbing down and, combined
+      // with a weak preconditioner, can plateau. Fales/Hohenstein/Levine build
+      // their guess from the lowest-energy determinants for exactly this reason
+      // (JCTC 13, 4162 (2017), Sec. 2.6 / Algorithm 3).
+      //
+      // Cheapest faithful analogue here: pick the nroot smallest projected
+      // diagonals. Unit vectors are trivially orthonormal, so no extra
+      // orthogonalization is needed, and with the exact ndiag these are the
+      // variationally best single-CSF starting guesses.
       int nseed = nroot;
       // Number of leading seed vectors whose Hv is already valid (thick restart
       // carries Hv for the kept Ritz vectors, so they need no fresh matvec). 0 at
       // the initial unit-vector seed.
       int nhv_valid = 0;
-      for (int p = 0; p < nroot; p++) {
-        std::fill(v[p].begin(), v[p].end(), ElemT(0.0));
-        if (p < K) v[p][p] = ElemT(1.0);
+      {
+        double _tsd = (tmr && tmr->on) ? _wtime() : 0.0;
+        std::vector<int> order(K);
+        for (int i = 0; i < K; ++i) order[i] = i;
+        const int ntake = std::min(nroot, K);
+        std::partial_sort(order.begin(), order.begin() + ntake, order.end(),
+                          [&](int a, int b) { return ndiag[a] < ndiag[b]; });
+        for (int p = 0; p < nroot; p++) {
+          std::fill(v[p].begin(), v[p].end(), ElemT(0.0));
+          if (p < K) v[p][order[p]] = ElemT(1.0);
+        }
+        if (mpi_rank_h == 0 && mpi_rank_t == 0 && mpi_rank_b == 0 && ntake > 0)
+          std::cout << "sbd(ss): seed CSFs (lowest ndiag) first="
+                    << order[0] << " diag=" << ndiag[order[0]] << std::endl;
+        if (tmr && tmr->on) tmr->t_seed += _wtime() - _tsd;
       }
 
       bool do_continue = true;
+      double _tloop0 = (tmr && tmr->on) ? _wtime() : 0.0;
       for (int it = 0; it < max_iteration && do_continue; it++) {
         int ib = 0, m = nhv_valid, ncur = nseed;
         while (true) {
-          for (int jb = m; jb < ncur; jb++) matvec(v[jb], Hv[jb]);
+          {
+            double _tmv = (tmr && tmr->on) ? _wtime() : 0.0;
+            for (int jb = m; jb < ncur; jb++) matvec(v[jb], Hv[jb]);
+            if (tmr && tmr->on) tmr->t_mv_outer += _wtime() - _tmv;
+          }
           m = ncur; ib = ncur - 1;
           nhv_valid = 0;  // consumed; only the first cycle after a restart carries Hv
 
@@ -503,6 +678,7 @@ namespace sbd {
             // Parallelize over the CSF index i (independent); loop order swapped
             // so each i accumulates its full kb-sum in one thread iteration.
             std::vector<ElemT> & Rp = Ritz[p];
+            double _tb = (tmr && tmr->on) ? _wtime() : 0.0;
 #pragma omp parallel for if(K > 4096)
             for (int i = 0; i < K; i++) {
               ElemT ri = ElemT(0.0), si = ElemT(0.0);
@@ -514,9 +690,11 @@ namespace sbd {
               Rp[i] = ri;
               res[i] = si - E[p]*ri;
             }
+            if (tmr && tmr->on) { tmr->t_ritz_build += _wtime() - _tb; _tb = _wtime(); }
             RealT nrmw = _local_normalize<ElemT,RealT>(Ritz[p]);
             (void)nrmw;
             norm_r[p] = _local_normalize<ElemT,RealT>(res);
+            if (tmr && tmr->on) tmr->t_ritz_norm += _wtime() - _tb;
             if (norm_r[p] >= eps) { all_converged = false; unconverged.push_back(p); }
           }
 
@@ -543,6 +721,7 @@ namespace sbd {
             // bug normalized ritz between the two terms -> inconsistent residual
             // -> stalled/divergent Davidson at large K). Parallelize over i.
             std::vector<ElemT> & Rp = Ritz[p];
+            double _td = (tmr && tmr->on) ? _wtime() : 0.0;
 #pragma omp parallel for if(K > 4096)
             for (int i = 0; i < K; i++) {
               ElemT ri = ElemT(0.0), si = ElemT(0.0);
@@ -554,7 +733,11 @@ namespace sbd {
               Rp[i] = ri;
               res[i] = si - E[p]*ri;
             }
+            if (tmr && tmr->on) {
+              tmr->t_corr_ritz += _wtime() - _td; tmr->n_corr_ritz++; _td = _wtime();
+            }
             _local_normalize<ElemT,RealT>(res);
+            if (tmr && tmr->on) { tmr->t_corr_norm += _wtime() - _td; _td = _wtime(); }
             int slot = ib + 1 + appended;
             std::vector<ElemT> & vslot = v[slot];
 #pragma omp parallel for if(K > 4096)
@@ -563,6 +746,7 @@ namespace sbd {
               if (std::abs(den) > eps_reg) vslot[i] = res[i]/den;
               else                          vslot[i] = res[i]/(den - eps_reg);
             }
+            if (tmr && tmr->on) { tmr->t_corr_prec += _wtime() - _td; _td = _wtime(); }
             // MGS (two passes) against all current basis + accepted corrections.
             // Classical MGS keeps the kb loop sequential (each subtraction depends
             // on the previous), but the two K-length loops per kb (inner product +
@@ -611,7 +795,11 @@ namespace sbd {
                   for (int i = 0; i < K; i++) vslot[i] -= vkb[i]*ol;
                 }
             }
+            // NOTE: this normalization is load-bearing -- an unnormalized
+            // correction vector makes the energy never converge (the historical
+            // pathology). It stays exactly as-is; only timing is added around it.
             RealT nv = _local_normalize<ElemT,RealT>(v[slot]);
+            if (tmr && tmr->on) tmr->t_corr_mgs += _wtime() - _td;
             if (nv < tau_drop) continue;
             appended++;
           }
@@ -694,17 +882,41 @@ namespace sbd {
         if (tmr && tmr->on) tmr->t_restart += _wtime() - _trs;
       }
 
+      if (tmr && tmr->on) tmr->t_loop_total += _wtime() - _tloop0;
+
       if (tmr && tmr->on && mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0) {
+        // Sum of the individually timed regions inside the inner-cycle loop.
+        // Anything left over is work in the loop that is still not instrumented
+        // (vector copies, allocations, the Ritz->Wcsf handoff, MPI waits).
+        const double acc = tmr->t_mv_outer + tmr->t_subbuild
+                         + tmr->t_ritz_build + tmr->t_ritz_norm
+                         + tmr->t_corr_ritz + tmr->t_corr_norm
+                         + tmr->t_corr_prec + tmr->t_corr_mgs
+                         + tmr->t_restart;
+        const double tot = tmr->t_loop_total;
+        auto pct = [&](double t) { return (tot > 0.0) ? (100.0 * t / tot) : 0.0; };
         std::cout << "sbd: SS-TIMING (K=" << K << ", threads=" << omp_get_max_threads()
-                  << ")\n"
-                  << "  matvec total   = " << tmr->t_matvec   << " s (" << tmr->n_matvec << " calls)\n"
-                  << "    project_up   = " << tmr->t_proj_up  << " s\n"
-                  << "    mult (H*v)   = " << tmr->t_mult      << " s\n"
-                  << "    project_down = " << tmr->t_proj_down << " s\n"
-                  << "  subspace build = " << tmr->t_subbuild << " s (" << tmr->n_inner << " inner products)\n"
-                  << "  ritz+residual  = " << tmr->t_ritz     << " s\n"
-                  << "  correction+MGS = " << tmr->t_correct  << " s\n"
-                  << "  restart        = " << tmr->t_restart  << " s\n";
+                  << ", nroot=" << nroot << ", nb=" << nb << ", keep=" << nkeep << ")\n"
+                  << "  setup: ndiag         = " << tmr->t_ndiag << " s, seed = " << tmr->t_seed << " s\n"
+                  << "  LOOP TOTAL           = " << tot << " s\n"
+                  << "  matvec (outer)       = " << tmr->t_mv_outer << " s (" << pct(tmr->t_mv_outer) << "%)\n"
+                  << "    [method1 split] project_up = " << tmr->t_proj_up
+                  << " s, mult = " << tmr->t_mult
+                  << " s, project_down = " << tmr->t_proj_down << " s ("
+                  << tmr->n_matvec << " calls)\n"
+                  << "  subspace build       = " << tmr->t_subbuild << " s (" << pct(tmr->t_subbuild)
+                  << "%, " << tmr->n_inner << " inner products)\n"
+                  << "  ritz build           = " << tmr->t_ritz_build << " s (" << pct(tmr->t_ritz_build) << "%)\n"
+                  << "  ritz normalize       = " << tmr->t_ritz_norm  << " s (" << pct(tmr->t_ritz_norm) << "%)\n"
+                  << "  corr: ritz REBUILD   = " << tmr->t_corr_ritz  << " s (" << pct(tmr->t_corr_ritz)
+                  << "%, " << tmr->n_corr_ritz << " rebuilds)  <-- duplicate of 'ritz build'\n"
+                  << "  corr: normalize      = " << tmr->t_corr_norm  << " s (" << pct(tmr->t_corr_norm) << "%)\n"
+                  << "  corr: precondition   = " << tmr->t_corr_prec  << " s (" << pct(tmr->t_corr_prec) << "%)\n"
+                  << "  corr: MGS + norm     = " << tmr->t_corr_mgs   << " s (" << pct(tmr->t_corr_mgs) << "%)\n"
+                  << "  restart              = " << tmr->t_restart    << " s (" << pct(tmr->t_restart) << "%)\n"
+                  << "  ---------------------\n"
+                  << "  accounted            = " << acc << " s (" << pct(acc) << "%)\n"
+                  << "  UNACCOUNTED          = " << (tot - acc) << " s (" << pct(tot - acc) << "%)\n";
       }
 
       Wcsf.resize(nroot);
@@ -739,18 +951,40 @@ namespace sbd {
                                     RealT eps,
                                     int nkeep) {
       const size_t ndet = det.size();
+      SSTimers tm;
       auto matvec = [&](const std::vector<ElemT> & xc, std::vector<ElemT> & yc) {
         std::vector<ElemT> xdet, ydet(ndet, ElemT(0.0));
+        if (!tm.on) {
+          project_up(V, xc, xdet, ndet);
+          Zero(ydet);
+          mult(hii, xdet, ydet, bit_length, norb, det, idxmap, exidx, I0, I1, I2,
+               h_comm, b_comm, t_comm);
+          project_down(V, ydet, yc);
+          return;
+        }
+        double t0 = _wtime();
         project_up(V, xc, xdet, ndet);
+        double t1 = _wtime(); tm.t_proj_up += t1 - t0;
         Zero(ydet);
         mult(hii, xdet, ydet, bit_length, norb, det, idxmap, exidx, I0, I1, I2,
              h_comm, b_comm, t_comm);
+        double t2 = _wtime(); tm.t_mult += t2 - t1;
         project_down(V, ydet, yc);
+        tm.t_proj_down += _wtime() - t2;
+        tm.t_matvec += _wtime() - t0; tm.n_matvec++;
       };
+      // Exact projected diagonal for the preconditioner (intra-block H via Hij).
+      std::vector<RealT> ndiag_exact;
+      {
+        double _t0 = tm.on ? _wtime() : 0.0;
+        build_projected_diagonal<ElemT,RealT>(V, hii, det, bit_length, norb,
+                                              I0, I1, I2, ndiag_exact);
+        if (tm.on) tm.t_ndiag += _wtime() - _t0;
+      }
       _davidson_projected_core<ElemT,RealT>(hii, V, matvec, Wcsf, Eout,
                                             h_comm, b_comm, t_comm,
                                             max_iteration, num_block, nroot, eps,
-                                            nkeep);
+                                            nkeep, &tm, &ndiag_exact);
     }
 
     /**
@@ -759,12 +993,18 @@ namespace sbd {
        Faster than matrix-free when the matrix fits; single-spin's basis is small
        (b_comm==1) so it always fits.
     */
-    template <typename ElemT, typename RealT>
+    template <typename ElemT, typename RealT, typename DetsContainer>
     void DavidsonMultiRootProjectedStored(const std::vector<ElemT> & hii,
                                           const SpinProjector & V,
                                           std::vector<std::vector<ElemT>> & Wcsf,
                                           std::vector<RealT> & Eout,
                                           size_t ndet,
+                                          const DetsContainer & det,
+                                          const size_t bit_length,
+                                          const size_t norb,
+                                          const ElemT & I0,
+                                          const oneInt<ElemT> & I1,
+                                          const twoInt<ElemT> & I2,
                                           const std::vector<std::vector<size_t*>> & ih,
                                           const std::vector<std::vector<size_t*>> & jh,
                                           const std::vector<std::vector<ElemT*>> & hij,
@@ -798,10 +1038,18 @@ namespace sbd {
         tm.t_proj_down += _wtime() - t2;
         tm.t_matvec += _wtime() - t0; tm.n_matvec++;
       };
+      // Exact projected diagonal for the preconditioner (intra-block H via Hij).
+      std::vector<RealT> ndiag_exact;
+      {
+        double _t0 = tm.on ? _wtime() : 0.0;
+        build_projected_diagonal<ElemT,RealT>(V, hii, det, bit_length, norb,
+                                              I0, I1, I2, ndiag_exact);
+        if (tm.on) tm.t_ndiag += _wtime() - _t0;
+      }
       _davidson_projected_core<ElemT,RealT>(hii, V, matvec, Wcsf, Eout,
                                             h_comm, b_comm, t_comm,
                                             max_iteration, num_block, nroot, eps,
-                                            nkeep, &tm);
+                                            nkeep, &tm, &ndiag_exact);
     }
 
   } // namespace gdb
