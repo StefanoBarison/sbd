@@ -34,8 +34,18 @@ namespace sbd {
 #pragma omp atomic update
 	twobody[sj+2*si][oj+norb*oi+norb*norb*oj+norb*norb*norb*oi]
 	  += SquaredNorm(WeightI);
+	// Partner term: the (i,j) loop runs only over j > i, so the (j,i)
+	// ordering must be accumulated explicitly here. Both the spin-block
+	// index and the orbital slots swap, matching the convention in
+	// OneDiffCorrelation and TwoDiffCorrelation. This line previously
+	// repeated the index above verbatim, which put 2x into one slot and 0
+	// into its partner. Energies were unaffected (the contraction with
+	// (pq|rs) is symmetric over the swap, so the sum is the same), but the
+	// raw 2-RDM was wrong -- verified against an independently constructed
+	// 2-RDM: for a single closed-shell determinant, element [1,0,1,0] read
+	// 8 instead of 4 and [0,1,0,1] read 0 instead of 4.
 #pragma omp atomic update
-	twobody[sj+2*si][oj+norb*oi+norb*norb*oj+norb*norb*norb*oi]
+	twobody[si+2*sj][oi+norb*oj+norb*norb*oi+norb*norb*norb*oj]
 	  += SquaredNorm(WeightI);
 	if( si == sj ) {
 #pragma omp atomic update
