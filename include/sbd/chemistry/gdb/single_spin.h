@@ -973,15 +973,25 @@ namespace sbd {
         tm.t_proj_down += _wtime() - t2;
         tm.t_matvec += _wtime() - t0; tm.n_matvec++;
       };
+      // hii is only filled for k % mpi_size_h == mpi_rank_h (qcham.h:397-400), so
+      // it is an h_comm-SHARDED diagonal, not a complete one. mult() tolerates
+      // that because it allreduces its output over h_comm, but we read the
+      // diagonal element-wise, so we need the completed vector. This mirrors
+      // davidson.h:77 / :356 / :693, which all call GetTotalD before using hii.
+      // Without it, h_comm_size > 1 silently produced a badly wrong energy
+      // (measured: -164.079118447 instead of -108.729420078 on N2 top100 at
+      // -np 2 --b_comm_size 1 --t_comm_size 1).
+      std::vector<ElemT> dii;
+      GetTotalD(hii, dii, h_comm);
       // Exact projected diagonal for the preconditioner (intra-block H via Hij).
       std::vector<RealT> ndiag_exact;
       {
         double _t0 = tm.on ? _wtime() : 0.0;
-        build_projected_diagonal<ElemT,RealT>(V, hii, det, bit_length, norb,
+        build_projected_diagonal<ElemT,RealT>(V, dii, det, bit_length, norb,
                                               I0, I1, I2, ndiag_exact);
         if (tm.on) tm.t_ndiag += _wtime() - _t0;
       }
-      _davidson_projected_core<ElemT,RealT>(hii, V, matvec, Wcsf, Eout,
+      _davidson_projected_core<ElemT,RealT>(dii, V, matvec, Wcsf, Eout,
                                             h_comm, b_comm, t_comm,
                                             max_iteration, num_block, nroot, eps,
                                             nkeep, &tm, &ndiag_exact);
@@ -1038,15 +1048,20 @@ namespace sbd {
         tm.t_proj_down += _wtime() - t2;
         tm.t_matvec += _wtime() - t0; tm.n_matvec++;
       };
+      // See the matrix-free overload above: hii is h_comm-sharded, so complete it
+      // with GetTotalD before reading diagonal elements directly. mult() keeps
+      // using the sharded hii, since it allreduces its own output over h_comm.
+      std::vector<ElemT> dii;
+      GetTotalD(hii, dii, h_comm);
       // Exact projected diagonal for the preconditioner (intra-block H via Hij).
       std::vector<RealT> ndiag_exact;
       {
         double _t0 = tm.on ? _wtime() : 0.0;
-        build_projected_diagonal<ElemT,RealT>(V, hii, det, bit_length, norb,
+        build_projected_diagonal<ElemT,RealT>(V, dii, det, bit_length, norb,
                                               I0, I1, I2, ndiag_exact);
         if (tm.on) tm.t_ndiag += _wtime() - _t0;
       }
-      _davidson_projected_core<ElemT,RealT>(hii, V, matvec, Wcsf, Eout,
+      _davidson_projected_core<ElemT,RealT>(dii, V, matvec, Wcsf, Eout,
                                             h_comm, b_comm, t_comm,
                                             max_iteration, num_block, nroot, eps,
                                             nkeep, &tm, &ndiag_exact);
