@@ -7,11 +7,14 @@ total spin S BEFORE diagonalizing, then runs the block Davidson-Liu solver in
 the reduced target-S CSF space. Single-spin by construction (no post-hoc <S^2>
 filtering) and a smaller solve.
 
-Restricted to b_comm_size == 1: the whole determinant vector is local to each
-task, so the projector V (block-diagonal by spatial configuration) is entirely
-rank-local. With b_comm_size > 1 a configuration's determinants scatter across
-ranks (SBD sorts by the full interleaved bitstring); the caller must guard
-against that case.
+Distribution status. The projector V is block diagonal by spatial configuration,
+so it is rank-local provided each configuration's determinants all live on one
+rank. SBD's default sort (by the full interleaved bitstring) scatters them, which
+`--do_redist_config 1` repairs; `require_complete_config_blocks()` verifies it
+rather than assuming it, and the global CSF numbering comes from an MPI_Exscan
+over b_comm (see SpinProjector). The CSF-space vector algebra in
+`_davidson_projected_core` is however still rank-local, so b_comm_size > 1 is
+refused for now -- see the note in require_complete_config_blocks().
 
 Conventions: determinant bit 2p = alpha orbital p, 2p+1 = beta orbital p
 (matches occupation.h getocc). Spatial config code per orbital: 0 empty,
@@ -22,6 +25,8 @@ Conventions: determinant bit 2p = alpha orbital p, 2p+1 = beta orbital p
 
 #include <algorithm>
 #include <functional>
+#include <iostream>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <vector>
@@ -72,12 +77,33 @@ namespace sbd {
       int worst_block_dim = 0, worst_present = 0;
     };
 
-    /// V: rank-local block-sparse det<->CSF map. csf_offset[b] = first CSF column
-    /// index of block b in the global CSF ordering; total_csf = k.
+    /// V: rank-local block-sparse det<->CSF map.
+    ///
+    /// CSF INDEXING -- two distinct spaces, do not mix them:
+    ///
+    ///   csf_offset[b]  RANK-LOCAL first CSF column of block b, in [0, local_csf).
+    ///                  Every vector this rank stores has length `local_csf`, so
+    ///                  this is the index to use for element access (project_up,
+    ///                  project_down, ndiag, the Krylov vectors).
+    ///   csf_base       This rank's first CSF in the GLOBAL numbering
+    ///                  (MPI_Exscan of local_csf over b_comm; 0 when b_comm_size
+    ///                  == 1). Block b's global column is csf_base+csf_offset[b].
+    ///                  Needed only when a global index must be named (e.g. a
+    ///                  MINLOC seed) -- never for indexing a local array.
+    ///   local_csf      Number of CSFs this rank owns == length of its slice.
+    ///   global_csf     Sum over b_comm. The dimension of the eigenproblem, so
+    ///                  the value every control-flow clamp (nb, nkeep, nroot) and
+    ///                  every user-facing "CSF dim" print must use.
+    ///
+    /// The former single `total_csf` was removed deliberately: it meant "local"
+    /// at some call sites and "global" at others, which is exactly the confusion
+    /// that made b_comm_size > 1 converge to a plausible wrong energy.
     struct SpinProjector {
       std::vector<ConfigBlock> blocks;
       std::vector<int> csf_offset;
-      int total_csf = 0;
+      int csf_base = 0;
+      int local_csf = 0;
+      int global_csf = 0;
       /// Largest block_dim over all blocks. Number of probe matvecs needed to
       /// extract the exact block-diagonal of the projected Hamiltonian.
       int max_block_dim = 0;
@@ -195,14 +221,91 @@ namespace sbd {
       return spin_mask;   // alpha pattern over open slots, in ascending-orbital slot order
     }
 
+    /// Derive the common spin projection 2*Sz of the determinant list, verified to
+    /// be the same for every determinant on every b rank.
+    ///
+    /// COLLECTIVE on b_comm. Replaces reading `det[0]` on each rank, which had
+    /// three failure modes, all silent and all reachable once b_comm_size > 1:
+    ///   1. `det[0]` is rank-LOCAL, so ranks could derive different Sz2 and build
+    ///      projectors for different Sz sectors. Their block dims and CSF counts
+    ///      would then disagree and the MPI_Exscan numbering would be nonsense.
+    ///   2. An empty local list silently defaulted to Sz2 = 0, which happens to be
+    ///      right only for an Sz=0 sector. At high rank counts a rank can own no
+    ///      determinants.
+    ///   3. Nothing checked that all determinants actually share one Sz. A mixed-Sz
+    ///      input is not a single spin sector at all; the projector is meaningless
+    ///      for it. This is the same class of silent-garbage hole as an incomplete
+    ///      configuration block, so it aborts rather than guesses.
+    ///
+    /// Cost is one O(ndet * norb) bit scan, done once outside the Davidson loop,
+    /// plus two 4-byte allreduces. Returns 2*Sz; aborts on a mixed-Sz list.
+    template <typename DetsContainer>
+    inline int derive_common_sz2(const DetsContainer & det, size_t bit_length,
+                                 int norb, MPI_Comm b_comm, MPI_Comm comm) {
+      // Sentinels chosen so a rank owning nothing cannot influence the min/max.
+      int loc_min = std::numeric_limits<int>::max();
+      int loc_max = std::numeric_limits<int>::min();
+      const long long nd = static_cast<long long>(det.size());
+#pragma omp parallel for schedule(static) reduction(min:loc_min) reduction(max:loc_max) if(nd > 4096)
+      for (long long i = 0; i < nd; ++i) {
+        int na = 0, nbe = 0;
+        for (int p = 0; p < norb; ++p) {
+          if (getocc(det[i], bit_length, 2 * p))     ++na;
+          if (getocc(det[i], bit_length, 2 * p + 1)) ++nbe;
+        }
+        const int s = na - nbe;
+        if (s < loc_min) loc_min = s;
+        if (s > loc_max) loc_max = s;
+      }
+
+      int glb_min = loc_min, glb_max = loc_max;
+      int b_size = 1;
+      MPI_Comm_size(b_comm, &b_size);
+      if (b_size > 1) {
+        MPI_Allreduce(&loc_min, &glb_min, 1, MPI_INT, MPI_MIN, b_comm);
+        MPI_Allreduce(&loc_max, &glb_max, 1, MPI_INT, MPI_MAX, b_comm);
+      }
+
+      int mpi_rank_w = 0;
+      MPI_Comm_rank(comm, &mpi_rank_w);
+
+      // Every rank empty => no determinants at all globally.
+      if (glb_min == std::numeric_limits<int>::max()) {
+        if (mpi_rank_w == 0)
+          std::cerr << " sbd: ERROR --single_spin: the determinant list is empty,"
+                       " so the spin projection Sz cannot be determined."
+                    << std::endl;
+        MPI_Abort(comm, 1);
+      }
+      if (glb_min != glb_max) {
+        if (mpi_rank_w == 0)
+          std::cerr << " sbd: ERROR --single_spin: the determinant list mixes spin"
+                       " projections (found 2*Sz from " << glb_min << " to "
+                    << glb_max << ").\n"
+                       "   The single-spin projector is defined for ONE Sz sector:"
+                       " S^2 is block diagonal over a configuration's Sz-orbit only\n"
+                       "   within a fixed Sz. Select a single-Sz determinant list,"
+                       " or run without --single_spin." << std::endl;
+        MPI_Abort(comm, 1);
+      }
+      return glb_max;
+    }
+
     /// Build the rank-local single-spin projector V for target spin multiplicity
     /// (2S+1: 1=singlet, 2=doublet, 3=triplet, ...) and spin projection Sz
     /// (n_up open-shell alphas is fixed per config by Sz).
-    /// Requires b_comm_size == 1 (caller guards).
+    ///
+    /// COLLECTIVE on b_comm (for the global CSF numbering at the end), so it must
+    /// be called on every b rank. Each rank's blocks come from its own slice of a
+    /// canonically-sorted determinant list, so block emission order is
+    /// deterministic and the Exscan is reproducible. That the blocks partition
+    /// configurations cleanly across ranks is a precondition, checked separately
+    /// by require_complete_config_blocks().
     template <typename ElemT, typename DetsContainer>
     SpinProjector build_config_projector(const DetsContainer & det,
                                          size_t bit_length, int norb,
-                                         int multiplicity, int Sz2 /* 2*Sz */) {
+                                         int multiplicity, int Sz2 /* 2*Sz */,
+                                         MPI_Comm b_comm) {
       // multiplicity m = 2S+1 -> S = (m-1)/2 -> S(S+1) = (m^2 - 1)/4
       double s2_target = 0.25 * (static_cast<double>(multiplicity) * multiplicity - 1.0);
       // group local det indices by (config pattern, open-slot arrangement mask)
@@ -227,10 +330,10 @@ namespace sbd {
         int n_open = 0;
         for (int c : config) if (c == 1) ++n_open;
         int n_up = (n_open + Sz2) / 2;   // alpha among open shells; Sz2 = 2*Sz
-        // Sz2 is taken from det[0] by the caller and assumed common to all dets.
-        // If a config's open-shell count has the wrong parity for that Sz, the
-        // determinant list is not a single Sz sector and n_up would be silently
-        // wrong (truncating division) -- skip rather than build a bad block.
+        // Sz2 comes from derive_common_sz2(), which has already verified it is the
+        // same for every determinant on every rank. A config whose open-shell count
+        // has the wrong parity for that Sz would still make n_up silently wrong
+        // (truncating division), so it is counted and skipped, not built.
         if (((n_open + Sz2) % 2) != 0 || n_up < 0 || n_up > n_open) {
           V.audit.n_dets_bad_parity += members.size();
           continue;
@@ -297,7 +400,54 @@ namespace sbd {
         V.csf_offset.push_back(running);
         running += n_csf;
       }
-      V.total_csf = running;
+      V.local_csf = running;
+
+      // Global CSF numbering over b_comm.
+      //
+      // `running` restarts at 0 on every rank, so csf_offset alone is only
+      // meaningful rank-locally. MPI_Exscan gives each rank the sum of the
+      // strictly-lower ranks' counts, i.e. the global index of its first CSF.
+      // Collective on b_comm: every b rank must reach this, including one that
+      // owns no determinants (it contributes 0 and still needs the barrier).
+      //
+      // MPI_Exscan leaves the recvbuf UNTOUCHED on rank 0, so csf_base is
+      // pre-zeroed rather than read back blind. csf_offset itself is left
+      // rank-local on purpose -- see the SpinProjector comment.
+      {
+        int b_size = 1, b_rank = 0;
+        MPI_Comm_size(b_comm, &b_size);
+        MPI_Comm_rank(b_comm, &b_rank);
+        if (b_size > 1) {
+          int base = 0;
+          MPI_Exscan(&V.local_csf, &base, 1, MPI_INT, MPI_SUM, b_comm);
+          V.csf_base = (b_rank == 0) ? 0 : base;
+          MPI_Allreduce(&V.local_csf, &V.global_csf, 1, MPI_INT, MPI_SUM, b_comm);
+        } else {
+          V.csf_base   = 0;
+          V.global_csf = V.local_csf;
+        }
+        // SBD_SS_CSFMAP=1 dumps the per-rank CSF partition. The invariant to check
+        // is that the [csf_base, csf_base+local_csf) ranges tile [0, global_csf)
+        // with no gap and no overlap: a gap means a rank's blocks were dropped, an
+        // overlap means the Exscan input disagreed with what was actually built.
+        if (const char* e = std::getenv("SBD_SS_CSFMAP")) {
+          if (e[0] == '1') {
+            for (int r = 0; r < b_size; ++r) {
+              MPI_Barrier(b_comm);
+              if (r == b_rank) {
+                std::cout << " sbd: single_spin CSF map: b_rank " << b_rank
+                          << " blocks=" << V.blocks.size()
+                          << " local_csf=" << V.local_csf
+                          << " range=[" << V.csf_base << ","
+                          << (V.csf_base + V.local_csf) << ")"
+                          << " global_csf=" << V.global_csf << std::endl;
+                std::cout.flush();
+              }
+            }
+            MPI_Barrier(b_comm);
+          }
+        }
+      }
       return V;
     }
 
@@ -343,11 +493,12 @@ namespace sbd {
         }
         // Blocks being complete is NECESSARY but not yet SUFFICIENT: the CSF-space
         // vector algebra in _davidson_projected_core is still rank-local
-        // (_local_inner, _local_normalize, the Rayleigh build, thick restart), and
-        // `total_csf` is the LOCAL CSF count. With b_comm_size > 1 each rank would
-        // therefore solve its own slice as if it were the whole space -- measured
-        // on N2 top50 at b_comm=2: reports "projected CSF dim = 27" (rank-local,
-        // vs 56 global) and converges to -111.07 with the residual stuck at ~4,
+        // (_local_inner, _local_normalize, the Rayleigh build, the MINLOC seed,
+        // thick restart). The CSF *numbering* is now global (csf_base/global_csf),
+        // so the dimension is reported correctly, but each rank would still solve
+        // its own slice as if it were the whole space -- measured on N2 top50 at
+        // b_comm=2 before the numbering fix: "projected CSF dim = 27" (rank-local,
+        // vs 56 global), converging to -111.07 with the residual stuck at ~4
         // instead of -108.667515671. Garbage, not a crash.
         //
         // So keep refusing b_comm_size > 1 until those reductions are made
@@ -493,7 +644,8 @@ namespace sbd {
                                   const oneInt<ElemT> & I1,
                                   const twoInt<ElemT> & I2,
                                   std::vector<RealT> & ndiag) {
-      const int K = V.total_csf;
+      // Local: ndiag is indexed by csf_offset[b]+c, which is rank-local.
+      const int K = V.local_csf;
       ndiag.assign(K, RealT(0));
       const long long nblk = static_cast<long long>(V.blocks.size());
 
@@ -567,7 +719,7 @@ namespace sbd {
     template <typename ElemT>
     void project_down(const SpinProjector & V, const std::vector<ElemT> & y_det,
                       std::vector<ElemT> & y_csf) {
-      y_csf.assign(V.total_csf, ElemT(0.0));
+      y_csf.assign(V.local_csf, ElemT(0.0));
       // Each block writes a disjoint y_csf[off .. off+n_csf) range (csf_offset is
       // unique per block), so parallelizing over blocks is race-free.
       const long long nblk = static_cast<long long>(V.blocks.size());
@@ -641,7 +793,8 @@ namespace sbd {
        Converged roots are single-S by construction. Mirrors DavidsonMultiRoot;
        the det-basis solver is left untouched.
 
-       @param[out] Wcsf  nroot CSF-space eigenvectors (each length V.total_csf)
+       @param[out] Wcsf  nroot CSF-space eigenvectors (each length V.local_csf,
+                         i.e. this rank's slice of the global CSF space)
        @param[out] Eout  nroot lowest energies (ascending)
     */
     /**
@@ -673,7 +826,12 @@ namespace sbd {
       int mpi_rank_t; MPI_Comm_rank(t_comm,&mpi_rank_t);
       int mpi_rank_b; MPI_Comm_rank(b_comm,&mpi_rank_b);
 
-      const int K = V.total_csf;
+      // K  = this rank's slice length -> every vector allocation and element loop.
+      // Kg = the eigenproblem dimension -> every control-flow clamp below.
+      // They are equal iff b_comm_size == 1. Using K for a clamp would let each
+      // rank pick a different nb/nkeep and desynchronize the collectives.
+      const int K  = V.local_csf;
+      const int Kg = V.global_csf;
 
       // Subspace (Krylov) cap before collapse. Modest size is fine — with a
       // correct residual the block Davidson-Liu converges in tens of iterations
@@ -682,7 +840,7 @@ namespace sbd {
       int nb = num_block;
       int nb_min = nroot + std::max(nroot, 10);
       if (nb < nb_min) nb = nb_min;
-      if (nb > K) nb = K;
+      if (nb > Kg) nb = Kg;
       if (nb < nroot) nb = nroot;
 
       // Thick-restart carryover: keep the lowest `nkeep` Ritz vectors at each
@@ -711,8 +869,8 @@ namespace sbd {
         if (growth < 1) growth = 1;
         int nb_need = nkeep + growth;
         if (nb < nb_need) nb = nb_need;
-        if (nb > K) nb = K;
-        // nkeep must still leave at least one growth slot after the K clamp.
+        if (nb > Kg) nb = Kg;
+        // nkeep must still leave at least one growth slot after the Kg clamp.
         if (nkeep > nb - 1) nkeep = nb - 1;
         if (nkeep < nroot) nkeep = std::min(nroot, nb - 1);
         if (nkeep < 1) nkeep = 1;
@@ -720,7 +878,7 @@ namespace sbd {
 
       if (mpi_rank_h == 0 && mpi_rank_t == 0 && mpi_rank_b == 0) {
         std::cout << "sbd(ss): nb=" << nb << " keep=" << nkeep
-                  << " growth=" << (nb - nkeep) << " (K=" << K << ")"
+                  << " growth=" << (nb - nkeep) << " (K=" << Kg << ")"
                   << std::endl;
       }
 
@@ -794,6 +952,14 @@ namespace sbd {
       // the initial unit-vector seed.
       int nhv_valid = 0;
       {
+        // NOT YET b_comm-AWARE: `ndiag` is this rank's slice, so this picks the
+        // nroot lowest diagonals LOCALLY. At b_comm_size > 1 that seeds nroot
+        // vectors per rank instead of nroot globally -- the seeds would not be
+        // the global minima and (worse) each rank would place a 1.0 in its own
+        // slice, so the assembled global vector has b_comm_size ones. Needs an
+        // MPI_MINLOC over b_comm on (ndiag[i], csf_base+i), then only the owning
+        // rank writes. Guarded by require_complete_config_blocks refusing
+        // b_comm_size > 1 until Phase B2 lands.
         double _tsd = (tmr && tmr->on) ? _wtime() : 0.0;
         std::vector<int> order(K);
         for (int i = 0; i < K; ++i) order[i] = i;
@@ -1073,7 +1239,7 @@ namespace sbd {
                          + tmr->t_restart;
         const double tot = tmr->t_loop_total;
         auto pct = [&](double t) { return (tot > 0.0) ? (100.0 * t / tot) : 0.0; };
-        std::cout << "sbd: SS-TIMING (K=" << K << ", threads=" << omp_get_max_threads()
+        std::cout << "sbd: SS-TIMING (K=" << Kg << ", threads=" << omp_get_max_threads()
                   << ", nroot=" << nroot << ", nb=" << nb << ", keep=" << nkeep << ")\n"
                   << "  setup: ndiag         = " << tmr->t_ndiag << " s, seed = " << tmr->t_seed << " s\n"
                   << "  LOOP TOTAL           = " << tot << " s\n"

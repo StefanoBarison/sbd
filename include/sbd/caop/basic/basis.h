@@ -192,8 +192,9 @@ namespace sbd {
   // shells. Such a set is exactly one Sz-orbit, and it is exactly one block of
   // the single-spin projector V (see chemistry/gdb/single_spin.h). Keeping
   // whole orbits rank-local is what lets the projected (Option 2) solver run
-  // with b_comm_size > 1 at all: a split orbit gives each rank a different
-  // total_csf and a different csf_offset, so the CSF spaces would not agree.
+  // with b_comm_size > 1 at all: a split orbit truncates a block, so its CSF
+  // column is neither normalized nor spin-pure, and the per-rank CSF counts no
+  // longer partition the global space that the MPI_Exscan numbering assumes.
   //
   // Key. With alpha at even bit positions and beta at odd positions, let
   //   a = w & ALPHA_MASK          (alpha bits, in place)

@@ -430,15 +430,10 @@ namespace sbd {
 			 " after the projector is built." << std::endl;
 	  }
 	  int nr = (nroots > 1) ? nroots : 1;
-	  int Sz2 = 0;
-	  if( !det.empty() ) {
-	    int na = 0, nb2 = 0;
-	    for(int p=0; p < static_cast<int>(L); p++) {
-	      if( getocc(det[0], bit_length, 2*p) )   na++;
-	      if( getocc(det[0], bit_length, 2*p+1) ) nb2++;
-	    }
-	    Sz2 = na - nb2;
-	  }
+	  // Collective on b_comm; verifies every determinant on every rank shares
+	  // one Sz rather than reading det[0] (which is rank-local).
+	  int Sz2 = derive_common_sz2(det, bit_length, static_cast<int>(L),
+				      b_comm, comm);
 	  // SBD_SS_TIMING also reports the phases OUTSIDE the Davidson loop --
 	  // "end davidson" brackets the projector build and the per-root
 	  // post-processing below, not just the solve. See the stored-matrix
@@ -449,7 +444,7 @@ namespace sbd {
 	  double _tv0 = ss_tm ? MPI_Wtime() : 0.0;
 	  SpinProjector Vproj =
 	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
-					  single_spin, Sz2);
+					  single_spin, Sz2, b_comm);
 	  if( ss_tm ) _t_vbuild = MPI_Wtime() - _tv0;
 	  // Precondition: every configuration block must be complete. Aborts with a
 	  // diagnostic naming the likely cause; replaces the old blanket
@@ -457,7 +452,7 @@ namespace sbd {
 	  require_complete_config_blocks(Vproj.audit, static_cast<int>(L),
 					 b_comm_size, b_comm, comm);
 	  if( mpi_rank == 0 )
-	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
+	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.global_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;
 	  std::vector<double> Eroots;
 	  int rkeep = (restart_keep >= 1) ? restart_keep : std::max(nr, max_nb/2);
@@ -677,15 +672,10 @@ namespace sbd {
 			 " after the projector is built." << std::endl;
 	  }
 	  int nr = (nroots > 1) ? nroots : 1;
-	  int Sz2 = 0;
-	  if( !det.empty() ) {
-	    int na = 0, nb2 = 0;
-	    for(int p=0; p < static_cast<int>(L); p++) {
-	      if( getocc(det[0], bit_length, 2*p) )   na++;
-	      if( getocc(det[0], bit_length, 2*p+1) ) nb2++;
-	    }
-	    Sz2 = na - nb2;
-	  }
+	  // Collective on b_comm; verifies every determinant on every rank shares
+	  // one Sz rather than reading det[0] (which is rank-local).
+	  int Sz2 = derive_common_sz2(det, bit_length, static_cast<int>(L),
+				      b_comm, comm);
 	  // SBD_SS_TIMING also reports the phases OUTSIDE the Davidson loop.
 	  // Necessary because "end davidson" brackets far more than the solve: at
 	  // K=113394 / nroots=4 / rdm=1 the loop itself was only ~52 s of ~205 s,
@@ -697,14 +687,14 @@ namespace sbd {
 	  double _tv0 = ss_tm ? MPI_Wtime() : 0.0;
 	  SpinProjector Vproj =
 	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
-					  single_spin, Sz2);
+					  single_spin, Sz2, b_comm);
 	  if( ss_tm ) _t_vbuild = MPI_Wtime() - _tv0;
 	  // Precondition: every configuration block must be complete (see the
 	  // matrix-free branch).
 	  require_complete_config_blocks(Vproj.audit, static_cast<int>(L),
 					 b_comm_size, b_comm, comm);
 	  if( mpi_rank == 0 )
-	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
+	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.global_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;
 	  std::vector<double> Eroots;
 	  int rkeep = (restart_keep >= 1) ? restart_keep : std::max(nr, max_nb/2);
