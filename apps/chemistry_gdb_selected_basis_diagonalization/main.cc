@@ -150,7 +150,12 @@ int main(int argc, char * argv[]) {
     if( mpi_rank_t == 0 ) {
       sbd::load_basis_from_files(detfiles,det,bit_length,2*L,b_comm);
       sbd::sort_bitarray(det);
-      if( sbd_data.do_sort_det ) {
+      // do_redist_config is checked first: it is the only strategy that keeps
+      // whole spatial-configuration orbits rank-local, which --single_spin
+      // requires when b_comm_size > 1.
+      if( sbd_data.do_redist_config ) {
+	sbd::redistribution_equal_config(det,bit_length,2*L,b_comm);
+      } else if( sbd_data.do_sort_det ) {
 	sbd::redistribution(det,bit_length,2*L,b_comm);
 	sbd::reordering(det,bit_length,2*L,b_comm);
       } else if ( sbd_data.do_redist_det ) {

@@ -400,8 +400,36 @@ namespace sbd {
 		    bdet_to_adet[k].data(),
 		    idxmap.BdetToDetLen[k]*sizeof(size_t));
       }
+
+      // AdetToBdetSM[k] and BdetToAdetSM[k] are filled by push_back in
+      // determinant-list order, so they come out ASCENDING only because the
+      // determinant list is in the canonical less_from_back order. Roughly 25
+      // std::lower_bound calls in mult.h / qcham.h / correlation.h binary-search
+      // these rows; if they are not sorted those searches silently miss matches
+      // and Hamiltonian / RDM terms are dropped, giving a variationally too-high
+      // energy with no error message.
+      //
+      // Any change to determinant ordering or distribution must preserve this.
+      // Set SBD_CHECK_IDXMAP=1 to verify it (off by default: the check is O(ndet)
+      // but only worth paying when validating a new ordering).
+      {
+	const char * e = std::getenv("SBD_CHECK_IDXMAP");
+	if( e && e[0] == '1' ) {
+	  size_t bad_ab = 0, bad_ba = 0;
+	  for(size_t k=0; k < adet_to_det.size(); k++)
+	    for(size_t i=1; i < idxmap.AdetToDetLen[k]; i++)
+	      if( idxmap.AdetToBdetSM[k][i-1] >= idxmap.AdetToBdetSM[k][i] ) bad_ab++;
+	  for(size_t k=0; k < bdet_to_det.size(); k++)
+	    for(size_t i=1; i < idxmap.BdetToDetLen[k]; i++)
+	      if( idxmap.BdetToAdetSM[k][i-1] >= idxmap.BdetToAdetSM[k][i] ) bad_ba++;
+	  std::cout << "SBD_CHECK_IDXMAP: AdetToBdetSM non-ascending pairs = " << bad_ab
+		    << ", BdetToAdetSM non-ascending pairs = " << bad_ba
+		    << ( (bad_ab == 0 && bad_ba == 0) ? "  [OK]" : "  [BROKEN: searches will miss]" )
+		    << std::endl;
+	}
+      }
     }
-    
+
     
     template<typename HDetContainer>
     void makeExcitationLookup(const HDetContainer & hdet_bra,

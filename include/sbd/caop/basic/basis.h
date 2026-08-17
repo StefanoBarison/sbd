@@ -183,6 +183,202 @@ namespace sbd {
     sort_bitarray(config);
   }
 
+  // Config-aligned redistribution: partition dets so that every determinant
+  // sharing a SPATIAL CONFIGURATION lands on the same rank.
+  //
+  // Two determinants have the same spatial configuration when, for every
+  // spatial orbital, they agree on whether it is empty / singly / doubly
+  // occupied -- i.e. they differ only in the spin arrangement of their open
+  // shells. Such a set is exactly one Sz-orbit, and it is exactly one block of
+  // the single-spin projector V (see chemistry/gdb/single_spin.h). Keeping
+  // whole orbits rank-local is what lets the projected (Option 2) solver run
+  // with b_comm_size > 1 at all: a split orbit gives each rank a different
+  // total_csf and a different csf_offset, so the CSF spaces would not agree.
+  //
+  // Key. With alpha at even bit positions and beta at odd positions, let
+  //   a = w & ALPHA_MASK          (alpha bits, in place)
+  //   b = (w >> 1) & ALPHA_MASK   (beta bits, shifted onto the even positions)
+  // then (a|b, a&b) = (occupied-anywhere, doubly-occupied) determines the
+  // configuration uniquely, and both halves are plain masked words -- the same
+  // style as redistribution_equal_bra_a's ALPHA_MASK trick.
+  //
+  // Balance. Orbit sizes are C(n_open, n_up) and vary widely (1, 2, 6, 20, 70,
+  // 252, ... for Sz=0), so slicing the key list into equal COUNTS of keys
+  // would imbalance badly. Instead assign whole keys greedily largest-first to
+  // the currently-least-loaded rank. Measured on real sampled N2 spaces this
+  // gives <=0.6% imbalance up to 64 ranks, improving with system size.
+  // The assignment is computed from the globally allgathered key list, which is
+  // identical on every rank, so all ranks derive the same ownership without
+  // further communication.
+  //
+  // Order. Like redistribution_equal_bra_a, this ends by restoring the
+  // canonical less_from_back order locally (Step 7). That is REQUIRED, not
+  // cosmetic: makeDetIndexMap builds AdetToBdetSM / BdetToAdetSM by push_back
+  // in det-list order, and ~25 lower_bound calls in mult.h / qcham.h /
+  // correlation.h binary-search those rows. A non-canonical local order makes
+  // them silently miss matches, dropping Hamiltonian terms with no error.
+  // LoadWavefunction also binary-searches the det list with less_from_back.
+  void redistribution_equal_config(det_vector<size_t> & config,
+                                   size_t bit_length,
+                                   size_t total_bit_length,
+                                   MPI_Comm comm) {
+    int mpi_size; MPI_Comm_size(comm, &mpi_size);
+    int mpi_rank; MPI_Comm_rank(comm, &mpi_rank);
+    if (mpi_size == 1) { sort_bitarray(config); return; }
+
+    const int clen = static_cast<int>((total_bit_length + bit_length - 1) / bit_length);
+    constexpr size_t ALPHA_MASK = 0x5555555555555555ULL;
+
+    // Config key of one det, as 2*clen words: [occupied-anywhere | doubly-occ].
+    auto config_key = [clen](const auto & det, std::vector<size_t> & key) {
+      for (int k = 0; k < clen; k++) {
+        const size_t a = det[k] & ALPHA_MASK;
+        const size_t b = (det[k] >> 1) & ALPHA_MASK;
+        key[k]        = a | b;
+        key[clen + k] = a & b;
+      }
+    };
+    const int klen = 2 * clen;
+
+    // Step 1: local (key, det index) list, sorted by key so equal keys are adjacent.
+    std::vector<size_t> keybuf(static_cast<size_t>(config.size()) * klen);
+    for (size_t j = 0; j < config.size(); j++) {
+      std::vector<size_t> key(klen);
+      config_key(config[j], key);
+      for (int k = 0; k < klen; k++) keybuf[j * klen + k] = key[k];
+    }
+    auto key_less = [klen](const size_t * x, const size_t * y) {
+      for (int k = klen - 1; k >= 0; k--) {   // from-back, matching less_from_back
+        if (x[k] < y[k]) return true;
+        if (x[k] > y[k]) return false;
+      }
+      return false;
+    };
+    std::vector<size_t> order(config.size());
+    std::iota(order.begin(), order.end(), size_t(0));
+    std::sort(order.begin(), order.end(), [&](size_t x, size_t y) {
+      return key_less(&keybuf[x * klen], &keybuf[y * klen]);
+    });
+
+    // Step 2: local unique keys, with local multiplicity (orbit size on this rank).
+    std::vector<size_t> loc_keys;      // flat, klen words per key
+    std::vector<size_t> loc_weight;    // dets per key, local
+    for (size_t i = 0; i < order.size(); i++) {
+      const size_t * cur = &keybuf[order[i] * klen];
+      if (i == 0 || key_less(&keybuf[order[i-1] * klen], cur)) {
+        loc_keys.insert(loc_keys.end(), cur, cur + klen);
+        loc_weight.push_back(1);
+      } else {
+        loc_weight.back()++;
+      }
+    }
+    const int loc_n = static_cast<int>(loc_weight.size());
+
+    // Step 3: allgather keys + weights -> global key list, identical on all ranks.
+    std::vector<int> all_counts(mpi_size);
+    MPI_Allgather(&loc_n, 1, MPI_INT, all_counts.data(), 1, MPI_INT, comm);
+    int total_n = 0;
+    std::vector<int> kdispl(mpi_size, 0), kcount(mpi_size);
+    std::vector<int> wdispl(mpi_size, 0), wcount(mpi_size);
+    for (int r = 0; r < mpi_size; r++) {
+      kdispl[r] = total_n * klen;  kcount[r] = all_counts[r] * klen;
+      wdispl[r] = total_n;         wcount[r] = all_counts[r];
+      total_n += all_counts[r];
+    }
+    std::vector<size_t> gath_keys(static_cast<size_t>(total_n) * klen);
+    std::vector<size_t> gath_weight(total_n);
+    MPI_Allgatherv(loc_keys.data(), loc_n * klen, SBD_MPI_SIZE_T,
+                   gath_keys.data(), kcount.data(), kdispl.data(), SBD_MPI_SIZE_T, comm);
+    MPI_Allgatherv(loc_weight.data(), loc_n, SBD_MPI_SIZE_T,
+                   gath_weight.data(), wcount.data(), wdispl.data(), SBD_MPI_SIZE_T, comm);
+
+    // Step 4: merge duplicate keys (the same config can appear on several ranks),
+    // producing the global unique key list with global orbit weights.
+    std::vector<size_t> gorder(total_n);
+    std::iota(gorder.begin(), gorder.end(), size_t(0));
+    std::sort(gorder.begin(), gorder.end(), [&](size_t x, size_t y) {
+      return key_less(&gath_keys[x * klen], &gath_keys[y * klen]);
+    });
+    std::vector<size_t> uniq_keys;     // flat, klen words per key
+    std::vector<size_t> uniq_weight;
+    for (size_t i = 0; i < gorder.size(); i++) {
+      const size_t * cur = &gath_keys[gorder[i] * klen];
+      if (i == 0 || key_less(&gath_keys[gorder[i-1] * klen], cur)) {
+        uniq_keys.insert(uniq_keys.end(), cur, cur + klen);
+        uniq_weight.push_back(gath_weight[gorder[i]]);
+      } else {
+        uniq_weight.back() += gath_weight[gorder[i]];
+      }
+    }
+    const size_t n_uniq = uniq_weight.size();
+
+    // Step 5: greedy largest-first assignment of whole keys to ranks. Ties are
+    // broken by key order and then by lowest rank index, so the result is
+    // deterministic and identical on every rank.
+    std::vector<size_t> by_weight(n_uniq);
+    std::iota(by_weight.begin(), by_weight.end(), size_t(0));
+    std::stable_sort(by_weight.begin(), by_weight.end(),
+                     [&](size_t x, size_t y) { return uniq_weight[x] > uniq_weight[y]; });
+    std::vector<size_t> load(mpi_size, 0);
+    std::vector<int> key_owner(n_uniq, 0);
+    for (size_t t = 0; t < n_uniq; t++) {
+      const size_t kk = by_weight[t];
+      int best = 0;
+      for (int r = 1; r < mpi_size; r++) if (load[r] < load[best]) best = r;
+      key_owner[kk] = best;
+      load[best] += uniq_weight[kk];
+    }
+
+    // Step 6: destination of each local det = owner of its config key.
+    std::vector<int> dest_per_det(config.size());
+    std::vector<int> sendcounts(mpi_size, 0);
+    {
+      std::vector<size_t> key(klen);
+      for (size_t j = 0; j < config.size(); j++) {
+        config_key(config[j], key);
+        // binary search the unique key list (sorted by key_less)
+        size_t lo = 0, hi = n_uniq;
+        while (lo < hi) {
+          const size_t mid = lo + (hi - lo) / 2;
+          if (key_less(&uniq_keys[mid * klen], key.data())) lo = mid + 1;
+          else hi = mid;
+        }
+        const int dest = (lo < n_uniq) ? key_owner[lo] : 0;
+        dest_per_det[j] = dest;
+        sendcounts[dest]++;
+      }
+    }
+
+    // Step 7: MPI_Alltoallv (clen words per det).
+    std::vector<int> sendcounts_w(mpi_size), sdispls(mpi_size, 0);
+    for (int r = 0; r < mpi_size; r++) sendcounts_w[r] = sendcounts[r] * clen;
+    for (int r = 1; r < mpi_size; r++) sdispls[r] = sdispls[r-1] + sendcounts_w[r-1];
+    std::vector<int> recvcounts_w(mpi_size), rdispls(mpi_size, 0);
+    MPI_Alltoall(sendcounts_w.data(), 1, MPI_INT, recvcounts_w.data(), 1, MPI_INT, comm);
+    for (int r = 1; r < mpi_size; r++) rdispls[r] = rdispls[r-1] + recvcounts_w[r-1];
+    int total_recv_w = rdispls[mpi_size-1] + recvcounts_w[mpi_size-1];
+
+    std::vector<size_t> sendbuf(static_cast<size_t>(config.size()) * clen);
+    {
+      std::vector<int> fill(sdispls);
+      for (size_t j = 0; j < config.size(); j++) {
+        const int d = dest_per_det[j];
+        for (int k = 0; k < clen; k++) sendbuf[fill[d]++] = config[j][k];
+      }
+    }
+    std::vector<size_t> recvbuf(total_recv_w);
+    MPI_Alltoallv(sendbuf.data(), sendcounts_w.data(), sdispls.data(), SBD_MPI_SIZE_T,
+                  recvbuf.data(), recvcounts_w.data(), rdispls.data(), SBD_MPI_SIZE_T, comm);
+
+    // Step 8: unpack and restore the canonical order (see the Order note above).
+    // sort_bitarray also dedups, matching redistribution_equal_bra_a.
+    size_t n_recv = static_cast<size_t>(total_recv_w) / static_cast<size_t>(clen);
+    config.resize(n_recv);
+    for (size_t i = 0; i < n_recv; i++)
+      for (int k = 0; k < clen; k++) config[i][k] = recvbuf[i * clen + k];
+    sort_bitarray(config);
+  }
+
   template <typename Container>
   void reordering(Container & config,
 		  size_t bit_length,

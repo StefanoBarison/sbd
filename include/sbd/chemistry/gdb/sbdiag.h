@@ -48,6 +48,12 @@ namespace sbd {
       bool do_sort_det = false;
       bool do_redist_det = false;
       bool do_redist_alpha_eq = true;
+      // Partition determinants so that every determinant of one spatial
+      // configuration lands on the same b_comm rank. Required for --single_spin
+      // with b_comm_size > 1, since the projector's blocks are whole
+      // configuration orbits. Off by default: the existing distribution
+      // strategies are unchanged unless this is asked for.
+      bool do_redist_config = false;
     };
 
     SBD generate_sbd_data(int argc, char * argv[]) {
@@ -135,6 +141,11 @@ namespace sbd {
 	if( std::string(argv[i]) == "--do_redist_alpha_eq" ) {
 	  sbd_data.do_redist_alpha_eq = ( std::atoi(argv[++i]) != 0 );
 	}
+	if( std::string(argv[i]) == "--do_redist_config" ) {
+	  if( std::atoi(argv[++i]) != 0 ) {
+	    sbd_data.do_redist_config = true;
+	  }
+	}
       }
       return sbd_data;
     }
@@ -159,6 +170,7 @@ namespace sbd {
       std::cout << "# do basis sort: " << sbd_data.do_sort_det << std::endl;
       std::cout << "# do redistribution of basis: " << sbd_data.do_redist_det << std::endl;
       std::cout << "# do equal-bra_a redistribution: " << sbd_data.do_redist_alpha_eq << std::endl;
+      std::cout << "# do config-aligned redistribution: " << sbd_data.do_redist_config << std::endl;
       if( sbd_data.do_rdm != 0.0 ) {
 	std::cout << "# do rdm: " << sbd_data.do_rdm << std::endl;
 	std::cout << "# rdm roots: "
@@ -1077,7 +1089,13 @@ namespace sbd {
       if( mpi_rank_h == 0 ) {
 	if( mpi_rank_t == 0 ) {
 	  load_basis_from_files(detfiles,det,bit_length,2*L,b_comm);
-	  if( sbd_data.do_sort_det ) {
+	  // NOTE: unlike apps/.../main.cc this path has no unconditional
+	  // sort_bitarray(det) here; load_basis_from_files already sorts
+	  // (caop/basic/basis.h) and every branch below re-sorts internally.
+	  // Kept as-is to avoid changing existing behaviour.
+	  if( sbd_data.do_redist_config ) {
+	    redistribution_equal_config(det,bit_length,2*L,b_comm);
+	  } else if( sbd_data.do_sort_det ) {
 	    redistribution(det,bit_length,2*L,b_comm);
 	    reordering(det,bit_length,2*L,b_comm);
 	  } else if ( sbd_data.do_redist_det ) {
