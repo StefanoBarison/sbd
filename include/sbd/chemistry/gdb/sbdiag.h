@@ -416,13 +416,18 @@ namespace sbd {
 			max_it,max_nb,eps,max_time);
 #else
 	if( single_spin >= 1 ) {
-	  // Option 2 (matrix-free): project onto target spin S. b_comm==1 only.
-	  if( b_comm_size > 1 ) {
-	    if( mpi_rank == 0 )
-	      std::cerr << " sbd: ERROR --single_spin requires b_comm_size == 1 "
-			<< "(configuration determinants scatter across b ranks); got "
-			<< b_comm_size << std::endl;
-	    MPI_Abort(comm, 1);
+	  // Option 2 (matrix-free): project onto target spin S.
+	  //
+	  // b_comm_size > 1 is allowed provided every configuration's determinants
+	  // are on one rank, which --do_redist_config 1 arranges. That is verified
+	  // after the projector is built (require_complete_config_blocks) rather
+	  // than assumed, so a split configuration aborts instead of silently
+	  // producing a truncated, non-spin-pure CSF column.
+	  if( b_comm_size > 1 && !sbd_data.do_redist_config && mpi_rank == 0 ) {
+	    std::cerr << " sbd: WARNING --single_spin with b_comm_size = " << b_comm_size
+		      << " and no --do_redist_config 1: configuration blocks are"
+			 " very likely split across b ranks and the run will abort"
+			 " after the projector is built." << std::endl;
 	  }
 	  int nr = (nroots > 1) ? nroots : 1;
 	  int Sz2 = 0;
@@ -446,6 +451,11 @@ namespace sbd {
 	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
 					  single_spin, Sz2);
 	  if( ss_tm ) _t_vbuild = MPI_Wtime() - _tv0;
+	  // Precondition: every configuration block must be complete. Aborts with a
+	  // diagnostic naming the likely cause; replaces the old blanket
+	  // b_comm_size == 1 restriction.
+	  require_complete_config_blocks(Vproj.audit, static_cast<int>(L),
+					 b_comm_size, b_comm, comm);
 	  if( mpi_rank == 0 )
 	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;
@@ -655,13 +665,16 @@ namespace sbd {
 	}
 	auto time_start_david = std::chrono::high_resolution_clock::now();
 	if( single_spin >= 1 ) {
-	  // Option 2 (stored matrix): project onto target spin S. b_comm==1 only.
-	  if( b_comm_size > 1 ) {
-	    if( mpi_rank == 0 )
-	      std::cerr << " sbd: ERROR --single_spin requires b_comm_size == 1 "
-			<< "(configuration determinants scatter across b ranks); got "
-			<< b_comm_size << std::endl;
-	    MPI_Abort(comm, 1);
+	  // Option 2 (stored matrix): project onto target spin S. See the
+	  // matrix-free branch above: b_comm_size > 1 is allowed when every
+	  // configuration's determinants are on one rank, which
+	  // --do_redist_config 1 arranges and require_complete_config_blocks
+	  // verifies below.
+	  if( b_comm_size > 1 && !sbd_data.do_redist_config && mpi_rank == 0 ) {
+	    std::cerr << " sbd: WARNING --single_spin with b_comm_size = " << b_comm_size
+		      << " and no --do_redist_config 1: configuration blocks are"
+			 " very likely split across b ranks and the run will abort"
+			 " after the projector is built." << std::endl;
 	  }
 	  int nr = (nroots > 1) ? nroots : 1;
 	  int Sz2 = 0;
@@ -686,6 +699,10 @@ namespace sbd {
 	    build_config_projector<ElemT>(det, bit_length, static_cast<int>(L),
 					  single_spin, Sz2);
 	  if( ss_tm ) _t_vbuild = MPI_Wtime() - _tv0;
+	  // Precondition: every configuration block must be complete (see the
+	  // matrix-free branch).
+	  require_complete_config_blocks(Vproj.audit, static_cast<int>(L),
+					 b_comm_size, b_comm, comm);
 	  if( mpi_rank == 0 )
 	    std::cout << " sbd: single_spin mult=" << single_spin << " projected CSF dim = " << Vproj.total_csf << std::endl;
 	  std::vector<std::vector<ElemT>> Wcsf;

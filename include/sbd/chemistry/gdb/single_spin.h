@@ -23,6 +23,7 @@ Conventions: determinant bit 2p = alpha orbital p, 2p+1 = beta orbital p
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <sstream>
 #include <vector>
 #include <cstdlib>
 #include <omp.h>
@@ -39,6 +40,38 @@ namespace sbd {
       int n_csf = 0;
     };
 
+    /// Per-rank block-completeness report, filled while V is built.
+    ///
+    /// A block is COMPLETE when all block_dim arrangement rows of its
+    /// configuration are present in the local determinant list. V is
+    /// block-diagonal by spatial configuration, so an incomplete block gives a
+    /// CSF column built from a strict subset of its spin-coupling set: not
+    /// normalized, not an S^2 eigenvector, and -- before this audit -- silently
+    /// accepted, because every consumer skips the (size_t)-1 sentinel rows while
+    /// `coeffs` still assumes every row is present.
+    ///
+    /// Two ways a block ends up incomplete:
+    ///   1. the determinant list is not spin-complete (missing Sz-orbit members);
+    ///   2. b_comm_size > 1 without config-aligned redistribution, so a
+    ///      configuration's determinants are scattered across ranks.
+    struct ProjectorAudit {
+      size_t n_blocks       = 0;   ///< blocks emitted on this rank
+      size_t n_incomplete   = 0;   ///< blocks missing >= 1 arrangement row
+      size_t n_missing_rows = 0;   ///< total missing rows (surviving sentinels)
+      size_t n_dets_covered = 0;   ///< local dets placed in an emitted block
+      /// Dets whose configuration has the wrong open-shell parity for the
+      /// requested Sz. Fatal: the list is not a single Sz sector.
+      size_t n_dets_bad_parity = 0;
+      /// Dets in a configuration with no target-S CSF at all. NOT an error --
+      /// those determinants genuinely have no target-S component (e.g. a
+      /// closed-shell configuration has no triplet CSF) -- but reported so the
+      /// count is visible rather than silently dropped.
+      size_t n_dets_no_target_s = 0;
+      /// One offending configuration, for the diagnostic message.
+      std::vector<int> worst_config;
+      int worst_block_dim = 0, worst_present = 0;
+    };
+
     /// V: rank-local block-sparse det<->CSF map. csf_offset[b] = first CSF column
     /// index of block b in the global CSF ordering; total_csf = k.
     struct SpinProjector {
@@ -48,6 +81,8 @@ namespace sbd {
       /// Largest block_dim over all blocks. Number of probe matvecs needed to
       /// extract the exact block-diagonal of the projected Hamiltonian.
       int max_block_dim = 0;
+      /// Completeness report for this rank's blocks; see ProjectorAudit.
+      ProjectorAudit audit;
     };
 
     // ---- canonical per-n_open S^2 block (orbital-independent), cached ----------
@@ -196,7 +231,10 @@ namespace sbd {
         // If a config's open-shell count has the wrong parity for that Sz, the
         // determinant list is not a single Sz sector and n_up would be silently
         // wrong (truncating division) -- skip rather than build a bad block.
-        if (((n_open + Sz2) % 2) != 0 || n_up < 0 || n_up > n_open) continue;
+        if (((n_open + Sz2) % 2) != 0 || n_up < 0 || n_up > n_open) {
+          V.audit.n_dets_bad_parity += members.size();
+          continue;
+        }
 
         if (coeff_cache.find(n_open) == coeff_cache.end()) {
           int bd, nc;
@@ -205,7 +243,12 @@ namespace sbd {
         }
         int block_dim = dim_cache[n_open];
         int n_csf = ncsf_cache[n_open];
-        if (n_csf == 0) continue;    // no target-S CSF for this config
+        if (n_csf == 0) {
+          // Legitimate: this configuration has no component of the target spin
+          // (e.g. a closed-shell config has no triplet CSF). Counted, not fatal.
+          V.audit.n_dets_no_target_s += members.size();
+          continue;
+        }
 
         // members must be exactly the block_dim arrangements of this config; order
         // them by arrangement mask to match the canonical basis ordering
@@ -224,6 +267,31 @@ namespace sbd {
           if (it != mask_to_row.end()) blk.det_indices[it->second] = pr.first;
         }
         blk.coeffs = coeff_cache[n_open];   // (block_dim x n_csf) row-major
+
+        // Audit this block's completeness. `coeffs` is the canonical S^2
+        // eigenvector for the FULL block_dim orbit, so any row still holding the
+        // (size_t)-1 sentinel means the CSF column is a truncation of that
+        // eigenvector: neither normalized nor spin-pure. Cheap -- one pass over
+        // rows we have just written.
+        {
+          int present = 0;
+          for (int r = 0; r < block_dim; ++r)
+            if (blk.det_indices[r] != static_cast<size_t>(-1)) ++present;
+          V.audit.n_blocks++;
+          V.audit.n_dets_covered += static_cast<size_t>(present);
+          if (present != block_dim) {
+            V.audit.n_incomplete++;
+            V.audit.n_missing_rows += static_cast<size_t>(block_dim - present);
+            // Keep the most-truncated block as the example to report.
+            if (V.audit.worst_config.empty() ||
+                (block_dim - present) > (V.audit.worst_block_dim - V.audit.worst_present)) {
+              V.audit.worst_config = config;
+              V.audit.worst_block_dim = block_dim;
+              V.audit.worst_present = present;
+            }
+          }
+        }
+
         if (block_dim > V.max_block_dim) V.max_block_dim = block_dim;
         V.blocks.push_back(std::move(blk));
         V.csf_offset.push_back(running);
@@ -231,6 +299,116 @@ namespace sbd {
       }
       V.total_csf = running;
       return V;
+    }
+
+    /**
+       Abort unless every rank's configuration blocks are complete.
+
+       Collective on b_comm: must be called on ALL b ranks. Replaces the previous
+       blanket `b_comm_size > 1` abort with a checked precondition, so the
+       projected solver runs exactly when its assumption actually holds.
+
+       This also closes a pre-existing silent failure at b_comm_size == 1: an
+       input determinant list that is not spin-complete produced truncated,
+       non-spin-pure CSF columns and a plausible-looking wrong energy, with no
+       warning of any kind.
+    */
+    inline void require_complete_config_blocks(const ProjectorAudit & audit,
+                                               int norb,
+                                               int b_comm_size,
+                                               MPI_Comm b_comm,
+                                               MPI_Comm comm) {
+      int mpi_rank_b; MPI_Comm_rank(b_comm, &mpi_rank_b);
+      int mpi_rank_w; MPI_Comm_rank(comm, &mpi_rank_w);
+
+      // Fatal defects: truncated blocks and wrong-Sz-parity configurations.
+      // n_dets_no_target_s is deliberately NOT fatal (see ProjectorAudit).
+      unsigned long long loc[4] = {
+        static_cast<unsigned long long>(audit.n_incomplete),
+        static_cast<unsigned long long>(audit.n_missing_rows),
+        static_cast<unsigned long long>(audit.n_dets_bad_parity),
+        static_cast<unsigned long long>(audit.n_dets_no_target_s)
+      };
+      unsigned long long tot[4] = {0,0,0,0};
+      MPI_Allreduce(loc, tot, 4, MPI_UNSIGNED_LONG_LONG, MPI_SUM, b_comm);
+
+      const bool fatal = (tot[0] != 0) || (tot[2] != 0);
+      if (!fatal) {
+        if (mpi_rank_w == 0) {
+          std::cout << " sbd: single_spin: all configuration blocks complete";
+          if (tot[3] != 0)
+            std::cout << " (" << tot[3] << " determinant(s) in configurations with"
+                      << " no target-S component, correctly excluded)";
+          std::cout << std::endl;
+        }
+        // Blocks being complete is NECESSARY but not yet SUFFICIENT: the CSF-space
+        // vector algebra in _davidson_projected_core is still rank-local
+        // (_local_inner, _local_normalize, the Rayleigh build, thick restart), and
+        // `total_csf` is the LOCAL CSF count. With b_comm_size > 1 each rank would
+        // therefore solve its own slice as if it were the whole space -- measured
+        // on N2 top50 at b_comm=2: reports "projected CSF dim = 27" (rank-local,
+        // vs 56 global) and converges to -111.07 with the residual stuck at ~4,
+        // instead of -108.667515671. Garbage, not a crash.
+        //
+        // So keep refusing b_comm_size > 1 until those reductions are made
+        // b_comm-aware. Removing this guard is the last step of that work, not
+        // the first.
+        if (b_comm_size > 1) {
+          if (mpi_rank_w == 0)
+            std::cerr
+              << " sbd: ERROR --single_spin with b_comm_size = " << b_comm_size
+              << " is not yet supported.\n"
+              << "      Configuration blocks ARE rank-local (--do_redist_config"
+                 " worked), but the CSF-space\n"
+              << "      reductions in the projected Davidson are still local-only,"
+                 " so each rank would\n"
+              << "      solve its own slice and return a wrong energy silently."
+                 " Use b_comm_size 1.\n"
+              << std::flush;
+          MPI_Barrier(b_comm);
+          MPI_Abort(comm, 1);
+        }
+        return;
+      }
+
+      // Every rank with a defect reports its own, so the offending rank is named.
+      if (audit.n_incomplete != 0 || audit.n_dets_bad_parity != 0) {
+        std::ostringstream os;
+        os << " sbd: ERROR --single_spin: b_comm rank " << mpi_rank_b
+           << " has " << audit.n_incomplete << " INCOMPLETE configuration block(s)"
+           << " (" << audit.n_missing_rows << " arrangement row(s) missing)";
+        if (audit.n_dets_bad_parity != 0)
+          os << " and " << audit.n_dets_bad_parity
+             << " determinant(s) whose configuration has the wrong open-shell"
+                " parity for the requested Sz";
+        os << "\n";
+        if (!audit.worst_config.empty()) {
+          os << "       worst block: block_dim=" << audit.worst_block_dim
+             << " present=" << audit.worst_present << "  config(0=empty,1=single,2=double) =";
+          for (int p = 0; p < norb && p < static_cast<int>(audit.worst_config.size()); ++p)
+            os << " " << audit.worst_config[p];
+          os << "\n";
+        }
+        std::cerr << os.str() << std::flush;
+      }
+
+      if (mpi_rank_w == 0) {
+        std::cerr
+          << " sbd: V is block-diagonal by spatial configuration. A truncated block\n"
+          << "      yields a CSF column that is neither normalized nor an S^2\n"
+          << "      eigenvector, so the reported energies would be silently wrong.\n"
+          << "      Two possible causes:\n"
+          << "        (1) b_comm_size = " << b_comm_size << " > 1 without config-aligned\n"
+          << "            redistribution, so a configuration's determinants are split\n"
+          << "            across b ranks. Add --do_redist_config 1.\n"
+          << "        (2) the determinant list is not spin-complete: some configuration\n"
+          << "            is missing Sz-orbit members, or the list spans several Sz\n"
+          << "            sectors. Run the Anderson spin completion on the determinant\n"
+          << "            set before diagonalizing.\n"
+          << std::flush;
+      }
+      MPI_Barrier(b_comm);      // let every rank's message land before aborting
+      MPI_Abort(comm, 1);
     }
 
     // ---- optional per-phase timing (env SBD_SS_TIMING=1) ----------------------
