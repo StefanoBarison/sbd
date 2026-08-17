@@ -7,14 +7,25 @@ total spin S BEFORE diagonalizing, then runs the block Davidson-Liu solver in
 the reduced target-S CSF space. Single-spin by construction (no post-hoc <S^2>
 filtering) and a smaller solve.
 
-Distribution status. The projector V is block diagonal by spatial configuration,
-so it is rank-local provided each configuration's determinants all live on one
-rank. SBD's default sort (by the full interleaved bitstring) scatters them, which
-`--do_redist_config 1` repairs; `require_complete_config_blocks()` verifies it
-rather than assuming it, and the global CSF numbering comes from an MPI_Exscan
-over b_comm (see SpinProjector). The CSF-space vector algebra in
-`_davidson_projected_core` is however still rank-local, so b_comm_size > 1 is
-refused for now -- see the note in require_complete_config_blocks().
+Distribution. V is block diagonal by spatial configuration, so it is rank-local
+provided each configuration's determinants all live on one rank. SBD's default
+sort (by the full interleaved bitstring) scatters them, which
+`--do_redist_config 1` repairs and `require_complete_config_blocks()` verifies
+rather than assumes. Each b_comm rank then owns the contiguous CSF range
+[csf_base, csf_base+local_csf) (MPI_Exscan; see SpinProjector), and the CSF-space
+algebra in `_davidson_projected_core` is b_comm-collective, so b_comm_size > 1 is
+supported: inner products, norms, the Rayleigh matrix, the seed and both
+Gram-Schmidt passes all reduce over b_comm.
+
+Two rules for anyone editing the solver:
+  * Every CSF-space reduction must be collective on b_comm. A rank-local one does
+    not crash -- it converges to a plausible wrong energy (see the history note in
+    require_complete_config_blocks).
+  * Every b rank must execute the same sequence of collectives. Control flow must
+    therefore branch on `Kg`/`global_csf`, never on the local `K`, which differs
+    between ranks.
+`mult` needs no change: it already reduces over t_comm/h_comm and slides over
+b_comm, so it is a distributed operator on b-local determinant vectors.
 
 Conventions: determinant bit 2p = alpha orbital p, 2p+1 = beta orbital p
 (matches occupation.h getocc). Spatial config code per orbital: 0 empty,
@@ -491,34 +502,20 @@ namespace sbd {
                       << " no target-S component, correctly excluded)";
           std::cout << std::endl;
         }
-        // Blocks being complete is NECESSARY but not yet SUFFICIENT: the CSF-space
-        // vector algebra in _davidson_projected_core is still rank-local
-        // (_local_inner, _local_normalize, the Rayleigh build, the MINLOC seed,
-        // thick restart). The CSF *numbering* is now global (csf_base/global_csf),
-        // so the dimension is reported correctly, but each rank would still solve
-        // its own slice as if it were the whole space -- measured on N2 top50 at
-        // b_comm=2 before the numbering fix: "projected CSF dim = 27" (rank-local,
-        // vs 56 global), converging to -111.07 with the residual stuck at ~4
-        // instead of -108.667515671. Garbage, not a crash.
+        // Complete blocks are now SUFFICIENT as well as necessary: the CSF-space
+        // reductions in _davidson_projected_core (_local_inner, _local_normalize,
+        // the Rayleigh build, the MINLOC seed, the correction MGS and the
+        // thick-restart MGS) are b_comm-collective, and the CSF numbering is
+        // global (csf_base/global_csf). So b_comm_size > 1 is allowed here.
         //
-        // So keep refusing b_comm_size > 1 until those reductions are made
-        // b_comm-aware. Removing this guard is the last step of that work, not
-        // the first.
-        if (b_comm_size > 1) {
-          if (mpi_rank_w == 0)
-            std::cerr
-              << " sbd: ERROR --single_spin with b_comm_size = " << b_comm_size
-              << " is not yet supported.\n"
-              << "      Configuration blocks ARE rank-local (--do_redist_config"
-                 " worked), but the CSF-space\n"
-              << "      reductions in the projected Davidson are still local-only,"
-                 " so each rank would\n"
-              << "      solve its own slice and return a wrong energy silently."
-                 " Use b_comm_size 1.\n"
-              << std::flush;
-          MPI_Barrier(b_comm);
-          MPI_Abort(comm, 1);
-        }
+        // History, since the failure mode was silent rather than loud: with the
+        // reductions local-only, b_comm=2 on N2 top50 reported "projected CSF
+        // dim = 27" (rank-local, vs 56 global) and converged to -111.07 with the
+        // residual stuck near 4 instead of -108.6675. Each rank was solving its
+        // own slice as if it were the whole space. If a future change reintroduces
+        // a rank-local reduction in that solver, expect exactly this shape:
+        // converged-looking, wrong, and no error.
+        (void)b_comm_size;
         return;
       }
 
@@ -737,39 +734,63 @@ namespace sbd {
       }
     }
 
-    // ---- local (b_comm==1) CSF-space vector helpers ---------------------------
-    // CSF vectors are not distributed (single b rank), so inner products and
-    // norms are plain local reductions. mult() inside the matvec still uses the
-    // t/h communicators for its own parallelism.
-
+    // ---- distributed CSF-space vector helpers ---------------------------------
+    // Each b_comm rank owns a contiguous slice of the CSF space (see
+    // SpinProjector: [csf_base, csf_base+local_csf)), so an inner product or a
+    // norm over the GLOBAL vector is the sum of the per-rank partials. Both
+    // helpers therefore take b_comm and allreduce; they are the primitives the
+    // rest of the solver is built from, so making them collective makes the Ritz
+    // build, the correction MGS and the thick restart distributed for free.
+    //
+    // At b_comm_size == 1 the allreduce is skipped entirely, so the arithmetic
+    // is bit-identical to the previous local-only version.
+    //
+    // COLLECTIVE: every b rank must call these the same number of times in the
+    // same order. That is why the parallel-vs-serial branch below keys off a
+    // communicator-independent threshold and never off the local slice length --
+    // ranks with different local_csf must still agree on the call sequence.
+    //
     // ElemT may be complex, so we cannot use an OpenMP reduction clause on it
     // directly. Accumulate per-thread partial sums into a scratch array and
     // combine serially (thread count is small vs the K-length loop).
+
+    /// Allreduce-sum `n` ElemT values in place over comm. No-op when size == 1,
+    /// so b_comm_size == 1 stays bit-identical to the old local-only code.
+    /// Uses SBD's own GetMpiType trait (framework/type_def.h) rather than
+    /// reinterpreting the buffer, so float and complex ElemT work unchanged.
     template <typename ElemT>
-    ElemT _local_inner(const std::vector<ElemT> & a, const std::vector<ElemT> & b) {
+    inline void _bcomm_sum(ElemT * x, int n, MPI_Comm comm) {
+      int csize = 1; MPI_Comm_size(comm, &csize);
+      if (csize == 1 || n == 0) return;
+      MPI_Allreduce(MPI_IN_PLACE, x, n, GetMpiType<ElemT>::MpiT, MPI_SUM, comm);
+    }
+
+    template <typename ElemT>
+    ElemT _local_inner(const std::vector<ElemT> & a, const std::vector<ElemT> & b,
+                       MPI_Comm b_comm) {
       const size_t n = a.size();
-      if (n <= 4096) {   // small: parallel overhead not worth it
-        ElemT s = ElemT(0.0);
-        for (size_t i = 0; i < n; ++i) s += Conjugate(a[i]) * b[i];
-        return s;
-      }
-      int nth = omp_get_max_threads();
-      std::vector<ElemT> partial(nth, ElemT(0.0));
-#pragma omp parallel
-      {
-        int tid = omp_get_thread_num();
-        ElemT loc = ElemT(0.0);
-#pragma omp for
-        for (size_t i = 0; i < n; ++i) loc += Conjugate(a[i]) * b[i];
-        partial[tid] = loc;
-      }
       ElemT s = ElemT(0.0);
-      for (int t = 0; t < nth; ++t) s += partial[t];
+      if (n <= 4096) {   // small: parallel overhead not worth it
+        for (size_t i = 0; i < n; ++i) s += Conjugate(a[i]) * b[i];
+      } else {
+        int nth = omp_get_max_threads();
+        std::vector<ElemT> partial(nth, ElemT(0.0));
+#pragma omp parallel
+        {
+          int tid = omp_get_thread_num();
+          ElemT loc = ElemT(0.0);
+#pragma omp for
+          for (size_t i = 0; i < n; ++i) loc += Conjugate(a[i]) * b[i];
+          partial[tid] = loc;
+        }
+        for (int t = 0; t < nth; ++t) s += partial[t];
+      }
+      _bcomm_sum(&s, 1, b_comm);
       return s;
     }
 
     template <typename ElemT, typename RealT>
-    RealT _local_normalize(std::vector<ElemT> & a) {
+    RealT _local_normalize(std::vector<ElemT> & a, MPI_Comm b_comm) {
       const size_t n = a.size();
       RealT n2 = RealT(0.0);
       if (n <= 4096) {
@@ -778,6 +799,10 @@ namespace sbd {
 #pragma omp parallel for reduction(+:n2)
         for (size_t i = 0; i < n; ++i) n2 += GetReal(Conjugate(a[i]) * a[i]);
       }
+      // The norm is global: sum the squared partials BEFORE the square root, or
+      // each rank would scale its slice by its own local norm and the assembled
+      // global vector would not be normalized at all.
+      _bcomm_sum(&n2, 1, b_comm);
       RealT nrm = std::sqrt(n2);
       if (nrm > RealT(0)) {
 #pragma omp parallel for if(n > 4096)
@@ -832,6 +857,22 @@ namespace sbd {
       // rank pick a different nb/nkeep and desynchronize the collectives.
       const int K  = V.local_csf;
       const int Kg = V.global_csf;
+
+      int b_comm_size = 1; MPI_Comm_size(b_comm, &b_comm_size);
+
+      // Threshold above which the K-length loops go parallel. Normally 4096 (below
+      // that, OpenMP fork/join costs more than the work). SBD_SS_PAR_THRESHOLD
+      // overrides it so the parallel/fused-MGS paths can be exercised on small
+      // test cases: K is the LOCAL slice length, so at b_comm>1 a problem big
+      // enough to trip 4096 on one rank may not trip it on any rank, leaving the
+      // fused-MGS path (with its collectives) untested. Set it to 0 in tests.
+      const int csf_par_threshold = [](){
+        if (const char* e = std::getenv("SBD_SS_PAR_THRESHOLD")) {
+          int v = std::atoi(e);
+          if (v >= 0) return v;
+        }
+        return 4096;
+      }();
 
       // Subspace (Krylov) cap before collapse. Modest size is fine — with a
       // correct residual the block Davidson-Liu converges in tens of iterations
@@ -952,27 +993,57 @@ namespace sbd {
       // the initial unit-vector seed.
       int nhv_valid = 0;
       {
-        // NOT YET b_comm-AWARE: `ndiag` is this rank's slice, so this picks the
-        // nroot lowest diagonals LOCALLY. At b_comm_size > 1 that seeds nroot
-        // vectors per rank instead of nroot globally -- the seeds would not be
-        // the global minima and (worse) each rank would place a 1.0 in its own
-        // slice, so the assembled global vector has b_comm_size ones. Needs an
-        // MPI_MINLOC over b_comm on (ndiag[i], csf_base+i), then only the owning
-        // rank writes. Guarded by require_complete_config_blocks refusing
-        // b_comm_size > 1 until Phase B2 lands.
         double _tsd = (tmr && tmr->on) ? _wtime() : 0.0;
-        std::vector<int> order(K);
-        for (int i = 0; i < K; ++i) order[i] = i;
-        const int ntake = std::min(nroot, K);
-        std::partial_sort(order.begin(), order.begin() + ntake, order.end(),
-                          [&](int a, int b) { return ndiag[a] < ndiag[b]; });
-        for (int p = 0; p < nroot; p++) {
-          std::fill(v[p].begin(), v[p].end(), ElemT(0.0));
-          if (p < K) v[p][order[p]] = ElemT(1.0);
+        const int ntake = std::min(nroot, Kg);
+        for (int p = 0; p < nroot; p++) std::fill(v[p].begin(), v[p].end(), ElemT(0.0));
+
+        if (b_comm_size == 1) {
+          std::vector<int> order(K);
+          for (int i = 0; i < K; ++i) order[i] = i;
+          std::partial_sort(order.begin(), order.begin() + ntake, order.end(),
+                            [&](int a, int b) { return ndiag[a] < ndiag[b]; });
+          for (int p = 0; p < ntake; p++) v[p][order[p]] = ElemT(1.0);
+          if (mpi_rank_h == 0 && mpi_rank_t == 0 && mpi_rank_b == 0 && ntake > 0)
+            std::cout << "sbd(ss): seed CSFs (lowest ndiag) first="
+                      << order[0] << " diag=" << ndiag[order[0]] << std::endl;
+        } else {
+          // Distributed: the nroot lowest diagonals are GLOBAL minima, so picking
+          // them rank-locally would seed nroot vectors per rank (and put
+          // b_comm_size ones into each assembled global vector). Take them one at
+          // a time with MPI_MINLOC over (value, global index), masking each winner
+          // so the next pass finds a distinct CSF. nroot is small (<= ~10), so
+          // nroot tiny collectives is cheaper than any global sort, and using the
+          // global index as the MINLOC tiebreak makes the choice deterministic
+          // when diagonals tie exactly (symmetry-equivalent CSFs do tie).
+          // MPI_DOUBLE_INT is defined by the standard to match exactly this
+          // layout -- a double followed by an int, tail padding included -- so no
+          // packing pragma is wanted here (adding one would BREAK the match). The
+          // assertion catches an ABI where that stops holding.
+          struct MinLocDI { double val; int idx; };
+          static_assert(sizeof(MinLocDI) >= sizeof(double) + sizeof(int),
+                        "MPI_DOUBLE_INT layout assumption");
+          std::vector<char> taken(static_cast<size_t>(K), 0);
+          for (int p = 0; p < ntake; p++) {
+            MinLocDI loc, glb;
+            // A rank owning no CSF (or none left untaken) must not win: seed it
+            // with +inf so MPI_MINLOC always prefers a real candidate.
+            loc.val = std::numeric_limits<double>::max();
+            loc.idx = std::numeric_limits<int>::max();
+            for (int i = 0; i < K; ++i) {
+              if (taken[i]) continue;
+              const double d = static_cast<double>(ndiag[i]);
+              const int gi = V.csf_base + i;
+              if (d < loc.val || (d == loc.val && gi < loc.idx)) { loc.val = d; loc.idx = gi; }
+            }
+            MPI_Allreduce(&loc, &glb, 1, MPI_DOUBLE_INT, MPI_MINLOC, b_comm);
+            // Only the owner of the winning global index writes the 1.0.
+            const int li = glb.idx - V.csf_base;
+            if (li >= 0 && li < K) { v[p][li] = ElemT(1.0); taken[li] = 1; }
+            if (p == 0 && mpi_rank_h == 0 && mpi_rank_t == 0 && mpi_rank_b == 0)
+              std::cout << "sbd(ss): seed CSFs (lowest ndiag) first="
+                        << glb.idx << " diag=" << glb.val << std::endl;
+          }
         }
-        if (mpi_rank_h == 0 && mpi_rank_t == 0 && mpi_rank_b == 0 && ntake > 0)
-          std::cout << "sbd(ss): seed CSFs (lowest ndiag) first="
-                    << order[0] << " diag=" << ndiag[order[0]] << std::endl;
         if (tmr && tmr->on) tmr->t_seed += _wtime() - _tsd;
       }
 
@@ -999,7 +1070,7 @@ namespace sbd {
           // K=3906; the 1120->3008s regression at K=113k/192 threads). One region
           // amortizes the barrier over all pairs.
           const int nv2 = (ib + 1) * (ib + 1);
-#pragma omp parallel for schedule(static) if(K > 4096)
+#pragma omp parallel for schedule(static) if(K > csf_par_threshold)
           for (int idx = 0; idx < nv2; ++idx) {
             int jb = idx / (ib + 1);
             int kb = idx % (ib + 1);
@@ -1008,10 +1079,41 @@ namespace sbd {
             ElemT s = ElemT(0.0);
             for (int i = 0; i < K; ++i) s += Conjugate(a[i]) * b[i];
             H[jb + nb*kb] = s;
-            U[jb + nb*kb] = s;
           }
+          // Each rank has only its slice's contribution to every <v_jb, Hv_kb>.
+          // Reduce the whole (ib+1)^2 block in ONE allreduce -- per-pair
+          // allreduces would be nb^2 collectives per inner step, the MPI analogue
+          // of the OpenMP fork/join storm this loop was restructured to avoid.
+          // H is nb x nb column-major with the live block in the leading
+          // (ib+1) x (ib+1) corner, so the columns are strided: pack, reduce, unpack.
+          if (b_comm_size > 1) {
+            std::vector<ElemT> pack(static_cast<size_t>(nv2));
+            for (int kb = 0; kb <= ib; ++kb)
+              for (int jb = 0; jb <= ib; ++jb)
+                pack[static_cast<size_t>(kb)*(ib+1) + jb] = H[jb + nb*kb];
+            _bcomm_sum(pack.data(), nv2, b_comm);
+            for (int kb = 0; kb <= ib; ++kb)
+              for (int jb = 0; jb <= ib; ++jb)
+                H[jb + nb*kb] = pack[static_cast<size_t>(kb)*(ib+1) + jb];
+          }
+          for (int kb = 0; kb <= ib; ++kb)
+            for (int jb = 0; jb <= ib; ++jb)
+              U[jb + nb*kb] = H[jb + nb*kb];
           if (tmr && tmr->on) tmr->n_inner += nv2;
-          hp_numeric::MatHeev(jobz, uplo, ib+1, U, nb, E);
+          // Eigen-decompose on b-rank 0 and broadcast, rather than letting every
+          // rank call LAPACK on (bitwise identical) input and trusting the results
+          // to agree. If they diverged even slightly, ranks could order or sign
+          // near-degenerate eigenvectors differently and would then build DIFFERENT
+          // Ritz vectors from the same basis -- a silent wrong answer, not a crash.
+          // Cost is nb^2 + nb doubles (~6 KB at nb=31), negligible against the
+          // K-length allreduces already in this loop.
+          if (b_comm_size > 1) {
+            if (mpi_rank_b == 0) hp_numeric::MatHeev(jobz, uplo, ib+1, U, nb, E);
+            MPI_Bcast(U, nb*nb, GetMpiType<ElemT>::MpiT, 0, b_comm);
+            MPI_Bcast(E, nb, GetMpiType<RealT>::MpiT, 0, b_comm);
+          } else {
+            hp_numeric::MatHeev(jobz, uplo, ib+1, U, nb, E);
+          }
           if (tmr && tmr->on) tmr->t_subbuild += _wtime() - _ts;
 
           double _tr = (tmr && tmr->on) ? _wtime() : 0.0;
@@ -1023,7 +1125,7 @@ namespace sbd {
             // so each i accumulates its full kb-sum in one thread iteration.
             std::vector<ElemT> & Rp = Ritz[p];
             double _tb = (tmr && tmr->on) ? _wtime() : 0.0;
-#pragma omp parallel for if(K > 4096)
+#pragma omp parallel for if(K > csf_par_threshold)
             for (int i = 0; i < K; i++) {
               ElemT ri = ElemT(0.0), si = ElemT(0.0);
               for (int kb = 0; kb <= ib; kb++) {
@@ -1035,9 +1137,9 @@ namespace sbd {
               res[i] = si - E[p]*ri;
             }
             if (tmr && tmr->on) { tmr->t_ritz_build += _wtime() - _tb; _tb = _wtime(); }
-            RealT nrmw = _local_normalize<ElemT,RealT>(Ritz[p]);
+            RealT nrmw = _local_normalize<ElemT,RealT>(Ritz[p], b_comm);
             (void)nrmw;
-            norm_r[p] = _local_normalize<ElemT,RealT>(res);
+            norm_r[p] = _local_normalize<ElemT,RealT>(res, b_comm);
             if (tmr && tmr->on) tmr->t_ritz_norm += _wtime() - _tb;
             if (norm_r[p] >= eps) { all_converged = false; unconverged.push_back(p); }
           }
@@ -1066,7 +1168,7 @@ namespace sbd {
             // -> stalled/divergent Davidson at large K). Parallelize over i.
             std::vector<ElemT> & Rp = Ritz[p];
             double _td = (tmr && tmr->on) ? _wtime() : 0.0;
-#pragma omp parallel for if(K > 4096)
+#pragma omp parallel for if(K > csf_par_threshold)
             for (int i = 0; i < K; i++) {
               ElemT ri = ElemT(0.0), si = ElemT(0.0);
               for (int kb = 0; kb <= ib; kb++) {
@@ -1080,11 +1182,11 @@ namespace sbd {
             if (tmr && tmr->on) {
               tmr->t_corr_ritz += _wtime() - _td; tmr->n_corr_ritz++; _td = _wtime();
             }
-            _local_normalize<ElemT,RealT>(res);
+            _local_normalize<ElemT,RealT>(res, b_comm);
             if (tmr && tmr->on) { tmr->t_corr_norm += _wtime() - _td; _td = _wtime(); }
             int slot = ib + 1 + appended;
             std::vector<ElemT> & vslot = v[slot];
-#pragma omp parallel for if(K > 4096)
+#pragma omp parallel for if(K > csf_par_threshold)
             for (int i = 0; i < K; i++) {
               RealT den = E[p] - ndiag[i];
               if (std::abs(den) > eps_reg) vslot[i] = res[i]/den;
@@ -1103,7 +1205,17 @@ namespace sbd {
             // array (same pattern as the subspace build). Barriers remain (2*slot)
             // but there is no fork/join or first-touch storm. Numerics identical:
             // same order, same two passes, same Conjugate(v_kb).vslot dot.
-            if (K > 4096) {
+            // NOTE ON COLLECTIVE SAFETY. `K` is the LOCAL slice length, so ranks
+            // can take DIFFERENT sides of this branch (verified: at b_comm=2 with
+            // a rank-dependent threshold, rank 0 took the parallel path and rank 1
+            // the serial one, and the run still gave the right energy). That is
+            // safe only because the two paths issue the SAME sequence of b_comm
+            // collectives: one reduction per (pass, kb), in the same order --
+            // _bcomm_sum inside `omp master` on this side, the _bcomm_sum at the
+            // end of _local_inner on the other. If you change either path's
+            // collective count or order, they must be changed together, or ranks
+            // on opposite sides of the branch will deadlock.
+            if (K > csf_par_threshold) {
               const int nth = omp_get_max_threads();
               std::vector<ElemT> mgs_partial(nth, ElemT(0.0));
               ElemT ol_shared = ElemT(0.0);
@@ -1118,13 +1230,22 @@ namespace sbd {
                     for (int i = 0; i < K; i++) loc += Conjugate(vkb[i]) * vslot[i];
                     mgs_partial[tid] = loc;
 #pragma omp barrier
-#pragma omp single
+                    // `omp master`, NOT `omp single`: this region contains an MPI
+                    // call, and under MPI_THREAD_FUNNELED only the thread that
+                    // initialized MPI (the master) may call it. `single` guarantees
+                    // one thread, not the master thread, so it is not FUNNELED-safe.
+                    // `master` has no implicit barrier (`single` does), hence the
+                    // explicit barrier below -- without it the other threads would
+                    // read ol_shared before the master has written it.
+#pragma omp master
                     {
                       ElemT s = ElemT(0.0);
                       for (int t = 0; t < nth; ++t) s += mgs_partial[t];
+                      // Global overlap: this rank holds only its CSF slice.
+                      _bcomm_sum(&s, 1, b_comm);
                       ol_shared = s;
                     }
-                    // implicit barrier after single -> ol_shared visible to all
+#pragma omp barrier
                     const ElemT ol = ol_shared;
 #pragma omp for
                     for (int i = 0; i < K; i++) vslot[i] -= vkb[i]*ol;
@@ -1134,7 +1255,7 @@ namespace sbd {
             } else {
               for (int pass = 0; pass < 2; pass++)
                 for (int kb = 0; kb < slot; kb++) {
-                  ElemT ol = _local_inner(v[kb], vslot);
+                  ElemT ol = _local_inner(v[kb], vslot, b_comm);
                   const std::vector<ElemT> & vkb = v[kb];
                   for (int i = 0; i < K; i++) vslot[i] -= vkb[i]*ol;
                 }
@@ -1142,8 +1263,15 @@ namespace sbd {
             // NOTE: this normalization is load-bearing -- an unnormalized
             // correction vector makes the energy never converge (the historical
             // pathology). It stays exactly as-is; only timing is added around it.
-            RealT nv = _local_normalize<ElemT,RealT>(v[slot]);
+            RealT nv = _local_normalize<ElemT,RealT>(v[slot], b_comm);
             if (tmr && tmr->on) tmr->t_corr_mgs += _wtime() - _td;
+            // `nv` is safe to branch on across ranks: _local_normalize allreduces
+            // the squared norm BEFORE taking the square root, so every rank gets
+            // the same bits and makes the same drop/keep decision -- and therefore
+            // the same `appended`, the same loop trip count, and the same
+            // collective sequence. The same argument covers norm_r[p] and E[p]
+            // (broadcast from b-rank 0). Any NEW branch in this loop must rest on
+            // a globally reduced quantity for the same reason.
             if (nv < tau_drop) continue;
             appended++;
           }
@@ -1182,7 +1310,7 @@ namespace sbd {
         for (int p = 0; p < keep; p++) {
           std::vector<ElemT> & vp = Vnew[p];
           std::vector<ElemT> & hp = HVnew[p];
-#pragma omp parallel for if(K > 4096)
+#pragma omp parallel for if(K > csf_par_threshold)
           for (int i = 0; i < K; i++) {
             ElemT ri = ElemT(0.0), hi = ElemT(0.0);
             for (int kb = 0; kb <= ib; kb++) {
@@ -1206,17 +1334,17 @@ namespace sbd {
         for (int pass = 0; pass < 2; pass++)
         for (int p = 0; p < keep; p++) {
           for (int q = 0; q < p; q++) {
-            ElemT ol = _local_inner(Vnew[q], Vnew[p]);   // <v_q, v_p>
-#pragma omp parallel for if(K > 4096)
+            ElemT ol = _local_inner(Vnew[q], Vnew[p], b_comm);   // <v_q, v_p>
+#pragma omp parallel for if(K > csf_par_threshold)
             for (int i = 0; i < K; i++) {
               Vnew[p][i]  -= Vnew[q][i]  * ol;
               HVnew[p][i] -= HVnew[q][i] * ol;   // same subtraction => Hv stays = H v
             }
           }
-          RealT nrm = _local_normalize<ElemT,RealT>(Vnew[p]);   // v_p /= |v_p|
+          RealT nrm = _local_normalize<ElemT,RealT>(Vnew[p], b_comm);   // v_p /= |v_p|
           if (nrm > RealT(0)) {
             RealT inv = RealT(1) / nrm;
-#pragma omp parallel for if(K > 4096)
+#pragma omp parallel for if(K > csf_par_threshold)
             for (int i = 0; i < K; i++) HVnew[p][i] *= inv;     // scale Hv identically
           }
         }

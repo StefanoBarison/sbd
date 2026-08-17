@@ -425,9 +425,10 @@ namespace sbd {
 	  // producing a truncated, non-spin-pure CSF column.
 	  if( b_comm_size > 1 && !sbd_data.do_redist_config && mpi_rank == 0 ) {
 	    std::cerr << " sbd: WARNING --single_spin with b_comm_size = " << b_comm_size
-		      << " and no --do_redist_config 1: configuration blocks are"
-			 " very likely split across b ranks and the run will abort"
-			 " after the projector is built." << std::endl;
+		      << " and no --do_redist_config 1: the projector's blocks are whole"
+			 " configuration orbits, which SBD's default determinant sort"
+			 " splits across b ranks. The run will abort after the projector"
+			 " is built. Add --do_redist_config 1." << std::endl;
 	  }
 	  int nr = (nroots > 1) ? nroots : 1;
 	  // Collective on b_comm; verifies every determinant on every rank shares
@@ -667,9 +668,10 @@ namespace sbd {
 	  // verifies below.
 	  if( b_comm_size > 1 && !sbd_data.do_redist_config && mpi_rank == 0 ) {
 	    std::cerr << " sbd: WARNING --single_spin with b_comm_size = " << b_comm_size
-		      << " and no --do_redist_config 1: configuration blocks are"
-			 " very likely split across b ranks and the run will abort"
-			 " after the projector is built." << std::endl;
+		      << " and no --do_redist_config 1: the projector's blocks are whole"
+			 " configuration orbits, which SBD's default determinant sort"
+			 " splits across b ranks. The run will abort after the projector"
+			 " is built. Add --do_redist_config 1." << std::endl;
 	  }
 	  int nr = (nroots > 1) ? nroots : 1;
 	  // Collective on b_comm; verifies every determinant on every rank shares
