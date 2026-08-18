@@ -1,0 +1,27 @@
+# Exact dense-diagonalization reference values for the sampled N2 spaces
+# (R=2.0, 6-31G, 10e/16o, FCIDUMP N2_R2.0_6-31g_10e_16o.dat, ecore included).
+#
+# Produced by single_spin_workflow/verify_n2_sbd.py, which builds H and S^2 over
+# the SAME determinant list SBD is given and diagonalizes densely. Independent of
+# SBD: different code, different language, no shared Slater-Condon routines.
+#
+# detfile  quantity     value
+det_top50   ndets        175
+det_top50   csf_singlet  56
+det_top50   csf_triplet  80
+det_top50   singlet[0]   -108.667515671
+det_top50   singlet[1]   -108.551694718
+det_top50   singlet[2]   -108.513483370
+det_top50   singlet[3]   -108.498185300
+det_top50   triplet[0]   -108.639031853
+det_top50   ground_any   -108.712570173   # S=2 quintet -- NOT what single_spin 1 returns
+det_top100  ndets        391
+det_top100  csf_singlet  117
+det_top100  singlet[0]   -108.729420078
+det_top100  singlet[1]   -108.571828872
+det_top100  singlet[2]   -108.540036804
+det_top100  singlet[3]   -108.512009005
+det_top100  ground_any   -108.744195067   # S=2 quintet
+det_top1000 ndets        17688
+det_top1000 csf_singlet  3906
+det_top1000 singlet[0]   -108.792795252
