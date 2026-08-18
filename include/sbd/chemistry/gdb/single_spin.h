@@ -1156,6 +1156,39 @@ namespace sbd {
           } else {
             hp_numeric::MatHeev(jobz, uplo, ib+1, U, nb, E);
           }
+          // CANONICALIZE EIGENVECTOR SIGNS. Broadcasting over b_comm is not
+          // sufficient when h_comm > 1 or t_comm > 1: there is then one b-rank-0
+          // PER h/t replica, each running its own LAPACK on its own copy. The
+          // input matrix is bitwise identical, but an eigenvector is only defined
+          // up to sign, and nothing obliges two independent LAPACK invocations to
+          // pick the same one for a near-degenerate root. Each replica would then
+          // build a Ritz vector of opposite sign from the same basis, and since
+          // mult() allreduces over t_comm and h_comm (mult.h:207-208, :264-265),
+          // those opposite vectors get SUMMED -- cancelling to noise.
+          //
+          // Observed exactly that way at b_comm=12 with h_comm=2 or 4: converging
+          // normally to a residual of 2.8e-4, then the residual GROWING as the
+          // roots tighten and the sign choice becomes ambiguous, diverging to -36
+          // and finally aborting with MPI_ERR_TRUNCATE. b_comm == mpi_size (one
+          // replica) always worked, which is what made this look like an h_comm
+          // bug rather than a sign-convention bug.
+          //
+          // Fixing it by sign convention rather than a wider broadcast keeps this
+          // purely local: no new communicator, no extra collective, and it also
+          // covers any future caller that replicates the solve differently. The
+          // convention -- make the first entry of largest magnitude positive --
+          // is deterministic and depends only on the eigenvector's own values.
+          for (int c = 0; c <= ib; ++c) {
+            ElemT * col = U + static_cast<size_t>(nb) * c;
+            int piv = 0;
+            RealT best = RealT(0);
+            for (int r = 0; r <= ib; ++r) {
+              const RealT a = std::abs(GetReal(col[r]));
+              if (a > best + RealT(1.0e-12)) { best = a; piv = r; }
+            }
+            if (GetReal(col[piv]) < RealT(0))
+              for (int r = 0; r <= ib; ++r) col[r] = -col[r];
+          }
           if (tmr && tmr->on) tmr->t_subbuild += _wtime() - _ts;
 
           double _tr = (tmr && tmr->on) ? _wtime() : 0.0;
