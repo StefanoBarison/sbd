@@ -866,6 +866,12 @@ namespace sbd {
       // test cases: K is the LOCAL slice length, so at b_comm>1 a problem big
       // enough to trip 4096 on one rank may not trip it on any rank, leaving the
       // fused-MGS path (with its collectives) untested. Set it to 0 in tests.
+      // SBD_SS_CHECK_IB=1 asserts every b rank is on the same inner step before
+      // each Rayleigh reduction. Diagnostic for collective-divergence bugs.
+      const bool _ss_check_ib = [](){
+        const char* e = std::getenv("SBD_SS_CHECK_IB");
+        return e && e[0] == '1';
+      }();
       const int csf_par_threshold = [](){
         if (const char* e = std::getenv("SBD_SS_PAR_THRESHOLD")) {
           int v = std::atoi(e);
@@ -1070,6 +1076,14 @@ namespace sbd {
           // K=3906; the 1120->3008s regression at K=113k/192 threads). One region
           // amortizes the barrier over all pairs.
           const int nv2 = (ib + 1) * (ib + 1);
+          // H is reduced as a whole nb x nb buffer (see below), so every element
+          // OUTSIDE the live (ib+1)^2 block must be zero -- it is written only
+          // inside that block, and a leftover value from a previous inner step
+          // would otherwise be summed across ranks and land in U. Zeroing the
+          // whole buffer costs nb^2 <= ~1600 writes per inner step, against
+          // nb^2 K-length dot products.
+          if (b_comm_size > 1)
+            std::fill(H, H + static_cast<size_t>(nb)*nb, ElemT(0.0));
 #pragma omp parallel for schedule(static) if(K > csf_par_threshold)
           for (int idx = 0; idx < nv2; ++idx) {
             int jb = idx / (ib + 1);
@@ -1087,14 +1101,42 @@ namespace sbd {
           // H is nb x nb column-major with the live block in the leading
           // (ib+1) x (ib+1) corner, so the columns are strided: pack, reduce, unpack.
           if (b_comm_size > 1) {
-            std::vector<ElemT> pack(static_cast<size_t>(nv2));
-            for (int kb = 0; kb <= ib; ++kb)
-              for (int jb = 0; jb <= ib; ++jb)
-                pack[static_cast<size_t>(kb)*(ib+1) + jb] = H[jb + nb*kb];
-            _bcomm_sum(pack.data(), nv2, b_comm);
-            for (int kb = 0; kb <= ib; ++kb)
-              for (int jb = 0; jb <= ib; ++jb)
-                H[jb + nb*kb] = pack[static_cast<size_t>(kb)*(ib+1) + jb];
+            // Reduce the FULL nb x nb buffer, not the live (ib+1)^2 block.
+            //
+            // The count must not depend on anything rank-local. `ib` is derived
+            // from `appended`, which is derived from per-root residual norms --
+            // all globally reduced, so in principle every rank agrees. In
+            // practice a divergence there produced MPI_ERR_TRUNCATE ("message
+            // truncated") deep in a production run at K=540707, because two
+            // ranks called MPI_Allreduce with different (ib+1)^2 counts. Using
+            // nb*nb -- a scalar fixed before the loop and identical on every
+            // rank by construction -- makes that failure mode unreachable
+            // instead of merely unlikely. The extra elements are zeros outside
+            // the live block, so the reduction result is unchanged; nb <= ~40,
+            // so nb*nb doubles is a few KB.
+            //
+            // If ib really can diverge, that is a separate correctness bug and
+            // this reduction would silently combine different subspaces -- hence
+            // the SBD_SS_CHECK_IB guard below, which turns it into a loud error.
+            _bcomm_sum(H, nb*nb, b_comm);
+          }
+          if (b_comm_size > 1 && _ss_check_ib) {
+            // Verify every b rank is on the same inner step. Cheap (one int) and
+            // only on when asked, but it converts a truncated-message abort or a
+            // silently-mismatched Rayleigh matrix into a named diagnosis.
+            int ib_min = ib, ib_max = ib;
+            MPI_Allreduce(MPI_IN_PLACE, &ib_min, 1, MPI_INT, MPI_MIN, b_comm);
+            MPI_Allreduce(MPI_IN_PLACE, &ib_max, 1, MPI_INT, MPI_MAX, b_comm);
+            if (ib_min != ib_max) {
+              if (mpi_rank_b == 0)
+                std::cerr << " sbd: ERROR --single_spin: b ranks disagree on the"
+                             " inner step (ib ranges " << ib_min << ".." << ib_max
+                          << " at outer iteration " << it << ").\n"
+                             "      The Rayleigh matrix would combine different"
+                             " subspaces. This is a solver bug, not an input"
+                             " problem -- please report the log." << std::endl;
+              MPI_Abort(b_comm, 1);
+            }
           }
           for (int kb = 0; kb <= ib; ++kb)
             for (int jb = 0; jb <= ib; ++jb)
