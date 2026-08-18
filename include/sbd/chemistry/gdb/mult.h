@@ -6,6 +6,41 @@
 #define SBD_CHEMISTRY_GDB_MULT_H
 
 #include <algorithm>
+#include <iostream>
+
+namespace sbd {
+  namespace gdb {
+    /// SBD_CHECK_MULT=1 enables the pre-reduction consistency checks in mult().
+    inline bool _sbd_check_mult() {
+      static const bool on = [](){
+        const char* e = std::getenv("SBD_CHECK_MULT");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+    /// Abort with a NAMED diagnostic if `n` differs across `comm`. MPI itself
+    /// only reports MPI_ERR_TRUNCATE on an opaque communicator id.
+    inline void _sbd_check_same_size(size_t n, MPI_Comm comm,
+                                     const char* cname, const char* vname) {
+      int csize = 1; MPI_Comm_size(comm, &csize);
+      if (csize < 2) return;
+      long long mn = static_cast<long long>(n), mx = mn;
+      MPI_Allreduce(MPI_IN_PLACE, &mn, 1, MPI_LONG_LONG, MPI_MIN, comm);
+      MPI_Allreduce(MPI_IN_PLACE, &mx, 1, MPI_LONG_LONG, MPI_MAX, comm);
+      if (mn != mx) {
+        int cr = 0, wr = 0;
+        MPI_Comm_rank(comm, &cr);
+        MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+        std::cerr << " sbd: ERROR mult: " << vname << ".size() differs across "
+                  << cname << " (min " << mn << ", max " << mx << "); this rank ("
+                  << cname << " rank " << cr << ", world rank " << wr << ") has "
+                  << n << ". A reduction over " << cname
+                  << " would abort with MPI_ERR_TRUNCATE." << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+      }
+    }
+  }
+}
 
 namespace sbd {
 
@@ -302,6 +337,31 @@ namespace sbd {
 	  std::memcpy(rwk.data(),twk.data(),twk.size()*sizeof(ElemT));
 	  sbd::MpiSlide(rwk,twk,bslide,b_comm);
 	}
+      }
+      // SBD_CHECK_MULT=1: verify wb has the same length on every rank of the
+      // communicator BEFORE reducing over it, and that every stored row index is
+      // in range. MpiAllreduce passes wb.size() as the MPI count, so a mismatch
+      // is reported by MPI only as an opaque MPI_ERR_TRUNCATE on "MPI COMM n",
+      // with no indication of which vector or which rank went wrong. This turns
+      // that into a named failure. Two ints per matvec when enabled.
+      if (_sbd_check_mult()) {
+        // Row indices must address wb; a write past the end corrupts the heap
+        // (including vector bookkeeping) and can itself change wb.size().
+        size_t max_ih = 0;
+        for (size_t task = 0; task < slide.size(); task++)
+          for (size_t th = 0; th < len[task].size(); th++)
+            for (size_t k = 0; k < len[task][th]; k++)
+              if (ih[task][th][k] > max_ih) max_ih = ih[task][th][k];
+        if (!ih.empty() && max_ih >= wb.size()) {
+          int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+          std::cerr << " sbd: ERROR mult: stored row index " << max_ih
+                    << " >= wb.size() " << wb.size() << " on world rank " << wr
+                    << " -- writes past the end of the output vector."
+                    << std::endl;
+          MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        _sbd_check_same_size(wb.size(), t_comm, "t_comm", "wb");
+        _sbd_check_same_size(wb.size(), h_comm, "h_comm", "wb");
       }
       sbd::MpiAllreduce(wb,MPI_SUM,t_comm);
       sbd::MpiAllreduce(wb,MPI_SUM,h_comm);
