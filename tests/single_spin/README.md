@@ -67,3 +67,32 @@ the single-rank optimum transfers.
 
 `--do_redist_config 1` is required whenever `b_comm_size > 1`; without it the run
 aborts (correctly) because configuration orbits get split across ranks.
+
+## Running the sweep
+
+```bash
+tests/single_spin/cluster_bcomm_sweep.sh <fcidump> <detfile> [np] [omp] [nroots]
+# e.g. at the measured single-root optimum:
+tests/single_spin/cluster_bcomm_sweep.sh $FCI dets.txt 48 4 1
+```
+
+It runs every valid `--b_comm_size` divisor of `np`, prints energy alongside
+`LOOP TOTAL` (the solve) and wall-clock, and adds `--do_redist_config 1`
+automatically whenever `b_comm > 1`. **Every energy in the table must agree to
+~1e-8 Ha** -- a row that differs is wrong, not just slower.
+
+Measured locally at np=4, K=3906 (N2 top1000), solve time:
+
+| b_comm | h_comm | solve (s) |
+|---|---|---|
+| 1 | 4 | 0.64 |
+| 2 | 2 | 0.83 |
+| 4 | 1 | 0.99 |
+
+So at small K, distributing is a net LOSS -- the CSF-space allreduces cost more
+than the shrunken slices save. That is the expected shape and the reason to sweep
+rather than assume: b_comm pays off when the Krylov basis is large enough that
+memory, not latency, is the binding constraint (at 1e8 determinants a replicated
+basis is 7.6-10.2 GiB/rank and does not shrink with node count at all). Do not
+read the small-K result as an argument against B2; read it as the reason the
+optimum must be measured at production K.
