@@ -107,6 +107,25 @@ Each batch's stdout, stderr, and command line are written to
 ``sbd_stdout.txt`` / ``sbd_stderr.txt`` / ``sbd_command.txt`` inside the
 batch's workdir.  On failure the workdir is preserved regardless of
 ``clean_temp_dir``.
+
+Wavefunction files
+------------------
+The C++ solver writes one binary shard PER ``b_comm`` RANK, named
+``<savename><rank:%06d>.bin``, and it does so once per root plus once more for
+the carryover vector -- so a run leaves ``2 x nroots x b_comm_size`` files.
+
+The numeric suffix is the **b_comm rank, not a root index**.  ``wf_root0`` +
+``000000`` therefore reads as "root 0000000", which is easy to misread as many
+roots when it is one root split across many ranks.
+
+Set ``wavefunction_out`` to consolidate each root into a single
+``<savename>.npz`` (``wf_root0.npz`` ... plus ``wf.npz``) holding
+``ci_strs_a``/``ci_strs_b``/``amplitudes`` in the caller's determinant order,
+and ``delete_shards=True`` to drop the ``.bin`` files once the merged archive
+has been written and read back.  Both default to off.
+
+Note that ``clean_temp_dir=True`` (the default) deletes the whole workdir on
+success, so ``wavefunction_out`` must point OUTSIDE it.
 """
 
 from __future__ import annotations
@@ -198,6 +217,8 @@ class SBDGdbSolver:
         # Workdir / bookkeeping
         temp_dir: str | Path | None = None,
         clean_temp_dir: bool = True,
+        wavefunction_out: str | Path | None = None,
+        delete_shards: bool = False,
         timeout_s: float | None = None,
         extra_cli_args: list[str] | None = None,
         # FCIDUMP handling
@@ -258,6 +279,38 @@ class SBDGdbSolver:
                 ``do_redist_det`` in the binary, so the two are not in conflict.
             temp_dir: Parent for per-batch workdirs.
             clean_temp_dir: Delete workdir on success.
+            wavefunction_out: Directory in which to write ONE merged
+                ``<savename>.npz`` per root, gathering all ``b_comm`` shards.
+                ``None`` (default) writes nothing and preserves current
+                behaviour.
+
+                Motivation: the C++ solver writes one binary shard per
+                ``b_comm`` rank, named ``<savename><rank:%06d>.bin``, and does so
+                once per root PLUS once for the carryover vector -- i.e.
+                ``2 x nroots x b_comm_size`` files.  At ``b_comm_size=12`` with
+                ``nroots=6`` that is 144 files.  Worse, the numeric suffix is the
+                **b_comm rank, not a root index**, so ``wf_root0`` + ``000000``
+                reads as "root 0000000".  The merged ``.npz`` files are named
+                ``wf_root0.npz`` ... ``wf_root<n>.npz`` plus ``wf.npz``, with no
+                rank suffix and no ambiguity.
+
+                Note this must be a directory OUTSIDE the workdir: with
+                ``clean_temp_dir=True`` (the default) the workdir is deleted on
+                success, which would take the merged files with it.
+
+                Each archive holds ``ci_strs_a``, ``ci_strs_b``, ``amplitudes``
+                (in the caller's determinant order, so it pairs directly with
+                ``sci_state``) plus ``norb``/``nelec``/``b_comm_size``/``savename``
+                metadata.
+            delete_shards: Remove the ``.bin`` shards once the merged ``.npz`` has
+                been written AND read back successfully.  Ignored unless
+                ``wavefunction_out`` is set, since otherwise there would be
+                nothing left.  Never deletes when the amplitudes came from the
+                stub fallback, and never deletes if verification fails -- on any
+                problem the shards are kept and a warning is raised.  Default
+                False.  Leave it False if you intend to restart from these
+                wavefunctions via ``loadname``: SBD's own loader reads the
+                shards, not the ``.npz``.
             timeout_s: Subprocess timeout in seconds.
             extra_cli_args: Appended verbatim to every invocation.
             canonicalize_fcidump: When ``fcidump_path`` is set, roundtrip it
@@ -391,6 +444,19 @@ class SBDGdbSolver:
             )
         self.temp_dir = Path(temp_dir) if temp_dir is not None else None
         self.clean_temp_dir = bool(clean_temp_dir)
+        self.wavefunction_out = (
+            None if wavefunction_out is None else Path(wavefunction_out)
+        )
+        self.delete_shards = bool(delete_shards)
+        if self.delete_shards and self.wavefunction_out is None:
+            warnings.warn(
+                "delete_shards=True has no effect without wavefunction_out: "
+                "the shards are the only copy of the wavefunction, so they are "
+                "kept. Set wavefunction_out to a directory to enable merging.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.delete_shards = False
         self.timeout_s = timeout_s
         self.extra_cli_args = list(extra_cli_args or [])
         self.canonicalize_fcidump = bool(canonicalize_fcidump)
@@ -610,9 +676,30 @@ class SBDGdbSolver:
                     return None
 
             def _make_result(energy, savename, one_rdm, two_rdm):
-                amplitudes = self._recover_amplitudes(
+                amplitudes, amps_are_real = self._recover_amplitudes(
                     workdir, strs_a, strs_b, norb, M, savename=savename
                 )
+                # Consolidate this root's b_comm shards into one .npz, and only
+                # then (optionally) remove them. Gated on amps_are_real so a stub
+                # never overwrites -- or authorises deleting -- real data.
+                if self.wavefunction_out is not None and amps_are_real:
+                    merged = self.wavefunction_out / f"{savename}.npz"
+                    if _write_merged_wavefunction(
+                        merged, savename, strs_a, strs_b, amplitudes,
+                        norb, nelec, self.b_comm_size,
+                    ) and self.delete_shards:
+                        for rank in range(self.b_comm_size):
+                            shard = workdir / f"{savename}{rank:06d}.bin"
+                            try:
+                                shard.unlink(missing_ok=True)
+                            except OSError as exc:
+                                warnings.warn(
+                                    f"Merged {merged} but could not remove shard "
+                                    f"{shard}: {exc}",
+                                    RuntimeWarning, stacklevel=2,
+                                )
+                    if self.verbose:
+                        print(f"[SBDGdbSolver] merged wavefunction -> {merged}")
                 occ_a, occ_b = _compute_occupancies(strs_a, strs_b, amplitudes, norb)
                 _check_occupancy_consistency(occ_a, occ_b, proc.stdout, norb)
                 return experimental_SCIResult(
@@ -755,7 +842,14 @@ class SBDGdbSolver:
         norb: int,
         M: int,
         savename: str = "wf",
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, bool]:
+        """Return ``(amplitudes, is_real)``.
+
+        ``is_real`` is False when the shards could not be read or matched and a
+        stub was substituted. Callers must not treat a stub as a wavefunction --
+        in particular it must never authorise deleting the shards it failed to
+        read.
+        """
         amp_map = _read_gdb_wavefunction(
             workdir, savename, self.b_comm_size, norb, self.bit_length
         )
@@ -767,7 +861,7 @@ class SBDGdbSolver:
                 UserWarning,
                 stacklevel=3,
             )
-            return _stub_amplitudes_1d(M)
+            return _stub_amplitudes_1d(M), False
 
         amplitudes = np.zeros(M, dtype=np.float64)
         for i, (a, b) in enumerate(zip(strs_a.tolist(), strs_b.tolist())):
@@ -784,8 +878,8 @@ class SBDGdbSolver:
                 UserWarning,
                 stacklevel=3,
             )
-            return _stub_amplitudes_1d(M)
-        return amplitudes
+            return _stub_amplitudes_1d(M), False
+        return amplitudes, True
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +962,76 @@ def _deinterleave_det_from_words(
         if int(words[k_b // bit_length]) & (1 << (k_b % bit_length)):
             beta |= 1 << io
     return alpha, beta
+
+
+def _write_merged_wavefunction(
+    out_path: Path,
+    savename: str,
+    strs_a: np.ndarray,
+    strs_b: np.ndarray,
+    amplitudes: np.ndarray,
+    norb: int,
+    nelec: tuple[int, int],
+    b_comm_size: int,
+) -> bool:
+    """
+    Write one ``.npz`` holding the merged wavefunction; return True iff verified.
+
+    The determinant order is the CALLER's (``strs_a``/``strs_b``), not the raw
+    shard order, so the archive pairs directly with ``experimental_SCIState``
+    without a second matching step.
+
+    Returning True is what authorises deleting the ``.bin`` shards, so the file is
+    read back and compared before saying so: a write that reported success but
+    produced a truncated or unreadable file would otherwise cost the wavefunction.
+    """
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            out_path,
+            ci_strs_a=np.asarray(strs_a, dtype=np.uint64),
+            ci_strs_b=np.asarray(strs_b, dtype=np.uint64),
+            amplitudes=np.asarray(amplitudes, dtype=np.float64),
+            norb=np.asarray(norb),
+            nelec=np.asarray(nelec),
+            b_comm_size=np.asarray(b_comm_size),
+            savename=np.asarray(savename),
+        )
+    except (OSError, ValueError) as exc:
+        warnings.warn(
+            f"Failed to write merged wavefunction {out_path}: {exc}. "
+            "Shards are kept.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return False
+
+    # Verify by reading back. np.savez appends .npz if absent, so resolve first.
+    check = out_path if out_path.suffix == ".npz" else out_path.with_suffix(".npz")
+    try:
+        with np.load(check, allow_pickle=False) as z:
+            got = z["amplitudes"]
+            got_a = z["ci_strs_a"]
+            if got.shape != np.asarray(amplitudes).shape:
+                raise ValueError(
+                    f"amplitude shape {got.shape} != {np.asarray(amplitudes).shape}"
+                )
+            if got_a.shape != np.asarray(strs_a).shape:
+                raise ValueError("ci_strs_a shape mismatch")
+            if not np.allclose(got, amplitudes, rtol=0.0, atol=0.0):
+                raise ValueError("amplitudes differ after round-trip")
+            nrm = float(np.linalg.norm(got))
+            if not np.isfinite(nrm) or nrm <= 0.0:
+                raise ValueError(f"norm is {nrm}")
+    except (OSError, ValueError, KeyError) as exc:
+        warnings.warn(
+            f"Merged wavefunction {check} failed verification ({exc}). "
+            "Shards are kept.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return False
+    return True
 
 
 def _read_gdb_wavefunction(
