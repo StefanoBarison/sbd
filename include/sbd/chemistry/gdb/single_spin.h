@@ -1228,11 +1228,39 @@ namespace sbd {
             if (tmr && tmr->on) { tmr->t_corr_norm += _wtime() - _td; _td = _wtime(); }
             int slot = ib + 1 + appended;
             std::vector<ElemT> & vslot = v[slot];
-#pragma omp parallel for if(K > csf_par_threshold)
+            // Diagonal (Jacobi) preconditioner, with a MEANINGFUL floor on the
+            // denominator.
+            //
+            // eps_reg = 1e-12 only ever caught exact division by zero, which is
+            // not the failure that occurs in practice. When E[p] lies INSIDE the
+            // spread of ndiag rather than below it, some denominators are merely
+            // small -- 1e-3, say -- and the correction picks up a ~1000x
+            // amplification on those components. MGS cannot repair that (the
+            // direction is genuinely in the space).
+            //
+            // HARDENING, NOT A DIAGNOSED FIX. This was written while chasing a
+            // reported divergence at K=113394, b_comm=12 (residual 0.029 -> 5.13
+            // on the first appended correction, then a slow drift to -37 over 100
+            // outer iterations). That report is NOT reproduced here: the same
+            // settings at K=93331 b_comm=12, and with the core shift moved outside
+            // the FCIDUMP to match the reporter's integrals, both converge
+            // normally and agree with b_comm=1 to 1e-13. So this floor removes a
+            // real fragility but is not confirmed to be that bug's cause -- do not
+            // treat the report as closed on the strength of it.
+            //
+            // Floor the magnitude at a scale-aware value and PRESERVE THE SIGN:
+            // flipping the sign of a denominator flips the correction direction,
+            // which turns a descent step into an ascent step. The scale follows
+            // |E[p]| so it is meaningful for both core-shifted and bare integrals.
+            const RealT den_floor =
+                std::max(static_cast<RealT>(1.0e-8),
+                         static_cast<RealT>(1.0e-10) * std::abs(E[p]));
+            #pragma omp parallel for if(K > csf_par_threshold)
             for (int i = 0; i < K; i++) {
               RealT den = E[p] - ndiag[i];
-              if (std::abs(den) > eps_reg) vslot[i] = res[i]/den;
-              else                          vslot[i] = res[i]/(den - eps_reg);
+              const RealT ad = std::abs(den);
+              if (ad < den_floor) den = (den < RealT(0) ? -den_floor : den_floor);
+              vslot[i] = res[i]/den;
             }
             if (tmr && tmr->on) { tmr->t_corr_prec += _wtime() - _td; _td = _wtime(); }
             // MGS (two passes) against all current basis + accepted corrections.
