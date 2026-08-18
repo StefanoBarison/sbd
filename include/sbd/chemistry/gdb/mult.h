@@ -5,6 +5,8 @@
 #ifndef SBD_CHEMISTRY_GDB_MULT_H
 #define SBD_CHEMISTRY_GDB_MULT_H
 
+#include <algorithm>
+
 namespace sbd {
 
   namespace gdb {
@@ -48,8 +50,28 @@ namespace sbd {
 
       size_t num_threads = omp_get_max_threads();
       if( mpi_rank_t == 0 ) {
+	// Bound on the SMALLEST of the three vectors, not on twk.size().
+	//
+	// This is the local diagonal term wb[i] += hii[i]*wk[i], so all three
+	// must be indexed with the LOCAL determinant count. But twk is the
+	// rotated ket: when exidx[0].slide != 0 it was MpiSlide'd in from a
+	// neighbouring b rank, so twk.size() is the NEIGHBOUR's count. Those
+	// coincide only when every b rank holds equally many determinants.
+	//
+	// --do_redist_config assigns whole configuration orbits, which cannot
+	// divide exactly: measured on N2 at b_comm=12, one rank holds 45058
+	// determinants and the other eleven hold 45059. The old bound therefore
+	// wrote one element past the end of wb (and read past hii) on the short
+	// rank -- silent heap corruption every matvec. Downstream,
+	// MpiAllreduce(wb,...) passes wb.size() as its count, so the short rank
+	// disagreed with its h_comm partner and the run aborted with
+	// MPI_ERR_TRUNCATE after diverging. Symptom trio: E[0] from the Rayleigh
+	// solve, <w|H|w>, and the final expectation value all DIFFERENT
+	// (-34.76 / -18.51 / -16.88), which unconverged-but-consistent iteration
+	// cannot produce.
+	const size_t ndiag_local = std::min(std::min(wb.size(), hii.size()), twk.size());
 #pragma omp parallel for
-	for(size_t i=0; i < twk.size(); i++) {
+	for(size_t i=0; i < ndiag_local; i++) {
 	  wb[i] += hii[i] * twk[i];
 	}
       }
@@ -238,8 +260,28 @@ namespace sbd {
       }
 
       if( mpi_rank_t == 0 ) {
+	// Bound on the SMALLEST of the three vectors, not on twk.size().
+	//
+	// This is the local diagonal term wb[i] += hii[i]*wk[i], so all three
+	// must be indexed with the LOCAL determinant count. But twk is the
+	// rotated ket: when exidx[0].slide != 0 it was MpiSlide'd in from a
+	// neighbouring b rank, so twk.size() is the NEIGHBOUR's count. Those
+	// coincide only when every b rank holds equally many determinants.
+	//
+	// --do_redist_config assigns whole configuration orbits, which cannot
+	// divide exactly: measured on N2 at b_comm=12, one rank holds 45058
+	// determinants and the other eleven hold 45059. The old bound therefore
+	// wrote one element past the end of wb (and read past hii) on the short
+	// rank -- silent heap corruption every matvec. Downstream,
+	// MpiAllreduce(wb,...) passes wb.size() as its count, so the short rank
+	// disagreed with its h_comm partner and the run aborted with
+	// MPI_ERR_TRUNCATE after diverging. Symptom trio: E[0] from the Rayleigh
+	// solve, <w|H|w>, and the final expectation value all DIFFERENT
+	// (-34.76 / -18.51 / -16.88), which unconverged-but-consistent iteration
+	// cannot produce.
+	const size_t ndiag_local = std::min(std::min(wb.size(), hii.size()), twk.size());
 #pragma omp parallel for
-	for(size_t i=0; i < twk.size(); i++) {
+	for(size_t i=0; i < ndiag_local; i++) {
 	  wb[i] += hii[i] * twk[i];
 	}
       }
