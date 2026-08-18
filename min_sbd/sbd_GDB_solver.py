@@ -178,9 +178,10 @@ class SBDGdbSolver:
         mpirun: str = "mpirun",
         mpi_np: int = 1,
         mpirun_args: list[str] | None = None,
+        omp_num_threads: int | None = None,
         # Davidson tunables
         davidson_block: int = 10,
-        davidson_iterations: int = 4,
+        davidson_iterations: int = 100,
         davidson_tolerance: float = 1e-4,
         nroots: int = 1,
         single_spin: int = -1,
@@ -193,6 +194,7 @@ class SBDGdbSolver:
         t_comm_size: int = 1,
         bit_length: int = 20,
         do_redist_det: bool = True,
+        do_redist_config: bool | None = None,
         # Workdir / bookkeeping
         temp_dir: str | Path | None = None,
         clean_temp_dir: bool = True,
@@ -215,9 +217,25 @@ class SBDGdbSolver:
             mpi_np: Total MPI rank count.  Must equal
                 ``h_comm_size × b_comm_size × t_comm_size`` where
                 ``h_comm_size = mpi_np / (b_comm_size × t_comm_size)``.
-            mpirun_args: Extra args after ``-np``.
+            mpirun_args: Extra args after ``-np``.  If given, it REPLACES the
+                default entirely, including the ``OMP_NUM_THREADS`` export --
+                so pass ``omp_num_threads`` instead of hand-rolling ``-x``
+                unless you specifically want full control.
+            omp_num_threads: Threads per MPI rank, exported as
+                ``-x OMP_NUM_THREADS=<n>``.  Defaults to 1, which is a poor
+                choice on a multicore node: the measured single-root optimum was
+                ``mpi_np=48`` with 4 threads per rank.  Ignored when
+                ``mpirun_args`` is supplied explicitly.
             davidson_block: Davidson subspace size (``--block``).
-            davidson_iterations: Davidson restart cycles (``--iteration``).
+            davidson_iterations: Davidson OUTER restart cycles (``--iteration``)
+                -- not matvecs and not inner steps. Each cycle grows the Krylov
+                subspace to ``davidson_block`` and then collapses it, so the
+                total matvec count is roughly
+                ``davidson_iterations x (davidson_block - restart_keep)``.
+                Exhausting this limit is NOT an error: the solver returns its
+                current Ritz values, which look like a converged answer. The
+                binary warns and this wrapper re-raises that as a
+                ``RuntimeWarning``, so do not filter those away.
             davidson_tolerance: Convergence threshold (``--tolerance``).
             method: 0=matrix-free, 1=matrix-stored (``--method``).
             b_comm_size: Basis communicator size (``--b_comm_size``).
@@ -227,6 +245,17 @@ class SBDGdbSolver:
                 format (``--bit_length``, default 20).
             do_redist_det: Redistribute determinants for load-balance
                 (``--do_redist_det``).  Recommended for multi-rank runs.
+            do_redist_config: Partition determinants so that every determinant
+                of one spatial configuration lands on the same ``b_comm`` rank
+                (``--do_redist_config``).  **Required** for ``single_spin`` with
+                ``b_comm_size > 1``: the projector's blocks are whole
+                configuration orbits, and SBD's default sort splits them across
+                ranks, which the binary detects and aborts on.
+                ``None`` (default) enables it automatically exactly when it is
+                needed -- ``single_spin >= 0`` and ``b_comm_size > 1`` -- and
+                leaves the historical strategies untouched otherwise.  Pass
+                ``True``/``False`` to override.  Takes precedence over
+                ``do_redist_det`` in the binary, so the two are not in conflict.
             temp_dir: Parent for per-batch workdirs.
             clean_temp_dir: Delete workdir on success.
             timeout_s: Subprocess timeout in seconds.
@@ -282,9 +311,26 @@ class SBDGdbSolver:
         self.verbose = bool(verbose)
         self.mpirun = mpirun
         self.mpi_np = int(mpi_np)
-        self.mpirun_args = (
-            list(mpirun_args) if mpirun_args is not None else ["-x", "OMP_NUM_THREADS=1"]
-        )
+        # The default used to hardcode OMP_NUM_THREADS=1, which silently capped
+        # every rank at one thread even on a many-core node. omp_num_threads
+        # makes that setting visible and adjustable without having to know the
+        # -x incantation; an explicit mpirun_args still wins outright.
+        self.omp_num_threads = None if omp_num_threads is None else int(omp_num_threads)
+        if mpirun_args is not None:
+            self.mpirun_args = list(mpirun_args)
+            if self.omp_num_threads is not None:
+                warnings.warn(
+                    "Both mpirun_args and omp_num_threads were given; "
+                    "omp_num_threads is ignored because mpirun_args replaces the "
+                    "launcher arguments wholesale. Add "
+                    f"'-x OMP_NUM_THREADS={self.omp_num_threads}' to mpirun_args, "
+                    "or drop mpirun_args.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        else:
+            _omp = 1 if self.omp_num_threads is None else self.omp_num_threads
+            self.mpirun_args = ["-x", f"OMP_NUM_THREADS={_omp}"]
         self.davidson_block = int(davidson_block)
         self.davidson_iterations = int(davidson_iterations)
         self.davidson_tolerance = float(davidson_tolerance)
@@ -323,6 +369,26 @@ class SBDGdbSolver:
         self.t_comm_size = int(t_comm_size)
         self.bit_length = int(bit_length)
         self.do_redist_det = bool(do_redist_det)
+        # Config-aligned redistribution: auto-enable exactly when the projected
+        # solver needs it, so callers do not have to know that coupling. Without
+        # it, single_spin at b_comm_size > 1 aborts inside the binary after MPI
+        # startup ("INCOMPLETE configuration block"), which is a slow and
+        # confusing way to learn about a flag.
+        if do_redist_config is None:
+            self.do_redist_config = (self.single_spin >= 0 and self.b_comm_size > 1)
+        else:
+            self.do_redist_config = bool(do_redist_config)
+        if (self.single_spin >= 0 and self.b_comm_size > 1
+                and not self.do_redist_config):
+            raise ValueError(
+                f"single_spin={self.single_spin} with b_comm_size="
+                f"{self.b_comm_size} requires do_redist_config=True. The "
+                f"single-spin projector's blocks are whole spatial-configuration "
+                f"orbits; SBD's default determinant sort splits them across "
+                f"b_comm ranks, and the solver aborts rather than silently "
+                f"building truncated, non-spin-pure CSF columns. Pass "
+                f"do_redist_config=True (or leave it None to auto-enable)."
+            )
         self.temp_dir = Path(temp_dir) if temp_dir is not None else None
         self.clean_temp_dir = bool(clean_temp_dir)
         self.timeout_s = timeout_s
@@ -482,6 +548,25 @@ class SBDGdbSolver:
                     UserWarning,
                     stacklevel=2,
                 )
+
+            # A non-converged solve exits 0 and prints a plausible energy: the
+            # Davidson loop simply runs out of iterations and reports its current
+            # Ritz values. Surface the binary's warning as a Python warning so it
+            # is not left sitting unread in sbd_stderr.txt.
+            for _line in (proc.stderr or "").splitlines():
+                if "did NOT converge" in _line:
+                    warnings.warn(
+                        f"sbd reported a non-converged solve: {_line.strip()} "
+                        f"The returned energy is NOT variationally converged. "
+                        f"Raise davidson_iterations (currently "
+                        f"{self.davidson_iterations}; it counts thick-restart "
+                        f"CYCLES, not matvecs) or loosen davidson_tolerance "
+                        f"(currently {self.davidson_tolerance:g}). "
+                        f"Work dir: {workdir}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    break
 
             if proc.returncode != 0:
                 tail = "\n".join(proc.stdout.splitlines()[-40:])
@@ -654,6 +739,7 @@ class SBDGdbSolver:
             "--t_comm_size", str(self.t_comm_size),
             "--bit_length", str(self.bit_length),
             "--do_redist_det", "1" if self.do_redist_det else "0",
+            "--do_redist_config", "1" if self.do_redist_config else "0",
             "--rdm", "1" if self.rdm else "0",
             *(["--rdm_root", str(self.rdm_root)]
               if (self.rdm and self.rdm_root is not None) else []),

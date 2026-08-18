@@ -1356,6 +1356,23 @@ namespace sbd {
 
       if (tmr && tmr->on) tmr->t_loop_total += _wtime() - _tloop0;
 
+      // Exhausting max_iteration is NOT convergence: the loop simply stops and
+      // the current Ritz values are returned. Without this warning that is
+      // indistinguishable from a converged answer in the output -- the caller
+      // sees a plausible energy and no indication the residual never met eps.
+      // (do_continue is still true only if the convergence test never passed.)
+      if (do_continue && mpi_rank_h == 0 && mpi_rank_t == 0 && mpi_rank_b == 0) {
+        RealT worst = RealT(0);
+        for (int p = 0; p < nroot; p++) if (norm_r[p] > worst) worst = norm_r[p];
+        std::cerr << " sbd: WARNING --single_spin did NOT converge in "
+                  << max_iteration << " outer iteration(s): max residual "
+                  << worst << " > tolerance " << eps << ".\n"
+                  << "      The reported energies are the current Ritz values and"
+                     " are NOT variationally converged.\n"
+                  << "      Raise --iteration (it counts thick-restart CYCLES, not"
+                     " matvecs) or loosen --tolerance." << std::endl;
+      }
+
       if (tmr && tmr->on && mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0) {
         // Sum of the individually timed regions inside the inner-cycle loop.
         // Anything left over is work in the loop that is still not instrumented
