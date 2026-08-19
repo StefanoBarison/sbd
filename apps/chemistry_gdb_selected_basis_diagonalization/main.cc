@@ -20,8 +20,9 @@ using Elem = double;
 
 int main(int argc, char * argv[]) {
 
-  int provided;
-  int mpi_ierr = MPI_Init_thread(&argc,&argv,MPI_THREAD_FUNNELED,&provided);
+  // Requests MPI_THREAD_FUNNELED and ABORTS if the MPI build does not
+  // provide it, then pins omp_set_dynamic(0). See MpiInitHybrid.
+  sbd::MpiInitHybrid(&argc, &argv);
   MPI_Comm comm = MPI_COMM_WORLD;
   int mpi_master = 0;
   int mpi_rank; MPI_Comm_rank(comm,&mpi_rank);

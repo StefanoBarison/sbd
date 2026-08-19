@@ -12,10 +12,91 @@
 #include <stdexcept>
 #include <vector>
 
+#include <iostream>
+
 #include "mpi.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "sbd/framework/det_vector.h"
 
 namespace sbd {
+
+  /**
+     Initialise MPI for hybrid MPI+OpenMP use, and ENFORCE the assumptions the
+     rest of the code makes. Replaces a bare
+     `MPI_Init_thread(&argc,&argv,MPI_THREAD_FUNNELED,&provided)`.
+
+     Two things were previously assumed and never checked:
+
+     1. THREAD LEVEL. Every app requests MPI_THREAD_FUNNELED but none read back
+        `provided`. FUNNELED is required because the single-spin fused
+        Gram-Schmidt performs an MPI reduction from inside an `omp parallel`
+        region, guarded by `omp master` so that only the initialising thread
+        calls MPI (chemistry/gdb/single_spin.h). If an MPI build granted only
+        MPI_THREAD_SINGLE that code would be undefined behaviour rather than
+        merely slow, and the symptom would be a silently wrong number. Abort
+        instead, naming what was asked for and what was granted.
+
+     2. OPENMP TEAM SIZE. Roughly a dozen sites size per-thread state with
+        `omp_get_max_threads()` outside a parallel region and then index it with
+        `omp_get_thread_num()` inside one, or stride a loop by the former (e.g.
+        chemistry/gdb/qcham.h, chemistry/gdb/mult.h, chemistry/gdb/correlation.h,
+        framework/dm_vector.h). That is only correct while the actual team size
+        equals `omp_get_max_threads()`. The OpenMP runtime is free to hand out a
+        smaller team when dynamic adjustment is enabled -- and the default
+        DIFFERS BETWEEN IMPLEMENTATIONS: libgomp (GCC) enables it, libomp
+        (LLVM/Intel) does not. A short team would make those sites read
+        uninitialised per-thread slots or silently skip whole index classes, with
+        no diagnostic. `omp_set_dynamic(0)` makes the invariant hold by
+        construction on every runtime.
+
+        NOTE: this was investigated as the cause of a known non-deterministic
+        wrong-answer bug (b_comm>1 with h_comm>1 and OMP_NUM_THREADS>=3) and
+        MEASURED NOT TO BE FIRING there -- a probe found zero team-size gaps
+        while runs were still wrong, and poisoning the per-thread array did not
+        change the result. So this is hardening a real latent portability hazard,
+        not a fix for that bug, which remains open.
+
+     Collective on MPI_COMM_WORLD in the abort path only. Call once, first thing
+     in main(), in place of MPI_Init_thread.
+  */
+  inline void MpiInitHybrid(int * argc, char *** argv) {
+    int provided = MPI_THREAD_SINGLE;
+    const int ierr = MPI_Init_thread(argc, argv, MPI_THREAD_FUNNELED, &provided);
+    if (ierr != MPI_SUCCESS) {
+      std::cerr << " sbd: ERROR MPI_Init_thread failed with code " << ierr
+                << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (provided < MPI_THREAD_FUNNELED) {
+      int rank = 0;
+      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+      if (rank == 0) {
+        auto name = [](int lvl) {
+          switch (lvl) {
+            case MPI_THREAD_SINGLE:     return "MPI_THREAD_SINGLE";
+            case MPI_THREAD_FUNNELED:   return "MPI_THREAD_FUNNELED";
+            case MPI_THREAD_SERIALIZED: return "MPI_THREAD_SERIALIZED";
+            case MPI_THREAD_MULTIPLE:   return "MPI_THREAD_MULTIPLE";
+            default:                    return "unknown";
+          }
+        };
+        std::cerr << " sbd: ERROR this MPI provides only " << name(provided)
+                  << " but SBD requires at least MPI_THREAD_FUNNELED.\n"
+                     "      The projected (single-spin) solver calls MPI from"
+                     " inside an OpenMP parallel region\n"
+                     "      on the master thread. Rebuild against a"
+                     " thread-capable MPI, or run with\n"
+                     "      OMP_NUM_THREADS=1." << std::endl;
+      }
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+#ifdef _OPENMP
+    // Guarantee team size == omp_get_max_threads(); see (2) above.
+    omp_set_dynamic(0);
+#endif
+  }
 
   void get_mpi_range(int mpi_size, int mpi_rank, size_t & i_begin, size_t & i_end)
   {
