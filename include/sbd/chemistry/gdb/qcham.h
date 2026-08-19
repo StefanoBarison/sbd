@@ -5,6 +5,8 @@
 #ifndef SBD_CHEMISTRY_GDB_QCHAM_H
 #define SBD_CHEMISTRY_GDB_QCHAM_H
 
+#include <algorithm>
+
 namespace sbd {
   namespace gdb {
 
@@ -47,12 +49,21 @@ namespace sbd {
 	tdet = det;
       }
 
-      size_t num_threads = 1;
+      // Number of slices the stored Hamiltonian is cut into below. Taken from
+      // omp_get_max_threads() OUTSIDE any parallel region: the previous code
+      // assigned omp_get_num_threads() from INSIDE one, which every thread of the
+      // team wrote to the same shared variable -- a data race (benign in practice,
+      // since they all write the same value, but a race nonetheless).
+      //
+      // More importantly this value SIZES ih/jh/hij/len, and mult() must address
+      // exactly these slices. mult() now derives the count from len[task].size()
+      // rather than from its own team size, so the two can no longer disagree.
+      const size_t num_threads =
+        static_cast<size_t>(std::max(1, omp_get_max_threads()));
       hii.resize(det.size());
 
 #pragma omp parallel
       {
-	num_threads = omp_get_num_threads();
 #pragma omp for
 	for(size_t k=0; k < det.size(); k++) {
 	  if( (k%mpi_size_h) != mpi_rank_h ) continue;

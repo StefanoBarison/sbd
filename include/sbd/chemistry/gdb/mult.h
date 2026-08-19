@@ -322,13 +322,33 @@ namespace sbd {
       }
 
       for(size_t task=0; task < slide.size(); task++) {
-#pragma omp parallel
-	{
-	  size_t thread_id = omp_get_thread_num();
-	  size_t num_threads = omp_get_num_threads();
-	  for(size_t k=0; k < len[task][thread_id]; k++) {
-	    wb[ih[task][thread_id][k]] += hij[task][thread_id][k]
-	      * twk[jh[task][thread_id][k]];
+	// The stored Hamiltonian was partitioned into len[task].size() slices by
+	// whatever team size was active in qcham (qcham.h:76-80). This region must
+	// therefore address exactly those slices -- NOT omp_get_num_threads() here.
+	//
+	// If mult's team is LARGER than qcham's was, len[task][thread_id] reads past
+	// the end of the vector: a garbage length, then garbage ih/jh pointers, then
+	// wild writes into wb. If it is SMALLER, the high slices are silently never
+	// applied and matrix elements go missing. Neither is detectable from the
+	// output except as a wrong energy.
+	//
+	// The team sizes can legitimately differ: qcham records
+	// omp_get_num_threads() from inside its own parallel region (and does so
+	// racily, from every thread), while the runtime is free to hand out a
+	// different team later -- and any caller that changes OMP_NUM_THREADS or
+	// enters from a different nesting depth between the two calls breaks the
+	// assumption outright.
+	//
+	// Bind the loop to the actual number of stored slices and drive it with an
+	// `omp for` so the mapping no longer depends on the team size at all. Row
+	// index sets are disjoint across slices (each bra determinant belongs to one
+	// alpha string, qcham.h:91), so the wb writes stay race-free.
+	const size_t nslice = len[task].size();
+#pragma omp parallel for schedule(static)
+	for(size_t sl = 0; sl < nslice; sl++) {
+	  for(size_t k=0; k < len[task][sl]; k++) {
+	    wb[ih[task][sl][k]] += hij[task][sl][k]
+	      * twk[jh[task][sl][k]];
 	  }
 	}
 	if( task != slide.size() - 1 ) {

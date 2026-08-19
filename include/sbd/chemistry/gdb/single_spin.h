@@ -1094,6 +1094,28 @@ namespace sbd {
             for (int i = 0; i < K; ++i) s += Conjugate(a[i]) * b[i];
             H[jb + nb*kb] = s;
           }
+          // SBD_SS_CHECK_H=1: recompute the Rayleigh block serially and compare.
+          // Isolates a threading defect in the loop above from anything downstream.
+          if (const char* _e = std::getenv("SBD_SS_CHECK_H")) {
+            if (_e[0] == '1') {
+              double worst = 0.0;
+              for (int jb = 0; jb <= ib; ++jb)
+                for (int kb = 0; kb <= ib; ++kb) {
+                  ElemT s = ElemT(0.0);
+                  for (int i = 0; i < K; ++i) s += Conjugate(v[jb][i]) * Hv[kb][i];
+                  const double d = std::abs(GetReal(s - H[jb + nb*kb]));
+                  if (d > worst) worst = d;
+                }
+              if (worst > 1.0e-9) {
+                int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                std::cerr << " sbd: ERROR Rayleigh block wrong by " << worst
+                          << " on world rank " << wr << " (ib=" << ib
+                          << ", nv2=" << nv2 << ", K=" << K << ", threads="
+                          << omp_get_max_threads() << ")" << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+              }
+            }
+          }
           // Each rank has only its slice's contribution to every <v_jb, Hv_kb>.
           // Reduce the whole (ib+1)^2 block in ONE allreduce -- per-pair
           // allreduces would be nb^2 collectives per inner step, the MPI analogue
