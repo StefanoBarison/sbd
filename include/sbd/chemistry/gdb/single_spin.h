@@ -858,6 +858,15 @@ namespace sbd {
        matrix-free (method 0) and stored-matrix (method 1) projected solvers.
        `matvec(x_csf, y_csf)` must implement y = V^T H (V x).
     */
+    /// SBD_SS_CHECK_VSLOT=1 bounds-checks slot and detects writes outside vslot.
+    inline bool _ss_check_vslot() {
+      static const bool on = [](){
+        const char* e = std::getenv("SBD_SS_CHECK_VSLOT");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+
     /// SBD_SS_CHECK_MGS=1 verifies each fused-MGS overlap against a serial recompute.
     inline bool _ss_check_mgs() {
       static const bool on = [](){
@@ -1401,10 +1410,35 @@ namespace sbd {
             // end of _local_inner on the other. If you change either path's
             // collective count or order, they must be changed together, or ranks
             // on opposite sides of the branch will deadlock.
+            const bool _ck = _ss_check_vslot();
+            std::vector<double> _sum_before;
+            std::vector<ElemT> _vslot_in;
+            if (_ck) _vslot_in = vslot;
             if (_ss_par(5,K)) {
               const int nth = omp_get_max_threads();
               std::vector<ElemT> mgs_partial(nth, ElemT(0.0));
               ElemT ol_shared = ElemT(0.0);
+              // SBD_SS_CHECK_VSLOT=1: bounds + neighbour-corruption check around the
+              // fused-MGS region. Three things it can catch that the overlap check
+              // cannot: (a) slot indexing past v's nb rows, (b) the region writing
+              // outside vslot (detected by checksumming the OTHER basis vectors,
+              // which it must never touch), (c) a team larger than mgs_partial.
+              if (_ck) {
+                if (slot < 0 || slot >= nb) {
+                  int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                  std::cerr << " sbd: ERROR fused MGS: slot=" << slot
+                            << " out of range [0," << nb << ") (ib=" << ib
+                            << " appended=" << appended << ", world rank " << wr
+                            << ")" << std::endl;
+                  MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+                for (int kb = 0; kb < nb; ++kb) {
+                  if (kb == slot) { _sum_before.push_back(0.0); continue; }
+                  double a = 0.0;
+                  for (int i = 0; i < K; ++i) a += std::abs(GetReal(v[kb][i]));
+                  _sum_before.push_back(a);
+                }
+              }
 #pragma omp parallel
               {
                 const int tid = omp_get_thread_num();
@@ -1433,6 +1467,20 @@ namespace sbd {
                     }
 #pragma omp barrier
                     const ElemT ol = ol_shared;
+                    if (_ck) {
+#pragma omp master
+                      {
+                        const int team = omp_get_num_threads();
+                        if (team > nth) {
+                          int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                          std::cerr << " sbd: ERROR fused MGS: team " << team
+                                    << " > mgs_partial size " << nth
+                                    << " -- out-of-bounds partial write (world rank "
+                                    << wr << ")" << std::endl;
+                          MPI_Abort(MPI_COMM_WORLD, 1);
+                        }
+                      }
+                    }
                     // SBD_SS_CHECK_MGS=1: recompute this overlap serially on the
                     // master and compare against the threaded reduction, BEFORE it
                     // is used. Catches a wrong reduction at the exact (pass,kb)
@@ -1471,6 +1519,54 @@ namespace sbd {
                   const std::vector<ElemT> & vkb = v[kb];
                   for (int i = 0; i < K; i++) vslot[i] -= vkb[i]*ol;
                 }
+            }
+            if (_ck && _ss_par(5,K)) {
+              // Redo the ENTIRE two-pass MGS serially on a saved copy of the input
+              // and compare the final vslot. The per-overlap check already passed,
+              // so if this fires the error is in the axpy / ordering, not the dot.
+              {
+                std::vector<ElemT> ref = _vslot_in;
+                for (int pass = 0; pass < 2; pass++)
+                  for (int kb = 0; kb < slot; kb++) {
+                    ElemT ol = ElemT(0.0);
+                    for (int i = 0; i < K; i++) ol += Conjugate(v[kb][i]) * ref[i];
+                    _bcomm_sum(&ol, 1, b_comm);
+                    for (int i = 0; i < K; i++) ref[i] -= v[kb][i]*ol;
+                  }
+                double worst = 0.0, nrm = 0.0;
+                for (int i = 0; i < K; ++i) {
+                  worst = std::max(worst, std::abs(GetReal(ref[i] - vslot[i])));
+                  nrm   = std::max(nrm,   std::abs(GetReal(ref[i])));
+                }
+                double gw = worst, gn = nrm;
+                { int cs=1; MPI_Comm_size(b_comm,&cs);
+                  if (cs>1) { MPI_Allreduce(MPI_IN_PLACE,&gw,1,MPI_DOUBLE,MPI_MAX,b_comm);
+                              MPI_Allreduce(MPI_IN_PLACE,&gn,1,MPI_DOUBLE,MPI_MAX,b_comm); } }
+                if (gw / std::max(1.0, gn) > 1.0e-8) {
+                  int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                  std::cerr << " sbd: ERROR fused MGS RESULT differs from serial MGS:"
+                            << " max|diff|=" << gw << " (scale " << gn << ", rel "
+                            << gw/std::max(1.0,gn) << "), slot=" << slot
+                            << " K=" << K << " threads=" << omp_get_max_threads()
+                            << " world rank " << wr << std::endl;
+                  MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+              }
+              for (int kb = 0; kb < nb; ++kb) {
+                if (kb == slot) continue;
+                double a = 0.0;
+                for (int i = 0; i < K; ++i) a += std::abs(GetReal(v[kb][i]));
+                const double b0 = _sum_before[kb];
+                const double sc = std::max(1.0, b0);
+                if (std::abs(a - b0) / sc > 1.0e-12) {
+                  int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                  std::cerr << " sbd: ERROR fused MGS CORRUPTED basis vector " << kb
+                            << " (slot=" << slot << "): |v[" << kb << "]| was " << b0
+                            << " now " << a << " (K=" << K << ", world rank " << wr
+                            << ")" << std::endl;
+                  MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+              }
             }
             // NOTE: this normalization is load-bearing -- an unnormalized
             // correction vector makes the energy never converge (the historical
