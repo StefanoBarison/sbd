@@ -37,6 +37,7 @@ Conventions: determinant bit 2p = alpha orbital p, 2p+1 = beta orbital p
 #include <algorithm>
 #include <functional>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -867,6 +868,104 @@ namespace sbd {
       return on;
     }
 
+
+    /// SBD_SS_FP=1: per-inner-step LAYOUT-INVARIANT fingerprints of the Krylov
+    /// vectors, for differential debugging across MPI decompositions.
+    ///
+    /// The existing SBD_SS_DUMP prints invariants (orthonormality, symmetry).
+    /// Those held to 1e-15 while the energy was already wrong, so they cannot
+    /// localise the defect. This prints VALUES instead -- reduced to scalars
+    /// that do not depend on how the CSF space is partitioned over b_comm, so a
+    /// run at `b=2,h=2` can be diffed step-by-step against `b=4,h=1` even though
+    /// no two ranks hold the same slice.
+    ///
+    /// Four reductions per vector, each over the GLOBAL assembled vector:
+    ///   s1   = sum_i x_i            translation/sign errors
+    ///   s2   = sum_i x_i^2          magnitude errors
+    ///   sw   = sum_i (g_i) * x_i    position-weighted: catches a permutation
+    ///                               or a misplaced slice that s1/s2 miss
+    ///   amax = max_i |x_i| and its GLOBAL index g_i (MAXLOC)
+    /// where g_i = csf_base + i is the global CSF column.
+    ///
+    /// Sign convention: eigenvectors are sign-arbitrary, so s1 and sw flip sign
+    /// together between layouts for a legitimately identical vector. Compare
+    /// |s1|; s2 and amax are sign-invariant already.
+    ///
+    /// WHICH LINES ARE COMPARABLE ACROSS LAYOUTS -- measured, not assumed. A
+    /// calibration run (top100, method 1, OMP=1, all three layouts giving the
+    /// correct energy) established:
+    ///
+    ///   COMPARABLE (physical, basis-independent), worst relative disagreement
+    ///   between b_comm=1 and b_comm=2/4 over 17 inner steps:
+    ///     E       9.2e-16   <-- the sharp instrument; use threshold 1e-10
+    ///     Ritz    1.5e-12   <-- use threshold 1e-8
+    ///     norm_r  2.2e-09   <-- weak, noisy; threshold 1e-5 at best
+    ///
+    ///   NOT COMPARABLE, and diffing them produces pure false positives:
+    ///     v, Hv, H (hsum/habs)
+    ///       The Krylov BASIS legitimately differs between layouts -- Gram-Schmidt
+    ///       order and the order in which residuals are appended both depend on
+    ///       the decomposition. Different bases spanning the same subspace give
+    ///       E0 agreeing to 1 ulp at every step while every basis-vector
+    ///       fingerprint differs in the 4th digit. 48 of 68 lines "differed" in
+    ///       calibration with nothing whatsoever wrong.
+    ///     sw, aidx (and hence any positional field)
+    ///       The GLOBAL CSF numbering is itself layout-dependent:
+    ///       build_config_projector assigns config blocks in redistribution
+    ///       order, so csf_base+i names the same physical CSF differently at
+    ///       b_comm=1 vs 2. The seed CSF is global index 110 at b=1 and 112 at
+    ///       b=2 -- same CSF, different label. sw and aidx are still useful for
+    ///       comparing two runs at the SAME layout (e.g. thread-count sweeps),
+    ///       which is why they are printed.
+    ///
+    /// So: diff E and Ritz across layouts. Ignore v/Hv/H/sw/aidx there.
+    inline bool _ss_fp() {
+      static const bool on = [](){
+        const char* e = std::getenv("SBD_SS_FP");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+
+    /// Compute the four fingerprints of a b_comm-distributed vector and print
+    /// them from b rank 0. `tag` names the quantity; `base` is V.csf_base.
+    template <typename ElemT>
+    inline void _ss_fingerprint(const char * tag, int it, int ib, int root,
+                                const std::vector<ElemT> & x, int base,
+                                MPI_Comm b_comm, int mpi_rank_h, int mpi_rank_t) {
+      const int n = static_cast<int>(x.size());
+      double s1 = 0.0, s2 = 0.0, sw = 0.0;
+      for (int i = 0; i < n; ++i) {
+        const double xi = GetReal(x[i]);
+        s1 += xi;
+        s2 += xi * xi;
+        sw += static_cast<double>(base + i) * xi;
+      }
+      struct { double val; int idx; } mine;
+      mine.val = -1.0; mine.idx = -1;
+      for (int i = 0; i < n; ++i) {
+        const double a = std::abs(GetReal(x[i]));
+        if (a > mine.val) { mine.val = a; mine.idx = base + i; }
+      }
+      int csize = 1; MPI_Comm_size(b_comm, &csize);
+      if (csize > 1) {
+        double acc[3] = { s1, s2, sw };
+        MPI_Allreduce(MPI_IN_PLACE, acc, 3, MPI_DOUBLE, MPI_SUM, b_comm);
+        s1 = acc[0]; s2 = acc[1]; sw = acc[2];
+        MPI_Allreduce(MPI_IN_PLACE, &mine, 1, MPI_DOUBLE_INT, MPI_MAXLOC, b_comm);
+      }
+      int b_rank = 0; MPI_Comm_rank(b_comm, &b_rank);
+      if (b_rank == 0 && mpi_rank_h == 0 && mpi_rank_t == 0) {
+        // Fixed-width, greppable, one line per (quantity, step, root).
+        std::cout << "   [fp] " << tag << " it=" << it << "." << ib
+                  << " r=" << root
+                  << std::scientific << std::setprecision(15)
+                  << " s1=" << s1 << " s2=" << s2 << " sw=" << sw
+                  << " amax=" << mine.val << " aidx=" << mine.idx
+                  << std::endl;
+      }
+    }
+
     /// SBD_SS_CHECK_HV=1 verifies mult's output is identical across h_comm.
     inline bool _ss_check_hv() {
       static const bool on = [](){
@@ -1370,6 +1469,38 @@ namespace sbd {
               std::cout << "   [dump] it=" << it << "." << ib
                         << " orth=" << orth << " nrmdev=" << nrmdev
                         << " Hasym=" << asym << " E0=" << E[0] << std::endl;
+          }
+          // SBD_SS_FP=1: per-inner-step layout-invariant VALUE fingerprints, for
+          // diffing this decomposition against a reference one. See _ss_fingerprint.
+          // Placed here, after the Ritz vectors and residuals are final for this
+          // step, so each line summarises a completed quantity rather than a
+          // partially-updated buffer. The basis vector v[ib] and its matvec Hv[ib]
+          // are the newest ones; Ritz[p]/E[p] are this step's eigen-solution.
+          if (_ss_fp()) {
+            _ss_fingerprint("v ", it, ib, ib, v[ib],  V.csf_base, b_comm,
+                            mpi_rank_h, mpi_rank_t);
+            _ss_fingerprint("Hv", it, ib, ib, Hv[ib], V.csf_base, b_comm,
+                            mpi_rank_h, mpi_rank_t);
+            for (int p = 0; p < nroot; ++p)
+              _ss_fingerprint("Rz", it, ib, p, Ritz[p], V.csf_base, b_comm,
+                              mpi_rank_h, mpi_rank_t);
+            // The Rayleigh block and the eigenvalues are already global (H is
+            // allreduced above; E comes from the b-rank-0 solve and is broadcast),
+            // so they need no reduction -- print them raw for the same diff.
+            if (mpi_rank_b == 0 && mpi_rank_h == 0 && mpi_rank_t == 0) {
+              double hsum = 0.0, habs = 0.0;
+              for (int j = 0; j <= ib; ++j)
+                for (int k = 0; k <= ib; ++k) {
+                  const double h = GetReal(H[j + nb*k]);
+                  hsum += h; habs += std::abs(h);
+                }
+              std::cout << "   [fp] H  it=" << it << "." << ib << " r=-"
+                        << std::scientific << std::setprecision(15)
+                        << " hsum=" << hsum << " habs=" << habs;
+              for (int p = 0; p < nroot; ++p) std::cout << " E" << p << "=" << E[p];
+              for (int p = 0; p < nroot; ++p) std::cout << " nr" << p << "=" << norm_r[p];
+              std::cout << std::endl;
+            }
           }
           if (mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0) {
             RealT maxr = RealT(0);
