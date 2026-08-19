@@ -1365,6 +1365,99 @@ namespace sbd {
               MPI_Abort(b_comm, 1);
             }
           }
+          // SBD_SS_CHECK_VREP=1: are the CSF-space basis vectors themselves
+          // identical across the h/t replicas? H is built from v and Hv, so if H
+          // disagrees, either its inputs already disagree (defect upstream, in the
+          // projection or the MGS) or the dot-product loop is at fault. This
+          // separates those two cases. Note SBD_SS_CHECK_HV already covers mult's
+          // DETERMINANT-space output and was clean, so the gap this closes is the
+          // projection and everything after it.
+          if (const char* _e = std::getenv("SBD_SS_CHECK_VREP")) {
+            if (_e[0] == '1') {
+              int hs = 1, ts = 1;
+              MPI_Comm_size(h_comm, &hs); MPI_Comm_size(t_comm, &ts);
+              if (hs > 1 || ts > 1) {
+                // Reduce each vector to a few scalars first: comparing K-length
+                // buffers across replicas every step would dominate the runtime.
+                const int nq = 2*(ib+1);
+                std::vector<double> mine(nq), lo(nq), hi(nq);
+                for (int j = 0; j <= ib; ++j) {
+                  double a = 0.0, b = 0.0;
+                  for (int i = 0; i < K; ++i) {
+                    a += GetReal(v[j][i])  * (i+1);
+                    b += GetReal(Hv[j][i]) * (i+1);
+                  }
+                  mine[2*j] = a; mine[2*j+1] = b;
+                }
+                lo = mine; hi = mine;
+                MPI_Allreduce(MPI_IN_PLACE, lo.data(), nq, MPI_DOUBLE, MPI_MIN, h_comm);
+                MPI_Allreduce(MPI_IN_PLACE, hi.data(), nq, MPI_DOUBLE, MPI_MAX, h_comm);
+                MPI_Allreduce(MPI_IN_PLACE, lo.data(), nq, MPI_DOUBLE, MPI_MIN, t_comm);
+                MPI_Allreduce(MPI_IN_PLACE, hi.data(), nq, MPI_DOUBLE, MPI_MAX, t_comm);
+                double wv = 0.0, wh = 0.0; int jv = -1, jh = -1;
+                for (int j = 0; j <= ib; ++j) {
+                  const double sv = std::max(std::abs(lo[2*j]),   std::abs(hi[2*j]));
+                  const double sh = std::max(std::abs(lo[2*j+1]), std::abs(hi[2*j+1]));
+                  const double dv = (hi[2*j]  -lo[2*j])   / (sv > 0 ? sv : 1.0);
+                  const double dh = (hi[2*j+1]-lo[2*j+1]) / (sh > 0 ? sh : 1.0);
+                  if (dv > wv) { wv = dv; jv = j; }
+                  if (dh > wh) { wh = dh; jh = j; }
+                }
+                if (wv > 1.0e-13 || wh > 1.0e-13) {
+                  int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                  std::cerr << " sbd: VREP DISAGREE it=" << it << "." << ib
+                            << " worst_v=" << wv << " (j=" << jv << ")"
+                            << " worst_Hv=" << wh << " (j=" << jh << ")"
+                            << " world rank " << wr << std::endl;
+                }
+              }
+            }
+          }
+          // SBD_SS_CHECK_HREP=1: is the Rayleigh matrix identical across the h/t
+          // replicas BEFORE the eigensolve? Each replica runs its own LAPACK, so
+          // identical input is the precondition for identical output. If this
+          // fires, the defect is upstream of the eigensolve entirely.
+          if (const char* _e = std::getenv("SBD_SS_CHECK_HREP")) {
+            if (_e[0] == '1') {
+              int hs = 1, ts = 1;
+              MPI_Comm_size(h_comm, &hs); MPI_Comm_size(t_comm, &ts);
+              if (hs > 1 || ts > 1) {
+                const int n = (ib+1)*(ib+1);
+                std::vector<double> mine(n), lo(n), hi(n);
+                for (int kb = 0, q = 0; kb <= ib; ++kb)
+                  for (int jb = 0; jb <= ib; ++jb, ++q)
+                    mine[q] = GetReal(H[jb + nb*kb]);
+                lo = mine; hi = mine;
+                MPI_Allreduce(MPI_IN_PLACE, lo.data(), n, MPI_DOUBLE, MPI_MIN, h_comm);
+                MPI_Allreduce(MPI_IN_PLACE, hi.data(), n, MPI_DOUBLE, MPI_MAX, h_comm);
+                MPI_Allreduce(MPI_IN_PLACE, lo.data(), n, MPI_DOUBLE, MPI_MIN, t_comm);
+                MPI_Allreduce(MPI_IN_PLACE, hi.data(), n, MPI_DOUBLE, MPI_MAX, t_comm);
+                // Relative error alone is useless here: an off-diagonal element
+                // that should be zero spans [-5e-16, 7.8e-16] between replicas,
+                // which is a relative difference of 1.6 and entirely benign. Scale
+                // by the magnitude of the LARGEST element in the matrix so the
+                // metric asks "does this differ by enough to matter", not "do two
+                // roundoff-level zeros differ".
+                double scale = 0.0;
+                for (int q = 0; q < n; ++q)
+                  scale = std::max(scale, std::max(std::abs(lo[q]), std::abs(hi[q])));
+                if (scale <= 0.0) scale = 1.0;
+                double worst = 0.0; int wq = -1;
+                for (int q = 0; q < n; ++q) {
+                  const double d = (hi[q]-lo[q]) / scale;
+                  if (d > worst) { worst = d; wq = q; }
+                }
+                if (worst > 1.0e-13) {
+                  int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                  std::cerr << " sbd: HREP DISAGREE it=" << it << "." << ib
+                            << " worst_rel=" << worst << " at elem " << wq
+                            << " (jb=" << (wq % (ib+1)) << ",kb=" << (wq/(ib+1))
+                            << ") spans [" << lo[wq] << "," << hi[wq]
+                            << "] world rank " << wr << std::endl;
+                }
+              }
+            }
+          }
           for (int kb = 0; kb <= ib; ++kb)
             for (int jb = 0; jb <= ib; ++jb)
               U[jb + nb*kb] = H[jb + nb*kb];
@@ -1415,6 +1508,42 @@ namespace sbd {
             }
             if (GetReal(col[piv]) < RealT(0))
               for (int r = 0; r <= ib; ++r) col[r] = -col[r];
+            // SBD_SS_CHECK_SIGN=1: verify every h/t replica picked the SAME pivot
+            // row and the SAME resulting sign. Each replica runs its own LAPACK on
+            // a bitwise-identical matrix, so a disagreement here means the
+            // canonicalization is not deterministic across replicas -- which is
+            // the exact failure this block exists to prevent.
+            if (const char* _e = std::getenv("SBD_SS_CHECK_SIGN")) {
+              if (_e[0] == '1') {
+                int hs = 1, ts = 1;
+                MPI_Comm_size(h_comm, &hs); MPI_Comm_size(t_comm, &ts);
+                if (hs > 1 || ts > 1) {
+                  // Pivot row, sign of the pivot entry, and a magnitude-ordering
+                  // fingerprint: how many entries lie within 1e-12 of `best`.
+                  int ties = 0;
+                  for (int r = 0; r <= ib; ++r)
+                    if (std::abs(std::abs(GetReal(col[r])) - best) <= RealT(1.0e-12))
+                      ++ties;
+                  long long f[3] = { piv, (GetReal(col[piv]) < 0 ? -1 : 1), ties };
+                  long long lo[3], hi[3];
+                  for (int j = 0; j < 3; ++j) { lo[j] = f[j]; hi[j] = f[j]; }
+                  MPI_Allreduce(MPI_IN_PLACE, lo, 3, MPI_LONG_LONG, MPI_MIN, h_comm);
+                  MPI_Allreduce(MPI_IN_PLACE, hi, 3, MPI_LONG_LONG, MPI_MAX, h_comm);
+                  MPI_Allreduce(MPI_IN_PLACE, lo, 3, MPI_LONG_LONG, MPI_MIN, t_comm);
+                  MPI_Allreduce(MPI_IN_PLACE, hi, 3, MPI_LONG_LONG, MPI_MAX, t_comm);
+                  if (lo[0] != hi[0] || lo[1] != hi[1]) {
+                    int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                    std::cerr << " sbd: SIGN DISAGREE it=" << it << "." << ib
+                              << " col=" << c << " piv spans " << lo[0] << ".."
+                              << hi[0] << " sign spans " << lo[1] << ".." << hi[1]
+                              << " ties spans " << lo[2] << ".." << hi[2]
+                              << " (this rank piv=" << piv << " ties=" << ties
+                              << " best=" << best << ", world rank " << wr << ")"
+                              << std::endl;
+                  }
+                }
+              }
+            }
           }
           if (tmr && tmr->on) tmr->t_subbuild += _wtime() - _ts;
 
@@ -1437,6 +1566,57 @@ namespace sbd {
               }
               Rp[i] = ri;
               res[i] = si - E[p]*ri;
+            }
+            // SBD_SS_CHECK_RITZREP=1: check res/Ritz across h/t replicas at the
+            // point they are BUILT, before any normalization. CORRREP sees res only
+            // after _local_normalize has scaled it in place, so it cannot say
+            // whether the divergence is in this loop or in the norm that follows.
+            if (const char* _e = std::getenv("SBD_SS_CHECK_RITZREP")) {
+              if (_e[0] == '1') {
+                int hs = 1, ts = 1;
+                MPI_Comm_size(h_comm, &hs); MPI_Comm_size(t_comm, &ts);
+                if (hs > 1 || ts > 1) {
+                  // Also fingerprint the INPUTS this loop reads: the U column and
+                  // the basis vectors. Then a disagreement in the output can be
+                  // attributed rather than guessed.
+                  double q[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+                  for (int i = 0; i < K; ++i) {
+                    q[0] += GetReal(res[i]) * (i+1);
+                    q[1] += GetReal(Rp[i])  * (i+1);
+                  }
+                  for (int kb = 0; kb <= ib; ++kb)
+                    q[2] += GetReal(U[kb + nb*p]) * (kb+1);
+                  // DENSE, not sampled. A sparse stride (i += 97) reported v as
+                  // clean at a step where res -- computed from v -- had already
+                  // diverged, which is impossible and was an artefact of the
+                  // sampling. Cost is fine: this is a diagnostic, off by default.
+                  for (int kb = 0; kb <= ib; ++kb)
+                    for (int i = 0; i < K; ++i)
+                      q[3] += GetReal(v[kb][i]) * (i+1) * (kb+1);
+                  // Hv too: it feeds si directly, and CHECK_HV only covers the
+                  // determinant-space output of mult, not the projected vector.
+                  for (int kb = 0; kb <= ib; ++kb)
+                    for (int i = 0; i < K; ++i)
+                      q[4] += GetReal(Hv[kb][i]) * (i+1) * (kb+1);
+                  double lo[5], hi[5];
+                  for (int j = 0; j < 5; ++j) { lo[j] = q[j]; hi[j] = q[j]; }
+                  MPI_Allreduce(MPI_IN_PLACE, lo, 5, MPI_DOUBLE, MPI_MIN, h_comm);
+                  MPI_Allreduce(MPI_IN_PLACE, hi, 5, MPI_DOUBLE, MPI_MAX, h_comm);
+                  MPI_Allreduce(MPI_IN_PLACE, lo, 5, MPI_DOUBLE, MPI_MIN, t_comm);
+                  MPI_Allreduce(MPI_IN_PLACE, hi, 5, MPI_DOUBLE, MPI_MAX, t_comm);
+                  const char * nm[5] = {"res_raw","Ritz_raw","Ucol","v_all","Hv_all"};
+                  for (int j = 0; j < 5; ++j) {
+                    const double s = std::max(std::abs(lo[j]), std::abs(hi[j]));
+                    const double d = (hi[j]-lo[j]) / (s > 0 ? s : 1.0);
+                    if (d > 1.0e-13) {
+                      int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                      std::cerr << " sbd: RITZREP it=" << it << "." << ib
+                                << " root=" << p << " field=" << nm[j]
+                                << " rel=" << d << " world rank " << wr << std::endl;
+                    }
+                  }
+                }
+              }
             }
             if (tmr && tmr->on) { tmr->t_ritz_build += _wtime() - _tb; _tb = _wtime(); }
             RealT nrmw = _local_normalize<ElemT,RealT>(Ritz[p], b_comm);
@@ -1577,6 +1757,44 @@ namespace sbd {
               const RealT ad = std::abs(den);
               if (ad < den_floor) den = (den < RealT(0) ? -den_floor : den_floor);
               vslot[i] = res[i]/den;
+            }
+            // SBD_SS_CHECK_CORRREP=1: are the correction and ALL ITS INPUTS
+            // identical across the h/t replicas? The correction is
+            // vslot = res / (E[p] - ndiag), so a disagreement in vslot must come
+            // from res, E[p], ndiag, or the loop itself. Checking all of them in
+            // one place says which, instead of inferring it.
+            if (const char* _e = std::getenv("SBD_SS_CHECK_CORRREP")) {
+              if (_e[0] == '1') {
+                int hs = 1, ts = 1;
+                MPI_Comm_size(h_comm, &hs); MPI_Comm_size(t_comm, &ts);
+                if (hs > 1 || ts > 1) {
+                  double q[4] = {0.0, 0.0, static_cast<double>(E[p]), 0.0};
+                  for (int i = 0; i < K; ++i) {
+                    q[0] += GetReal(res[i])   * (i+1);   // input  res
+                    q[1] += GetReal(vslot[i]) * (i+1);   // output vslot
+                    q[3] += static_cast<double>(ndiag[i]) * (i+1);  // input ndiag
+                  }
+                  double lo[4], hi[4];
+                  for (int j = 0; j < 4; ++j) { lo[j] = q[j]; hi[j] = q[j]; }
+                  MPI_Allreduce(MPI_IN_PLACE, lo, 4, MPI_DOUBLE, MPI_MIN, h_comm);
+                  MPI_Allreduce(MPI_IN_PLACE, hi, 4, MPI_DOUBLE, MPI_MAX, h_comm);
+                  MPI_Allreduce(MPI_IN_PLACE, lo, 4, MPI_DOUBLE, MPI_MIN, t_comm);
+                  MPI_Allreduce(MPI_IN_PLACE, hi, 4, MPI_DOUBLE, MPI_MAX, t_comm);
+                  const char * nm[4] = {"res", "vslot", "E", "ndiag"};
+                  for (int j = 0; j < 4; ++j) {
+                    const double s = std::max(std::abs(lo[j]), std::abs(hi[j]));
+                    const double d = (hi[j]-lo[j]) / (s > 0 ? s : 1.0);
+                    if (d > 1.0e-13) {
+                      int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                      std::cerr << " sbd: CORRREP DISAGREE it=" << it << "." << ib
+                                << " root=" << p << " slot=" << slot
+                                << " field=" << nm[j] << " rel=" << d
+                                << " spans [" << lo[j] << "," << hi[j] << "]"
+                                << " world rank " << wr << std::endl;
+                    }
+                  }
+                }
+              }
             }
             if (tmr && tmr->on) { tmr->t_corr_prec += _wtime() - _td; _td = _wtime(); }
             // MGS (two passes) against all current basis + accepted corrections.
