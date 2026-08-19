@@ -858,6 +858,24 @@ namespace sbd {
        matrix-free (method 0) and stored-matrix (method 1) projected solvers.
        `matvec(x_csf, y_csf)` must implement y = V^T H (V x).
     */
+    /// SBD_SS_CHECK_CORR=1 traces the conditioning of each Davidson correction.
+    inline bool _ss_check_corr() {
+      static const bool on = [](){
+        const char* e = std::getenv("SBD_SS_CHECK_CORR");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+
+    /// SBD_SS_CHECK_FLOW=1 verifies b ranks agree on correction-loop control flow.
+    inline bool _ss_check_flow() {
+      static const bool on = [](){
+        const char* e = std::getenv("SBD_SS_CHECK_FLOW");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+
     /// SBD_SS_CHECK_VSLOT=1 bounds-checks slot and detects writes outside vslot.
     inline bool _ss_check_vslot() {
       static const bool on = [](){
@@ -1410,6 +1428,42 @@ namespace sbd {
             // end of _local_inner on the other. If you change either path's
             // collective count or order, they must be changed together, or ranks
             // on opposite sides of the branch will deadlock.
+            // SBD_SS_CHECK_FLOW=1: verify every b rank agrees on the CONTROL FLOW of
+            // the correction loop, not on the arithmetic. If ranks disagree on
+            // `slot` they issue different numbers of MGS reductions, so every later
+            // b_comm reduction pairs mismatched data while each one still looks
+            // self-consistent locally -- correct values, wrong global result, and
+            // eventually MPI_ERR_TRUNCATE. Also flags ranks taking DIFFERENT sides
+            // of the fused/serial branch, which is legal only because both paths
+            // issue the same reduction sequence -- and that equivalence depends on
+            // `slot` matching.
+            if (_ss_check_flow()) {
+              long long f[4] = { ib, appended, slot, _ss_par(5,K) ? 1 : 0 };
+              long long lo[4], hi[4];
+              for (int j = 0; j < 4; ++j) { lo[j] = f[j]; hi[j] = f[j]; }
+              int _cs = 1; MPI_Comm_size(b_comm, &_cs);
+              if (_cs > 1) {
+                MPI_Allreduce(MPI_IN_PLACE, lo, 4, MPI_LONG_LONG, MPI_MIN, b_comm);
+                MPI_Allreduce(MPI_IN_PLACE, hi, 4, MPI_LONG_LONG, MPI_MAX, b_comm);
+                bool bad = false;
+                for (int j = 0; j < 4; ++j) if (lo[j] != hi[j]) bad = true;
+                if (bad) {
+                  int cr = 0, wr = 0;
+                  MPI_Comm_rank(b_comm, &cr); MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                  std::cerr << " sbd: ERROR correction-loop flow DESYNC across b_comm:"
+                            << " this rank ib=" << ib << " appended=" << appended
+                            << " slot=" << slot << " fused=" << (_ss_par(5,K)?1:0)
+                            << " K=" << K
+                            << " | spans ib " << lo[0] << ".." << hi[0]
+                            << ", appended " << lo[1] << ".." << hi[1]
+                            << ", slot " << lo[2] << ".." << hi[2]
+                            << ", fused " << lo[3] << ".." << hi[3]
+                            << " (b rank " << cr << ", world rank " << wr << ")"
+                            << std::endl;
+                  MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+              }
+            }
             const bool _ck = _ss_check_vslot();
             std::vector<double> _sum_before;
             std::vector<ElemT> _vslot_in;
@@ -1571,7 +1625,40 @@ namespace sbd {
             // NOTE: this normalization is load-bearing -- an unnormalized
             // correction vector makes the energy never converge (the historical
             // pathology). It stays exactly as-is; only timing is added around it.
+            // SBD_SS_CHECK_CORR=1: report the quantities that govern whether this
+            // correction is well-conditioned, at every append. A Davidson step
+            // cannot legitimately grow the residual, so if it does, one of these
+            // is pathological: den_floor hits (E[p] inside the ndiag spread), the
+            // pre-MGS norm, or the post-MGS norm (near-total cancellation means
+            // the direction was already in the span and MGS left only noise).
+            if (_ss_check_corr()) {
+              double pre = 0.0;
+              for (int i = 0; i < K; ++i) pre += GetReal(Conjugate(vslot[i])*vslot[i]);
+              long long nfloor = 0;
+              double dmin = 1.0e300;
+              for (int i = 0; i < K; ++i) {
+                const RealT den = E[p] - ndiag[i];
+                const double ad = std::abs(GetReal(den));
+                if (ad < dmin) dmin = ad;
+                if (ad < den_floor) nfloor++;
+              }
+              double g[3] = { pre, static_cast<double>(nfloor), -dmin };
+              int _cs=1; MPI_Comm_size(b_comm,&_cs);
+              if (_cs>1) MPI_Allreduce(MPI_IN_PLACE, g, 3, MPI_DOUBLE, MPI_SUM, b_comm);
+              if (mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0)
+                std::cout << "   [corr] it=" << it << "." << ib << " p=" << p
+                          << " slot=" << slot
+                          << " |precond|=" << std::sqrt(g[0])
+                          << " floored=" << static_cast<long long>(g[1])
+                          << "/" << Kg
+                          << " min|E-ndiag|=" << -g[2]
+                          << " E=" << E[p] << std::endl;
+            }
             RealT nv = _local_normalize<ElemT,RealT>(v[slot], b_comm);
+            if (_ss_check_corr() && mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0)
+              std::cout << "   [corr] it=" << it << "." << ib << " p=" << p
+                        << " post-MGS norm nv=" << nv
+                        << (nv < tau_drop ? "  DROPPED" : "") << std::endl;
             if (tmr && tmr->on) tmr->t_corr_mgs += _wtime() - _td;
             // `nv` is safe to branch on across ranks: _local_normalize allreduces
             // the squared norm BEFORE taking the square root, so every rank gets
