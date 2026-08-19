@@ -858,6 +858,15 @@ namespace sbd {
        matrix-free (method 0) and stored-matrix (method 1) projected solvers.
        `matvec(x_csf, y_csf)` must implement y = V^T H (V x).
     */
+    /// SBD_SS_DUMP=1 prints per-step Krylov invariants (orthonormality, symmetry).
+    inline bool _ss_dump() {
+      static const bool on = [](){
+        const char* e = std::getenv("SBD_SS_DUMP");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+
     /// SBD_SS_CHECK_HV=1 verifies mult's output is identical across h_comm.
     inline bool _ss_check_hv() {
       static const bool on = [](){
@@ -1338,6 +1347,30 @@ namespace sbd {
             if (norm_r[p] >= eps) { all_converged = false; unconverged.push_back(p); }
           }
 
+          // SBD_SS_DUMP=1: per-inner-step INVARIANTS, not values. These must hold
+          // for any correct parallel layout, so whichever breaks first localises
+          // the defect without needing a matching good/bad pair of vectors.
+          //   orth   = max_{j<k} |<v_j|v_k>|      should be ~1e-15
+          //   nrm    = max_j |1 - <v_j|v_j>|      should be ~1e-15
+          //   asym   = max_{j,k} |H_jk - H_kj|    Rayleigh must be symmetric
+          if (_ss_dump()) {
+            double orth = 0.0, nrmdev = 0.0, asym = 0.0;
+            for (int j = 0; j <= ib; ++j) {
+              ElemT d = _local_inner(v[j], v[j], b_comm);
+              nrmdev = std::max(nrmdev, std::abs(GetReal(d) - 1.0));
+              for (int k = j+1; k <= ib; ++k) {
+                ElemT o = _local_inner(v[j], v[k], b_comm);
+                orth = std::max(orth, std::abs(GetReal(o)));
+              }
+            }
+            for (int j = 0; j <= ib; ++j)
+              for (int k = 0; k <= ib; ++k)
+                asym = std::max(asym, std::abs(GetReal(H[j + nb*k] - H[k + nb*j])));
+            if (mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0)
+              std::cout << "   [dump] it=" << it << "." << ib
+                        << " orth=" << orth << " nrmdev=" << nrmdev
+                        << " Hasym=" << asym << " E0=" << E[0] << std::endl;
+          }
           if (mpi_rank_h==0 && mpi_rank_t==0 && mpi_rank_b==0) {
             RealT maxr = RealT(0);
             for (int p=0;p<nroot;p++) if (norm_r[p]>maxr) maxr=norm_r[p];
