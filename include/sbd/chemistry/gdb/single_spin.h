@@ -858,6 +858,15 @@ namespace sbd {
        matrix-free (method 0) and stored-matrix (method 1) projected solvers.
        `matvec(x_csf, y_csf)` must implement y = V^T H (V x).
     */
+    /// SBD_SS_CHECK_HV=1 verifies mult's output is identical across h_comm.
+    inline bool _ss_check_hv() {
+      static const bool on = [](){
+        const char* e = std::getenv("SBD_SS_CHECK_HV");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+
     /// SBD_SS_CHECK_CORR=1 traces the conditioning of each Davidson correction.
     inline bool _ss_check_corr() {
       static const bool on = [](){
@@ -1919,6 +1928,34 @@ namespace sbd {
           project_up(V, xc, xdet, ndet);
           Zero(ydet);
           mult(hii, ih, jh, hij, len, slide, xdet, ydet, h_comm, b_comm, t_comm);
+          // SBD_SS_CHECK_HV=1: after mult, ydet must be IDENTICAL on every h rank --
+          // mult allreduces over h_comm, so h partners hold the same b-slice and the
+          // same result. If they differ, the stored Hamiltonian is inconsistent
+          // across the h_comm sharding (each h rank stores a strided subset), and
+          // the sum is not reproducing the full operator.
+          if (_ss_check_hv()) {
+            int hs = 1; MPI_Comm_size(h_comm, &hs);
+            if (hs > 1) {
+              std::vector<ElemT> lo(ydet), hi(ydet);
+              MPI_Allreduce(MPI_IN_PLACE, lo.data(), static_cast<int>(lo.size()),
+                            GetMpiType<ElemT>::MpiT, MPI_MIN, h_comm);
+              MPI_Allreduce(MPI_IN_PLACE, hi.data(), static_cast<int>(hi.size()),
+                            GetMpiType<ElemT>::MpiT, MPI_MAX, h_comm);
+              double worst = 0.0; size_t nbad = 0;
+              for (size_t i = 0; i < ydet.size(); ++i) {
+                const double d = std::abs(GetReal(hi[i]) - GetReal(lo[i]));
+                if (d > 1.0e-12) { nbad++; if (d > worst) worst = d; }
+              }
+              if (nbad) {
+                int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                std::cerr << " sbd: ERROR ydet differs across h_comm after mult: "
+                          << nbad << " of " << ydet.size()
+                          << " elements, max spread " << worst
+                          << " (world rank " << wr << ")" << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+              }
+            }
+          }
           project_down(V, ydet, yc);
           return;
         }
