@@ -758,10 +758,40 @@ namespace sbd {
     /// so b_comm_size == 1 stays bit-identical to the old local-only code.
     /// Uses SBD's own GetMpiType trait (framework/type_def.h) rather than
     /// reinterpreting the buffer, so float and complex ElemT work unchanged.
+    /// Number of _bcomm_sum calls issued by this rank, and the total element count.
+    /// Diagnostic for MPI_ERR_TRUNCATE: a count mismatch means ranks disagreed on
+    /// the SEQUENCE of reductions, which this makes visible.
+    inline long long & _bcomm_call_count() { static long long c = 0; return c; }
+    inline long long & _bcomm_elem_count() { static long long c = 0; return c; }
+
     template <typename ElemT>
     inline void _bcomm_sum(ElemT * x, int n, MPI_Comm comm) {
       int csize = 1; MPI_Comm_size(comm, &csize);
       if (csize == 1 || n == 0) return;
+      _bcomm_call_count()++;
+      _bcomm_elem_count() += n;
+      // SBD_SS_TRACE_RED=1: before each reduction, confirm every rank agrees on
+      // WHICH reduction this is (call ordinal) and on its element count. A
+      // disagreement is the cause of MPI_ERR_TRUNCATE and is otherwise invisible.
+      if (const char* _e = std::getenv("SBD_SS_TRACE_RED")) {
+        if (_e[0] == '1') {
+          long long mine[2] = { _bcomm_call_count(), static_cast<long long>(n) };
+          long long lo[2] = { mine[0], mine[1] }, hi[2] = { mine[0], mine[1] };
+          MPI_Allreduce(MPI_IN_PLACE, lo, 2, MPI_LONG_LONG, MPI_MIN, comm);
+          MPI_Allreduce(MPI_IN_PLACE, hi, 2, MPI_LONG_LONG, MPI_MAX, comm);
+          if (lo[0] != hi[0] || lo[1] != hi[1]) {
+            int cr = 0, wr = 0;
+            MPI_Comm_rank(comm, &cr); MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+            std::cerr << " sbd: ERROR b_comm reduction DESYNC: this rank is at call "
+                      << mine[0] << " with n=" << n << "; across b_comm the call"
+                      << " ordinal spans " << lo[0] << ".." << hi[0]
+                      << " and n spans " << lo[1] << ".." << hi[1]
+                      << " (b rank " << cr << ", world rank " << wr << ")"
+                      << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+          }
+        }
+      }
       MPI_Allreduce(MPI_IN_PLACE, x, n, GetMpiType<ElemT>::MpiT, MPI_SUM, comm);
     }
 
@@ -828,6 +858,27 @@ namespace sbd {
        matrix-free (method 0) and stored-matrix (method 1) projected solvers.
        `matvec(x_csf, y_csf)` must implement y = V^T H (V x).
     */
+    /// SBD_SS_CHECK_MGS=1 verifies each fused-MGS overlap against a serial recompute.
+    inline bool _ss_check_mgs() {
+      static const bool on = [](){
+        const char* e = std::getenv("SBD_SS_CHECK_MGS");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+
+    /// Threshold above which CSF-space loops go parallel; see SBD_SS_PAR_THRESHOLD.
+    inline int _csf_par_thr_value() {
+      static const int v = [](){
+        if (const char* e = std::getenv("SBD_SS_PAR_THRESHOLD")) {
+          int x = std::atoi(e);
+          if (x >= 0) return x;
+        }
+        return 4096;
+      }();
+      return v;
+    }
+
     template <typename ElemT, typename RealT>
     void _davidson_projected_core(const std::vector<ElemT> & hii,
                                   const SpinProjector & V,
@@ -872,6 +923,16 @@ namespace sbd {
         const char* e = std::getenv("SBD_SS_CHECK_IB");
         return e && e[0] == '1';
       }();
+      // SBD_SS_SERIAL=<n> forces CSF-loop region n to run SERIAL while the others
+      // stay parallel, for bisecting a threading defect. Regions are numbered in
+      // source order; 0 = none. Diagnostic only.
+      const int _ss_serial_region = [](){
+        const char* e = std::getenv("SBD_SS_SERIAL");
+        return e ? std::atoi(e) : 0;
+      }();
+      auto _ss_par = [&](int region, int k) {
+        return (region != _ss_serial_region) && (k > _csf_par_thr_value());
+      };
       const int csf_par_threshold = [](){
         if (const char* e = std::getenv("SBD_SS_PAR_THRESHOLD")) {
           int v = std::atoi(e);
@@ -1084,7 +1145,7 @@ namespace sbd {
           // nb^2 K-length dot products.
           if (b_comm_size > 1)
             std::fill(H, H + static_cast<size_t>(nb)*nb, ElemT(0.0));
-#pragma omp parallel for schedule(static) if(K > csf_par_threshold)
+#pragma omp parallel for schedule(static) if(_ss_par(1,K))
           for (int idx = 0; idx < nv2; ++idx) {
             int jb = idx / (ib + 1);
             int kb = idx % (ib + 1);
@@ -1222,7 +1283,7 @@ namespace sbd {
             // so each i accumulates its full kb-sum in one thread iteration.
             std::vector<ElemT> & Rp = Ritz[p];
             double _tb = (tmr && tmr->on) ? _wtime() : 0.0;
-#pragma omp parallel for if(K > csf_par_threshold)
+#pragma omp parallel for if(_ss_par(2,K))
             for (int i = 0; i < K; i++) {
               ElemT ri = ElemT(0.0), si = ElemT(0.0);
               for (int kb = 0; kb <= ib; kb++) {
@@ -1265,7 +1326,7 @@ namespace sbd {
             // -> stalled/divergent Davidson at large K). Parallelize over i.
             std::vector<ElemT> & Rp = Ritz[p];
             double _td = (tmr && tmr->on) ? _wtime() : 0.0;
-#pragma omp parallel for if(K > csf_par_threshold)
+#pragma omp parallel for if(_ss_par(3,K))
             for (int i = 0; i < K; i++) {
               ElemT ri = ElemT(0.0), si = ElemT(0.0);
               for (int kb = 0; kb <= ib; kb++) {
@@ -1310,7 +1371,7 @@ namespace sbd {
             const RealT den_floor =
                 std::max(static_cast<RealT>(1.0e-8),
                          static_cast<RealT>(1.0e-10) * std::abs(E[p]));
-            #pragma omp parallel for if(K > csf_par_threshold)
+            #pragma omp parallel for if(_ss_par(4,K))
             for (int i = 0; i < K; i++) {
               RealT den = E[p] - ndiag[i];
               const RealT ad = std::abs(den);
@@ -1340,7 +1401,7 @@ namespace sbd {
             // end of _local_inner on the other. If you change either path's
             // collective count or order, they must be changed together, or ranks
             // on opposite sides of the branch will deadlock.
-            if (K > csf_par_threshold) {
+            if (_ss_par(5,K)) {
               const int nth = omp_get_max_threads();
               std::vector<ElemT> mgs_partial(nth, ElemT(0.0));
               ElemT ol_shared = ElemT(0.0);
@@ -1372,6 +1433,32 @@ namespace sbd {
                     }
 #pragma omp barrier
                     const ElemT ol = ol_shared;
+                    // SBD_SS_CHECK_MGS=1: recompute this overlap serially on the
+                    // master and compare against the threaded reduction, BEFORE it
+                    // is used. Catches a wrong reduction at the exact (pass,kb)
+                    // where it first happens, rather than as a wrong energy later.
+                    if (_ss_check_mgs()) {
+#pragma omp master
+                      {
+                        ElemT ref = ElemT(0.0);
+                        for (int i = 0; i < K; i++) ref += Conjugate(vkb[i]) * vslot[i];
+                        _bcomm_sum(&ref, 1, b_comm);
+                        const double d = std::abs(GetReal(ref - ol));
+                        const double scale = std::max(1.0, std::abs(GetReal(ref)));
+                        if (d / scale > 1.0e-10) {
+                          int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                          std::cerr << " sbd: ERROR fused MGS overlap wrong: pass="
+                                    << pass << " kb=" << kb << " slot=" << slot
+                                    << " got " << GetReal(ol) << " want " << GetReal(ref)
+                                    << " rel " << (d/scale) << " (K=" << K
+                                    << ", threads=" << omp_get_num_threads()
+                                    << ", nth=" << nth << ", world rank " << wr << ")"
+                                    << std::endl;
+                          MPI_Abort(MPI_COMM_WORLD, 1);
+                        }
+                      }
+#pragma omp barrier
+                    }
 #pragma omp for
                     for (int i = 0; i < K; i++) vslot[i] -= vkb[i]*ol;
                   }
@@ -1435,7 +1522,7 @@ namespace sbd {
         for (int p = 0; p < keep; p++) {
           std::vector<ElemT> & vp = Vnew[p];
           std::vector<ElemT> & hp = HVnew[p];
-#pragma omp parallel for if(K > csf_par_threshold)
+#pragma omp parallel for if(_ss_par(6,K))
           for (int i = 0; i < K; i++) {
             ElemT ri = ElemT(0.0), hi = ElemT(0.0);
             for (int kb = 0; kb <= ib; kb++) {
@@ -1460,7 +1547,7 @@ namespace sbd {
         for (int p = 0; p < keep; p++) {
           for (int q = 0; q < p; q++) {
             ElemT ol = _local_inner(Vnew[q], Vnew[p], b_comm);   // <v_q, v_p>
-#pragma omp parallel for if(K > csf_par_threshold)
+#pragma omp parallel for if(_ss_par(7,K))
             for (int i = 0; i < K; i++) {
               Vnew[p][i]  -= Vnew[q][i]  * ol;
               HVnew[p][i] -= HVnew[q][i] * ol;   // same subtraction => Hv stays = H v
@@ -1469,7 +1556,7 @@ namespace sbd {
           RealT nrm = _local_normalize<ElemT,RealT>(Vnew[p], b_comm);   // v_p /= |v_p|
           if (nrm > RealT(0)) {
             RealT inv = RealT(1) / nrm;
-#pragma omp parallel for if(K > csf_par_threshold)
+#pragma omp parallel for if(_ss_par(8,K))
             for (int i = 0; i < K; i++) HVnew[p][i] *= inv;     // scale Hv identically
           }
         }
