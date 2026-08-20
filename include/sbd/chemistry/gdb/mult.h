@@ -117,6 +117,25 @@ namespace sbd {
 	  size_t thread_id = omp_get_thread_num();
 	  size_t ia_begin = thread_id;
 	  size_t ia_end = idxmap.AdetToDetLen.size();
+	  // SBD_CHECK_TEAM=1: `num_threads` is omp_get_max_threads(), read OUTSIDE
+	  // this region, but the loop below strides by it while indexing by
+	  // omp_get_thread_num(). That partition covers every `ia` if and only if
+	  // the ACTUAL team size equals num_threads. A smaller team silently drops
+	  // whole residue classes of ia -- missing Hamiltonian terms, no error.
+#pragma omp master
+	  if (const char* _e = std::getenv("SBD_CHECK_TEAM")) {
+	    if (_e[0] == '1') {
+	      const int team = omp_get_num_threads();
+	      if (static_cast<size_t>(team) != num_threads) {
+		int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+		std::cerr << " sbd: TEAM GAP in mult: team=" << team
+			  << " but stride num_threads=" << num_threads
+			  << " -> ia classes [" << team << "," << num_threads
+			  << ") are NEVER visited (world rank " << wr << ")"
+			  << std::endl;
+	      }
+	    }
+	  }
 
 	  // alpha-beta excitaiton
 	  for(size_t ia=ia_begin; ia < ia_end; ia+=num_threads) {

@@ -1074,7 +1074,18 @@ namespace sbd {
         const char* e = std::getenv("SBD_SS_SERIAL");
         return e ? std::atoi(e) : 0;
       }();
+      // SBD_SS_SERIAL takes ONE region, which cannot answer "is the defect in any
+      // CSF-space OpenMP region at all". SBD_SS_SERIAL_MASK is a bitmask: bit
+      // (region-1) set => that region runs serial. 255 = all eight serial. If the
+      // failure survives 255 at OMP_NUM_THREADS>=3, no CSF-loop region is the
+      // mechanism and the thread dependence is indirect.
+      const unsigned _ss_serial_mask = [](){
+        if (const char* e = std::getenv("SBD_SS_SERIAL_MASK"))
+          return static_cast<unsigned>(std::strtoul(e, nullptr, 0));
+        return 0u;
+      }();
       auto _ss_par = [&](int region, int k) {
+        if (region >= 1 && (_ss_serial_mask & (1u << (region-1)))) return false;
         return (region != _ss_serial_region) && (k > _csf_par_thr_value());
       };
       const int csf_par_threshold = [](){
@@ -1604,6 +1615,45 @@ namespace sbd {
                   MPI_Allreduce(MPI_IN_PLACE, hi, 5, MPI_DOUBLE, MPI_MAX, h_comm);
                   MPI_Allreduce(MPI_IN_PLACE, lo, 5, MPI_DOUBLE, MPI_MIN, t_comm);
                   MPI_Allreduce(MPI_IN_PLACE, hi, 5, MPI_DOUBLE, MPI_MAX, t_comm);
+                  // ELEMENT-WISE check, in addition to the weighted sums above.
+                  // A weighted sum can cancel: opposite-sign element differences
+                  // sum to zero and the fingerprint reports "clean" for a vector
+                  // that is not. That is exactly the shape of the contradiction
+                  // this is being used to resolve (res diverging while every input
+                  // it is computed from reported clean AND the build loop was
+                  // forced serial -- at most two of those three can be true).
+                  // Reduce the max absolute element-wise spread instead.
+                  {
+                    std::vector<double> el(4*K);
+                    for (int i = 0; i < K; ++i) {
+                      el[i]       = GetReal(res[i]);
+                      el[K+i]     = GetReal(Rp[i]);
+                      el[2*K+i]   = GetReal(v[ib][i]);
+                      el[3*K+i]   = GetReal(Hv[ib][i]);
+                    }
+                    std::vector<double> elo(el), ehi(el);
+                    MPI_Allreduce(MPI_IN_PLACE, elo.data(), 4*K, MPI_DOUBLE, MPI_MIN, h_comm);
+                    MPI_Allreduce(MPI_IN_PLACE, ehi.data(), 4*K, MPI_DOUBLE, MPI_MAX, h_comm);
+                    MPI_Allreduce(MPI_IN_PLACE, elo.data(), 4*K, MPI_DOUBLE, MPI_MIN, t_comm);
+                    MPI_Allreduce(MPI_IN_PLACE, ehi.data(), 4*K, MPI_DOUBLE, MPI_MAX, t_comm);
+                    const char * en[4] = {"EW_res","EW_Ritz","EW_v_ib","EW_Hv_ib"};
+                    for (int f = 0; f < 4; ++f) {
+                      double mx = 0.0, scale = 0.0; int at = -1;
+                      for (int i = 0; i < K; ++i) {
+                        const double d = ehi[f*K+i] - elo[f*K+i];
+                        scale = std::max(scale, std::abs(ehi[f*K+i]));
+                        if (d > mx) { mx = d; at = i; }
+                      }
+                      if (scale <= 0.0) scale = 1.0;
+                      if (mx / scale > 1.0e-13) {
+                        int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+                        std::cerr << " sbd: RITZREP it=" << it << "." << ib
+                                  << " root=" << p << " field=" << en[f]
+                                  << " rel=" << (mx/scale) << " at_csf=" << at
+                                  << " world rank " << wr << std::endl;
+                      }
+                    }
+                  }
                   const char * nm[5] = {"res_raw","Ritz_raw","Ucol","v_all","Hv_all"};
                   for (int j = 0; j < 5; ++j) {
                     const double s = std::max(std::abs(lo[j]), std::abs(hi[j]));
