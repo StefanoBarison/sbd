@@ -335,6 +335,25 @@ namespace sbd {
 	// (-34.76 / -18.51 / -16.88), which unconverged-but-consistent iteration
 	// cannot produce.
 	const size_t ndiag_local = std::min(std::min(wb.size(), hii.size()), twk.size());
+	// SBD_CHECK_NDIAG=1: the min() above SILENTLY TRUNCATES the local diagonal
+	// when twk is shorter than wb -- which happens whenever the ket was rotated in
+	// from a b rank holding fewer determinants (--do_redist_config assigns whole
+	// config orbits and cannot divide exactly; measured 45058 vs 45059 at
+	// b_comm=12). Every skipped i is a missing wb[i] += hii[i]*wk[i] term, i.e. a
+	// missing DIAGONAL element of H. A missing diagonal makes the applied operator
+	// non-symmetric, which is the measured signature (SBD_SS_CHECK_SYM fires on
+	// <v_j,Hv_k> != <v_k,Hv_j>). The min() prevents an out-of-bounds write, but it
+	// is a bounds fix, not a correctness fix.
+	if (std::getenv("SBD_CHECK_NDIAG") != nullptr) {
+	  if (ndiag_local < wb.size() || ndiag_local < hii.size()) {
+	    int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+	    std::cerr << " sbd: NDIAG TRUNCATED wb=" << wb.size()
+		      << " hii=" << hii.size() << " twk=" << twk.size()
+		      << " used=" << ndiag_local
+		      << " MISSING=" << (std::min(wb.size(),hii.size()) - ndiag_local)
+		      << " diagonal terms (world rank " << wr << ")" << std::endl;
+	  }
+	}
 #pragma omp parallel for
 	for(size_t i=0; i < ndiag_local; i++) {
 	  wb[i] += hii[i] * twk[i];

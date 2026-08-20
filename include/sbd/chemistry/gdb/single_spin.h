@@ -1332,6 +1332,66 @@ namespace sbd {
             // same v/Hv, with one reduction each -- so a nonzero result here indicts
             // mult itself, and a zero result here with nonzero Hasym indicts the
             // parallel build or the reduction.
+            // SBD_SS_CHECK_REPEAT=1: call the matvec TWICE on the same input and
+            // compare. mult must be a pure function of its input; if two adjacent
+            // calls on identical data disagree, the defect is inside mult and is a
+            // race or an uninitialised read, not anything about the Davidson basis.
+            // This separates "mult is non-deterministic" from "mult is a consistent
+            // but non-symmetric operator", which the symmetry check alone cannot.
+            // SBD_SS_CHECK_OPSYM=1: test the operator's symmetry on FRESH random
+            // probes, independent of the Davidson basis entirely:
+            //   <x, H y> must equal <y, H x>
+            // Both matvecs are issued back to back on vectors built from a fixed
+            // seed, so a violation cannot be blamed on stale Hv, restart carry, MGS,
+            // or anything the solver did. If this fires, mult applies a
+            // non-symmetric operator, full stop, and the search moves entirely into
+            // how the stored Hamiltonian is built and sharded over h_comm.
+            if (std::getenv("SBD_SS_CHECK_OPSYM") != nullptr && it == 0 && ib == 0) {
+              std::vector<ElemT> x(static_cast<size_t>(K)), y(static_cast<size_t>(K));
+              std::vector<ElemT> Hx(static_cast<size_t>(K)), Hy(static_cast<size_t>(K));
+              // Deterministic, and different on each b rank's slice by construction
+              // (csf_base enters the seed), so the global probe is not symmetric-by-
+              // accident.
+              for (int i = 0; i < K; ++i) {
+                const int g = V.csf_base + i;
+                x[i] = ElemT(std::sin(0.7 * (g + 1)));
+                y[i] = ElemT(std::cos(1.3 * (g + 1)));
+              }
+              matvec(x, Hx);
+              matvec(y, Hy);
+              double xHy = 0.0, yHx = 0.0;
+              for (int i = 0; i < K; ++i) {
+                xHy += GetReal(x[i]) * GetReal(Hy[i]);
+                yHx += GetReal(y[i]) * GetReal(Hx[i]);
+              }
+              _bcomm_sum(&xHy, 1, b_comm);
+              _bcomm_sum(&yHx, 1, b_comm);
+              const double sc = std::max(std::abs(xHy), std::abs(yHx));
+              const double rel = std::abs(xHy - yHx) / (sc > 0 ? sc : 1.0);
+              if (mpi_rank_b == 0 && mpi_rank_h == 0 && mpi_rank_t == 0)
+                std::cerr << " sbdOPSYM <x,Hy>=" << xHy << " <y,Hx>=" << yHx
+                          << " rel=" << rel
+                          << (rel > 1.0e-12 ? "  NON-SYMMETRIC" : "  ok")
+                          << std::endl;
+            }
+            if (std::getenv("SBD_SS_CHECK_REPEAT") != nullptr && ncur > 0) {
+              std::vector<ElemT> a(static_cast<size_t>(K)), b(static_cast<size_t>(K));
+              const int jb = ncur - 1;
+              matvec(v[jb], a);
+              matvec(v[jb], b);
+              double num = 0.0, den = 0.0;
+              for (int i = 0; i < K; ++i) {
+                const double d = GetReal(a[i]) - GetReal(b[i]);
+                num += d*d; den += GetReal(a[i])*GetReal(a[i]);
+              }
+              _bcomm_sum(&num, 1, b_comm);
+              _bcomm_sum(&den, 1, b_comm);
+              const double rel = std::sqrt(num)/(den > 0 ? std::sqrt(den) : 1.0);
+              if (rel > 1.0e-14 && mpi_rank_b == 0 && mpi_rank_h == 0
+                  && mpi_rank_t == 0)
+                std::cerr << " sbdREPEAT it=" << it << "." << ib
+                          << " j=" << jb << " relerr=" << rel << std::endl;
+            }
             if (std::getenv("SBD_SS_CHECK_SYM") != nullptr && ncur > 1) {
               double worst = 0.0; int wj = -1, wk = -1;
               for (int jb = 0; jb < ncur; ++jb)
