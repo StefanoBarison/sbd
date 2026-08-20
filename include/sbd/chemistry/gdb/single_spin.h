@@ -592,6 +592,23 @@ namespace sbd {
 
     // ---- exact projected diagonal (preconditioner) ----------------------------
 
+    /// SBD_SS_SERIAL_BLK=1 forces the BLOCK-parallel loops serial.
+    ///
+    /// These four loops (build_projected_diagonal, project_up, project_down, and
+    /// the approximate-ndiag fallback) parallelize over configuration blocks with a
+    /// plain `if(nblk > N)` clause. They are NOT covered by _ss_par / the
+    /// SBD_SS_SERIAL_MASK region numbering, which only reaches the CSF-index loops.
+    /// So a run with mask=255 still executed all four of these in parallel -- the
+    /// "all CSF regions serial, still wrong" result does not exonerate them.
+    inline bool _ss_serial_blk() {
+      static const bool on = [](){
+        const char* e = std::getenv("SBD_SS_SERIAL_BLK");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+
+
     /**
        Exact diagonal of the projected Hamiltonian, H^csf_cc = sum_{r,r'} V_rc
        V_r'c H_rr', for use as the Davidson preconditioner.
@@ -647,7 +664,8 @@ namespace sbd {
       ndiag.assign(K, RealT(0));
       const long long nblk = static_cast<long long>(V.blocks.size());
 
-#pragma omp parallel for schedule(dynamic) if(nblk > 64)
+      const bool _blkpar0 = (nblk > 64) && !_ss_serial_blk();
+#pragma omp parallel for schedule(dynamic) if(_blkpar0)
       for (long long b = 0; b < nblk; ++b) {
         const ConfigBlock & blk = V.blocks[b];
         const int d = blk.block_dim;
@@ -698,7 +716,8 @@ namespace sbd {
       // Blocks own disjoint det indices (grouped by exact spatial config), so
       // writing x_det[di] across blocks is race-free -> parallelize over blocks.
       const long long nblk = static_cast<long long>(V.blocks.size());
-#pragma omp parallel for schedule(dynamic) if(nblk > 256)
+      const bool _blkpar1 = (nblk > 256) && !_ss_serial_blk();
+#pragma omp parallel for schedule(dynamic) if(_blkpar1)
       for (long long b = 0; b < nblk; ++b) {
         const ConfigBlock & blk = V.blocks[b];
         int off = V.csf_offset[b];
@@ -721,7 +740,8 @@ namespace sbd {
       // Each block writes a disjoint y_csf[off .. off+n_csf) range (csf_offset is
       // unique per block), so parallelizing over blocks is race-free.
       const long long nblk = static_cast<long long>(V.blocks.size());
-#pragma omp parallel for schedule(dynamic) if(nblk > 256)
+      const bool _blkpar2 = (nblk > 256) && !_ss_serial_blk();
+#pragma omp parallel for schedule(dynamic) if(_blkpar2)
       for (long long b = 0; b < nblk; ++b) {
         const ConfigBlock & blk = V.blocks[b];
         int off = V.csf_offset[b];
@@ -966,6 +986,11 @@ namespace sbd {
       }
     }
 
+    /// Local matvec invocation count, for SBD_SS_CHECK_MV. Compared across the
+    /// h/t replicas AFTER the solve -- never inside the matvec, which would add a
+    /// collective to a call the replicas do not make in lockstep.
+    inline long long & _ss_mv_count() { static long long c = 0; return c; }
+
     /// SBD_SS_CHECK_HV=1 verifies mult's output is identical across h_comm.
     inline bool _ss_check_hv() {
       static const bool on = [](){
@@ -1163,7 +1188,8 @@ namespace sbd {
       } else {
         ndiag.assign(K, RealT(0));
         const long long nblk_diag = static_cast<long long>(V.blocks.size());
-#pragma omp parallel for schedule(dynamic) if(nblk_diag > 256)
+      const bool _blkpar3 = (nblk_diag > 256) && !_ss_serial_blk();
+#pragma omp parallel for schedule(dynamic) if(_blkpar3)
         for (long long bidx = 0; bidx < nblk_diag; ++bidx) {
           const ConfigBlock & blk = V.blocks[bidx];
           int off = V.csf_offset[bidx];
@@ -2244,6 +2270,24 @@ namespace sbd {
                   << "  UNACCOUNTED          = " << (tot - acc) << " s (" << pct(tot - acc) << "%)\n";
       }
 
+      // SBD_SS_CHECK_MV=1: did every h/t replica call the matvec the same number
+      // of times? Replicas hold identical data and run identical control flow, so
+      // they must. A mismatch means the solver's iteration count itself is
+      // replica-dependent, which no amount of per-vector checking would show.
+      if (std::getenv("SBD_SS_CHECK_MV") != nullptr) {
+        int hs = 1, ts = 1;
+        MPI_Comm_size(h_comm, &hs); MPI_Comm_size(t_comm, &ts);
+        if (hs > 1 || ts > 1) {
+          long long mine = _ss_mv_count(), lo = mine, hi = mine;
+          MPI_Allreduce(MPI_IN_PLACE, &lo, 1, MPI_LONG_LONG, MPI_MIN, h_comm);
+          MPI_Allreduce(MPI_IN_PLACE, &hi, 1, MPI_LONG_LONG, MPI_MAX, h_comm);
+          MPI_Allreduce(MPI_IN_PLACE, &lo, 1, MPI_LONG_LONG, MPI_MIN, t_comm);
+          MPI_Allreduce(MPI_IN_PLACE, &hi, 1, MPI_LONG_LONG, MPI_MAX, t_comm);
+          int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+          std::cerr << " sbdMVCOUNT mine=" << mine << " span=" << lo << ".." << hi
+                    << (lo == hi ? " SAME" : " DIFFER") << " rank" << wr << std::endl;
+        }
+      }
       Wcsf.resize(nroot);
       Eout.resize(nroot);
       for (int p = 0; p < nroot; p++) { Wcsf[p] = Ritz[p]; Eout[p] = E[p]; }
@@ -2279,6 +2323,18 @@ namespace sbd {
       SSTimers tm;
       auto matvec = [&](const std::vector<ElemT> & xc, std::vector<ElemT> & yc) {
         std::vector<ElemT> xdet, ydet(ndet, ElemT(0.0));
+        // SBD_SS_CHECK_MV=1: count matvec invocations per rank, LOCALLY.
+        //
+        // An earlier version of this probe put an MPI_Allreduce over h_comm inside
+        // the matvec to compare its stages across replicas. That aborted with
+        // MPI_ERR_TRUNCATE before printing anything -- which is itself the finding:
+        // the replicas do NOT call the matvec the same number of times, so any
+        // collective placed here desynchronizes. Counting locally and comparing
+        // once, after the solve, measures that without perturbing it.
+        //
+        // (Note also that SBD_SS_CHECK_HV at :2389 lives in the METHOD-0 solver, so
+        // every --method 1 run reported "clean" from a probe that never ran. Always
+        // confirm an instrument is in the path before trusting its silence.)
         if (!tm.on) {
           project_up(V, xc, xdet, ndet);
           Zero(ydet);
@@ -2356,6 +2412,7 @@ namespace sbd {
       SSTimers tm;
       auto matvec = [&](const std::vector<ElemT> & xc, std::vector<ElemT> & yc) {
         std::vector<ElemT> xdet, ydet(ndet, ElemT(0.0));
+        if (std::getenv("SBD_SS_CHECK_MV") != nullptr) _ss_mv_count()++;
         if (!tm.on) {
           project_up(V, xc, xdet, ndet);
           Zero(ydet);
