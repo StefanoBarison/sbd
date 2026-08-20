@@ -775,6 +775,27 @@ namespace sbd {
     // directly. Accumulate per-thread partial sums into a scratch array and
     // combine serially (thread count is small vs the K-length loop).
 
+    /// SBD_SS_SERIAL_RED=1 forces _local_inner / _local_normalize serial. Their
+    /// OpenMP is internal to the helpers, so it is covered by neither
+    /// SBD_SS_SERIAL_MASK (CSF-index regions) nor SBD_SS_SERIAL_BLK (block loops).
+    /// Value of SBD_SS_SERIAL_RED: 1 = both helpers serial, 2 = _local_inner only,
+    /// 3 = _local_normalize only. Lets the two be separated.
+    inline int _ss_serial_red_mode() {
+      static const int m = [](){
+        const char* e = std::getenv("SBD_SS_SERIAL_RED");
+        return e ? std::atoi(e) : 0;
+      }();
+      return m;
+    }
+    inline bool _ss_serial_red() { const int m = _ss_serial_red_mode(); return m == 1; }
+    inline bool _ss_serial_inner() { const int m = _ss_serial_red_mode(); return m == 1 || m == 2; }
+    inline bool _ss_serial_norm()  { const int m = _ss_serial_red_mode(); return m == 1 || m == 3; }
+    /// mode 4 = serialize only the SUM inside _local_normalize (scaling stays
+    /// threaded); mode 5 = serialize only the SCALING loop. Separates "the norm value
+    /// is not reproducible" from "the division loop is at fault".
+    inline bool _ss_serial_norm_sum()   { const int m = _ss_serial_red_mode(); return m == 1 || m == 3 || m == 4; }
+    inline bool _ss_serial_norm_scale() { const int m = _ss_serial_red_mode(); return m == 1 || m == 3 || m == 5; }
+
     /// Allreduce-sum `n` ElemT values in place over comm. No-op when size == 1,
     /// so b_comm_size == 1 stays bit-identical to the old local-only code.
     /// Uses SBD's own GetMpiType trait (framework/type_def.h) rather than
@@ -821,7 +842,10 @@ namespace sbd {
                        MPI_Comm b_comm) {
       const size_t n = a.size();
       ElemT s = ElemT(0.0);
-      if (n <= 4096) {   // small: parallel overhead not worth it
+      // SBD_SS_SERIAL_RED=1 forces these reduction helpers serial. Their OpenMP is
+      // internal and reached by NEITHER _ss_par/SBD_SS_SERIAL_MASK nor
+      // SBD_SS_SERIAL_BLK, so every "serial" run so far still threaded them.
+      if (n <= 4096 || _ss_serial_inner()) {   // small: parallel overhead not worth it
         for (size_t i = 0; i < n; ++i) s += Conjugate(a[i]) * b[i];
       } else {
         int nth = omp_get_max_threads();
@@ -844,19 +868,68 @@ namespace sbd {
     RealT _local_normalize(std::vector<ElemT> & a, MPI_Comm b_comm) {
       const size_t n = a.size();
       RealT n2 = RealT(0.0);
-      if (n <= 4096) {
+      if (n <= 4096 || _ss_serial_norm_sum()) {
         for (size_t i = 0; i < n; ++i) n2 += GetReal(Conjugate(a[i]) * a[i]);
       } else {
-#pragma omp parallel for reduction(+:n2)
-        for (size_t i = 0; i < n; ++i) n2 += GetReal(Conjugate(a[i]) * a[i]);
+        // Accumulate per-thread partials and fold them in a FIXED order, exactly as
+        // _local_inner does. Do NOT use `reduction(+:n2)` here.
+        //
+        // OpenMP leaves the order in which a reduction combines its partial results
+        // unspecified, so `reduction(+:)` makes this function non-deterministic in its
+        // last bit: two calls on identical data can return norms differing by ~1e-17.
+        // That is normally harmless, but the thick-restart Hv carry depends on it. The
+        // carry's correctness rests on Vnew and HVnew undergoing IDENTICAL operations
+        // (Hv = H v is preserved by linearity only if every scale and subtraction is
+        // mirrored exactly), and Vnew is divided by this norm inside this function
+        // while HVnew is divided by the returned value in a separate loop. A norm that
+        // is not reproducible breaks that mirror a little at every restart; with the
+        // near-degenerate kept Ritz vectors it is then amplified until the Rayleigh
+        // matrix <v_j,Hv_k> is visibly asymmetric and its lowest eigenvalue falls
+        // BELOW the true ground state.
+        //
+        // Measured: with reduction(+:), the parallel and serial sums differ by
+        // 2.08e-17 (678 occurrences in four outer iterations) and 3 of 4 runs at
+        // np=4 b_comm=2 h_comm=2 OMP_NUM_THREADS=3 returned a wrong energy. Folding in
+        // fixed order instead, the same configuration returns
+        // -108.8332670970907 six times out of six, bit-identical.
+        const int nth = omp_get_max_threads();
+        std::vector<RealT> partial(nth, RealT(0.0));
+#pragma omp parallel
+        {
+          const int tid = omp_get_thread_num();
+          RealT loc = RealT(0.0);
+#pragma omp for
+          for (size_t i = 0; i < n; ++i) loc += GetReal(Conjugate(a[i]) * a[i]);
+          partial[tid] = loc;
+        }
+        for (int t = 0; t < nth; ++t) n2 += partial[t];
       }
       // The norm is global: sum the squared partials BEFORE the square root, or
       // each rank would scale its slice by its own local norm and the assembled
       // global vector would not be normalized at all.
       _bcomm_sum(&n2, 1, b_comm);
+      // SBD_SS_CHECK_N2=1: is the pre-reduction local sum the same whether computed
+      // in parallel or serially? The parallel branch uses reduction(+:n2), whose
+      // partial-combination ORDER is unspecified and may vary between calls, so two
+      // calls on identical data can return different last bits. Callers that assume a
+      // reproducible norm -- notably the thick-restart Hv mirror, which divides v by
+      // this value and Hv by it in a separate loop -- then drift apart.
+      if (std::getenv("SBD_SS_CHECK_N2") != nullptr) {
+        RealT ser = RealT(0.0);
+        for (size_t i = 0; i < n; ++i) ser += GetReal(Conjugate(a[i]) * a[i]);
+        RealT ser_g = ser;
+        _bcomm_sum(&ser_g, 1, b_comm);
+        if (ser_g != n2) {
+          int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+          std::cerr << " sbdN2 par=" << n2 << " ser=" << ser_g
+                    << " diff=" << (n2 - ser_g) << " n=" << n
+                    << " rank" << wr << std::endl;
+        }
+      }
       RealT nrm = std::sqrt(n2);
       if (nrm > RealT(0)) {
-#pragma omp parallel for if(n > 4096)
+        const bool _rp = (n > 4096) && !_ss_serial_norm_scale();
+#pragma omp parallel for if(_rp)
         for (size_t i = 0; i < n; ++i) a[i] /= nrm;
       }
       return nrm;
@@ -1338,42 +1411,6 @@ namespace sbd {
             // race or an uninitialised read, not anything about the Davidson basis.
             // This separates "mult is non-deterministic" from "mult is a consistent
             // but non-symmetric operator", which the symmetry check alone cannot.
-            // SBD_SS_CHECK_OPSYM=1: test the operator's symmetry on FRESH random
-            // probes, independent of the Davidson basis entirely:
-            //   <x, H y> must equal <y, H x>
-            // Both matvecs are issued back to back on vectors built from a fixed
-            // seed, so a violation cannot be blamed on stale Hv, restart carry, MGS,
-            // or anything the solver did. If this fires, mult applies a
-            // non-symmetric operator, full stop, and the search moves entirely into
-            // how the stored Hamiltonian is built and sharded over h_comm.
-            if (std::getenv("SBD_SS_CHECK_OPSYM") != nullptr && it == 0 && ib == 0) {
-              std::vector<ElemT> x(static_cast<size_t>(K)), y(static_cast<size_t>(K));
-              std::vector<ElemT> Hx(static_cast<size_t>(K)), Hy(static_cast<size_t>(K));
-              // Deterministic, and different on each b rank's slice by construction
-              // (csf_base enters the seed), so the global probe is not symmetric-by-
-              // accident.
-              for (int i = 0; i < K; ++i) {
-                const int g = V.csf_base + i;
-                x[i] = ElemT(std::sin(0.7 * (g + 1)));
-                y[i] = ElemT(std::cos(1.3 * (g + 1)));
-              }
-              matvec(x, Hx);
-              matvec(y, Hy);
-              double xHy = 0.0, yHx = 0.0;
-              for (int i = 0; i < K; ++i) {
-                xHy += GetReal(x[i]) * GetReal(Hy[i]);
-                yHx += GetReal(y[i]) * GetReal(Hx[i]);
-              }
-              _bcomm_sum(&xHy, 1, b_comm);
-              _bcomm_sum(&yHx, 1, b_comm);
-              const double sc = std::max(std::abs(xHy), std::abs(yHx));
-              const double rel = std::abs(xHy - yHx) / (sc > 0 ? sc : 1.0);
-              if (mpi_rank_b == 0 && mpi_rank_h == 0 && mpi_rank_t == 0)
-                std::cerr << " sbdOPSYM <x,Hy>=" << xHy << " <y,Hx>=" << yHx
-                          << " rel=" << rel
-                          << (rel > 1.0e-12 ? "  NON-SYMMETRIC" : "  ok")
-                          << std::endl;
-            }
             if (std::getenv("SBD_SS_CHECK_REPEAT") != nullptr && ncur > 0) {
               std::vector<ElemT> a(static_cast<size_t>(K)), b(static_cast<size_t>(K));
               const int jb = ncur - 1;
@@ -1412,7 +1449,13 @@ namespace sbd {
                           << " ncur=" << ncur << " worst=" << worst
                           << " at (" << wj << "," << wk << ")" << std::endl;
             }
-            if (std::getenv("SBD_SS_CHECK_PAIR") != nullptr && m > 0) {
+            // SBD_SS_CHECK_PAIR=2 checks EVERY step, not only the carry boundary.
+            // Restricting to m > 0 (=1) kept the cost down but meant the probe never
+            // ran on the steps where SBD_SS_CHECK_SYM actually fires, so "pairing is
+            // exact" and "the operator is non-symmetric" were measured at different
+            // places and only LOOKED contradictory. Use 2 with a small --iteration.
+            if (std::getenv("SBD_SS_CHECK_PAIR") != nullptr
+                && (m > 0 || std::getenv("SBD_SS_CHECK_PAIR")[0] == '2')) {
               std::vector<ElemT> chk(static_cast<size_t>(K));
               for (int jb = 0; jb < ncur; ++jb) {
                 matvec(v[jb], chk);
@@ -2327,6 +2370,22 @@ namespace sbd {
         for (int p = 0; p < keep; p++) {
           for (int q = 0; q < p; q++) {
             ElemT ol = _local_inner(Vnew[q], Vnew[p], b_comm);   // <v_q, v_p>
+            // SBD_SS_CHECK_OL=1: is _local_inner REPRODUCIBLE? Call it again on the
+            // same two vectors and compare bitwise. The threaded version sums
+            // per-thread partials in a fixed order, so it should be -- unless the
+            // team size varies between calls, which would change the partition of the
+            // loop and hence the summation order, giving a different last bit each
+            // time. Serialising the helper fixes the bug 6/6, and tid never overruns,
+            // so an order-dependent sum is what is left.
+            if (std::getenv("SBD_SS_CHECK_OL") != nullptr) {
+              ElemT ol2 = _local_inner(Vnew[q], Vnew[p], b_comm);
+              if (GetReal(ol2) != GetReal(ol) && mpi_rank_b == 0
+                  && mpi_rank_h == 0 && mpi_rank_t == 0)
+                std::cerr << " sbdOL NONREPRODUCIBLE it=" << it
+                          << " p=" << p << " q=" << q
+                          << " diff=" << (GetReal(ol2) - GetReal(ol))
+                          << " val=" << GetReal(ol) << std::endl;
+            }
 #pragma omp parallel for if(_ss_par(7,K))
             for (int i = 0; i < K; i++) {
               Vnew[p][i]  -= Vnew[q][i]  * ol;
@@ -2335,9 +2394,42 @@ namespace sbd {
           }
           RealT nrm = _local_normalize<ElemT,RealT>(Vnew[p], b_comm);   // v_p /= |v_p|
           if (nrm > RealT(0)) {
-            RealT inv = RealT(1) / nrm;
+            // DIVIDE, exactly as _local_normalize does to Vnew[p] -- do not multiply
+            // by a precomputed 1/nrm. `x / nrm` and `x * (1/nrm)` are NOT the same in
+            // floating point: the reciprocal rounds once and the multiply rounds
+            // again, so the two vectors get scaled by factors differing by ~1 ulp.
+            // The Hv carry's whole correctness rests on Vnew and HVnew undergoing
+            // IDENTICAL operations, so a 1-ulp asymmetry here breaks Hv = H v a
+            // little at every restart. It accumulates over restarts and, with the
+            // near-degenerate kept Ritz vectors, is amplified until the Rayleigh
+            // matrix is visibly non-symmetric.
 #pragma omp parallel for if(_ss_par(8,K))
-            for (int i = 0; i < K; i++) HVnew[p][i] *= inv;     // scale Hv identically
+            for (int i = 0; i < K; i++) HVnew[p][i] /= nrm;     // scale Hv identically
+          }
+        }
+        // SBD_SS_CHECK_MIRROR=1: after the restart block, does HVnew[p] still equal
+        // H*Vnew[p]? The whole Hv carry rests on "every operation applied to Vnew is
+        // mirrored onto HVnew, so linearity preserves Hv = H v". Verify it rather
+        // than trust it: recompute the matvec for each kept vector and compare.
+        // A failure here means the carried Hv is stale, the Rayleigh matrix
+        // <v_j,Hv_k> is built from mismatched pairs, and its lowest eigenvalue can
+        // drop below the true ground state -- the measured signature.
+        if (std::getenv("SBD_SS_CHECK_MIRROR") != nullptr) {
+          std::vector<ElemT> chk(static_cast<size_t>(K));
+          for (int p = 0; p < keep; ++p) {
+            matvec(Vnew[p], chk);
+            double num = 0.0, den = 0.0;
+            for (int i = 0; i < K; ++i) {
+              const double d = GetReal(chk[i]) - GetReal(HVnew[p][i]);
+              num += d*d; den += GetReal(chk[i])*GetReal(chk[i]);
+            }
+            _bcomm_sum(&num, 1, b_comm);
+            _bcomm_sum(&den, 1, b_comm);
+            const double rel = std::sqrt(num)/(den > 0 ? std::sqrt(den) : 1.0);
+            if (rel > 1.0e-11 && mpi_rank_b == 0 && mpi_rank_h == 0
+                && mpi_rank_t == 0)
+              std::cerr << " sbdMIRROR it=" << it << " p=" << p
+                        << " of keep=" << keep << " relerr=" << rel << std::endl;
           }
         }
         for (int p = 0; p < keep; p++) { v[p] = Vnew[p]; Hv[p] = HVnew[p]; }
