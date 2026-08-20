@@ -57,14 +57,27 @@ namespace sbd {
 	// tdet = det;
       }
 
-      size_t num_threads = 1;
-      num_threads = omp_get_max_threads();
-      
+      // Pin the team size on the two accumulation regions below with
+      // num_threads(nthr).
+      //
+      // Both regions partition their loop by STRIDE: thread t handles
+      // i = t, t+nthr, t+2*nthr, ... That covers every i only if the team really
+      // has nthr threads. omp_get_max_threads() is the size of the NEXT team, not
+      // a guarantee, and dynamic adjustment is ON by default in libgomp; a smaller
+      // team would leave residue classes [team, nthr) NEVER VISITED, silently
+      // dropping their contributions to the 1- and 2-RDM. The per-thread
+      // accumulators are sized nthr and summed in full afterwards, so unused slots
+      // contribute zeros harmlessly -- it is the missing STRIDE classes that
+      // corrupt the result, with no error and no crash.
+      int nthr = omp_get_max_threads();
+      if( nthr < 1 ) nthr = 1;
+      const size_t num_threads = static_cast<size_t>(nthr);
+
       std::vector<std::vector<std::vector<ElemT>>> onebody_t(num_threads,onebody);
       std::vector<std::vector<std::vector<ElemT>>> twobody_t(num_threads,twobody);
 
       if( mpi_rank_t == 0 ) {
-#pragma omp parallel
+#pragma omp parallel num_threads(nthr)
 	{
 	  size_t thread_id = omp_get_thread_num();
 	  size_t i_start = thread_id;
@@ -80,7 +93,7 @@ namespace sbd {
       }
 
       for(size_t task=0; task < exidx.size(); task++) {
-#pragma omp parallel
+#pragma omp parallel num_threads(nthr)   // stride is nthr; see the note above
 	{
 	  size_t thread_id = omp_get_thread_num();
 	  size_t ia_begin = thread_id;

@@ -58,8 +58,23 @@ namespace sbd {
       // More importantly this value SIZES ih/jh/hij/len, and mult() must address
       // exactly these slices. mult() now derives the count from len[task].size()
       // rather than from its own team size, so the two can no longer disagree.
-      const size_t num_threads =
-        static_cast<size_t>(std::max(1, omp_get_max_threads()));
+      // PIN the team size on the two strided regions below with num_threads(nthr).
+      //
+      // This value both SIZES ih/jh/hij/len and STRIDES the loops that fill them,
+      // and the counting pass (below) must partition identically to the filling
+      // pass (further down) or the slices do not correspond. omp_get_max_threads()
+      // is the size of the NEXT team, not a guarantee; dynamic adjustment is ON by
+      // default in libgomp. With a smaller team, len[task][t] for t >= team is
+      // never assigned (it is set inside the region) and those `ia` residue classes
+      // are never visited -- stored matrix elements silently missing, giving a
+      // variationally too-high energy with no error. num_threads() removes the
+      // possibility rather than relying on the runtime's discretion.
+      //
+      // mult() derives its slice count from len[task].size() rather than from its
+      // own team size, so the two cannot disagree.
+      int nthr = omp_get_max_threads();
+      if( nthr < 1 ) nthr = 1;
+      const size_t num_threads = static_cast<size_t>(nthr);
       hii.resize(det.size());
 
 #pragma omp parallel
@@ -88,7 +103,7 @@ namespace sbd {
 	jh[task].resize(num_threads);
 	hij[task].resize(num_threads);
 	len[task].resize(num_threads);
-#pragma omp parallel
+#pragma omp parallel num_threads(nthr)   // stride is nthr; see note above
 	{
 	  size_t thread_id = omp_get_thread_num();
 	  size_t ia_begin = thread_id;
@@ -221,7 +236,7 @@ namespace sbd {
 	}
 
 	// perform actual matrix memorization
-#pragma omp parallel
+#pragma omp parallel num_threads(nthr)   // stride is nthr; see note above
 	{
 	  size_t thread_id = omp_get_thread_num();
 	  size_t ia_begin = thread_id;

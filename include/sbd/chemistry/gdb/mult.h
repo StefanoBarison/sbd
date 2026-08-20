@@ -84,62 +84,68 @@ namespace sbd {
 	// tdet = det;
       }
 
-      size_t num_threads = omp_get_max_threads();
       if( mpi_rank_t == 0 ) {
-	// Bound on the SMALLEST of the three vectors, not on twk.size().
+	// Local diagonal wb[i] += hii[i]*wk[i]. Index `wk`, the LOCAL ket -- never
+	// `twk`, which is the ket rotated in from a neighbouring b rank.
 	//
-	// This is the local diagonal term wb[i] += hii[i]*wk[i], so all three
-	// must be indexed with the LOCAL determinant count. But twk is the
-	// rotated ket: when exidx[0].slide != 0 it was MpiSlide'd in from a
-	// neighbouring b rank, so twk.size() is the NEIGHBOUR's count. Those
-	// coincide only when every b rank holds equally many determinants.
+	// History, because this line has been wrong twice. It originally indexed
+	// twk and was bounded by twk.size(); --do_redist_config assigns whole
+	// configuration orbits, which need not divide evenly (measured on N2 at
+	// b_comm=12: one rank holds 45058 determinants, the other eleven 45059), so
+	// on the short rank it wrote one element PAST THE END of wb and read past
+	// hii -- silent heap corruption every matvec. Downstream MpiAllreduce(wb)
+	// passes wb.size() as its count, so the short rank disagreed with its
+	// h_comm partner and the run aborted with MPI_ERR_TRUNCATE after diverging.
+	// Symptom trio: E[0] from the Rayleigh solve, <w|H|w>, and the final
+	// expectation value all DIFFERENT (-34.76 / -18.51 / -16.88), which
+	// unconverged-but-consistent iteration cannot produce.
 	//
-	// --do_redist_config assigns whole configuration orbits, which cannot
-	// divide exactly: measured on N2 at b_comm=12, one rank holds 45058
-	// determinants and the other eleven hold 45059. The old bound therefore
-	// wrote one element past the end of wb (and read past hii) on the short
-	// rank -- silent heap corruption every matvec. Downstream,
-	// MpiAllreduce(wb,...) passes wb.size() as its count, so the short rank
-	// disagreed with its h_comm partner and the run aborted with
-	// MPI_ERR_TRUNCATE after diverging. Symptom trio: E[0] from the Rayleigh
-	// solve, <w|H|w>, and the final expectation value all DIFFERENT
-	// (-34.76 / -18.51 / -16.88), which unconverged-but-consistent iteration
-	// cannot produce.
-	const size_t ndiag_local = std::min(std::min(wb.size(), hii.size()), twk.size());
+	// That was then patched to min(wb, hii, twk), which stopped the overrun but
+	// would silently TRUNCATE the diagonal -- dropping real matrix elements for
+	// a variationally too-high energy with no error -- had it ever fired. It
+	// never did: t_comm rank 0 always receives task_begin == 0, hence slide == 0,
+	// hence twk == wk here, for every (b,t) with t <= b. Correct only by
+	// accident, and only while that partition holds.
+	//
+	// So: index `wk` explicitly, and ASSERT the sizes rather than clamping them.
+	// A clamp hides a broken invariant; an assert reports it.
+	if( wk.size() != wb.size() || hii.size() < wb.size() ) {
+	  int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD,&wr);
+	  std::cerr << " sbd: ERROR mult diagonal: size mismatch wb=" << wb.size()
+		    << " wk=" << wk.size() << " hii=" << hii.size()
+		    << " on world rank " << wr << std::endl;
+	  MPI_Abort(MPI_COMM_WORLD,1);
+	}
 #pragma omp parallel for
-	for(size_t i=0; i < ndiag_local; i++) {
-	  wb[i] += hii[i] * twk[i];
+	for(size_t i=0; i < wb.size(); i++) {
+	  wb[i] += hii[i] * wk[i];
 	}
       }
 
       for(size_t task=0; task < exidx.size(); task++) {
 #pragma omp parallel
 	{
+	  // Stride by the ACTUAL team size, read inside the region -- not by the
+	  // omp_get_max_threads() captured outside it.
+	  //
+	  // This is a strided partition: thread t handles ia = t, t+stride,
+	  // t+2*stride, ... It covers every ia if and only if stride equals the real
+	  // team size. omp_get_max_threads() is the size of the NEXT team, not this
+	  // one; if the runtime hands out fewer threads (dynamic adjustment -- on by
+	  // default in libgomp, off in libomp -- or an if() clause, or nesting) then
+	  // residue classes [team, max_threads) are NEVER VISITED and their
+	  // Hamiltonian contributions are silently missing. No crash, just a wrong
+	  // energy. Deriving the stride from omp_get_num_threads() makes the
+	  // partition correct for whatever team is actually granted.
+	  //
+	  // (MpiInitHybrid calls omp_set_dynamic(0), which makes the two agree in
+	  // practice. This does not rely on that: correctness here should not depend
+	  // on a setting made in a different file.)
+	  const size_t stride = static_cast<size_t>(omp_get_num_threads());
 	  size_t thread_id = omp_get_thread_num();
 	  size_t ia_begin = thread_id;
 	  size_t ia_end = idxmap.AdetToDetLen.size();
-	  // SBD_CHECK_TEAM=1: `num_threads` is omp_get_max_threads(), read OUTSIDE
-	  // this region, but the loop below strides by it while indexing by
-	  // omp_get_thread_num(). That partition covers every `ia` if and only if
-	  // the ACTUAL team size equals num_threads. A smaller team silently drops
-	  // whole residue classes of ia -- missing Hamiltonian terms, no error.
-#pragma omp master
-	  if (const char* _e = std::getenv("SBD_CHECK_TEAM")) {
-	    if (_e[0] == '1') {
-	      const int team = omp_get_num_threads();
-	      if (static_cast<size_t>(team) != num_threads) {
-		int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
-		std::cerr << " sbd: TEAM GAP in mult: team=" << team
-			  << " but stride num_threads=" << num_threads
-			  << " -> ia classes [" << team << "," << num_threads
-			  << ") are NEVER visited (world rank " << wr << ")"
-			  << std::endl;
-	      }
-	    }
-	  }
-
-	  // alpha-beta excitaiton
-	  for(size_t ia=ia_begin; ia < ia_end; ia+=num_threads) {
+	  for(size_t ia=ia_begin; ia < ia_end; ia+=stride) {
 	    for(size_t ib=0; ib < idxmap.AdetToDetLen[ia]; ib++) {
 	      size_t iast = ia;
 	      size_t ibst = idxmap.AdetToBdetSM[ia][ib];
@@ -334,29 +340,21 @@ namespace sbd {
 	// solve, <w|H|w>, and the final expectation value all DIFFERENT
 	// (-34.76 / -18.51 / -16.88), which unconverged-but-consistent iteration
 	// cannot produce.
-	const size_t ndiag_local = std::min(std::min(wb.size(), hii.size()), twk.size());
-	// SBD_CHECK_NDIAG=1: the min() above SILENTLY TRUNCATES the local diagonal
-	// when twk is shorter than wb -- which happens whenever the ket was rotated in
-	// from a b rank holding fewer determinants (--do_redist_config assigns whole
-	// config orbits and cannot divide exactly; measured 45058 vs 45059 at
-	// b_comm=12). Every skipped i is a missing wb[i] += hii[i]*wk[i] term, i.e. a
-	// missing DIAGONAL element of H. A missing diagonal makes the applied operator
-	// non-symmetric, which is the measured signature (SBD_SS_CHECK_SYM fires on
-	// <v_j,Hv_k> != <v_k,Hv_j>). The min() prevents an out-of-bounds write, but it
-	// is a bounds fix, not a correctness fix.
-	if (std::getenv("SBD_CHECK_NDIAG") != nullptr) {
-	  if (ndiag_local < wb.size() || ndiag_local < hii.size()) {
-	    int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
-	    std::cerr << " sbd: NDIAG TRUNCATED wb=" << wb.size()
-		      << " hii=" << hii.size() << " twk=" << twk.size()
-		      << " used=" << ndiag_local
-		      << " MISSING=" << (std::min(wb.size(),hii.size()) - ndiag_local)
-		      << " diagonal terms (world rank " << wr << ")" << std::endl;
-	  }
+	// Index `wk` (local ket), not `twk` (rotated). See the matching comment in
+	// the matrix-free overload above: t_comm rank 0 always gets task_begin == 0
+	// hence slide == 0, so twk == wk here -- an accidental invariant that the
+	// old min(wb,hii,twk) clamp was silently relying on. Assert, do not clamp:
+	// a clamp would drop real diagonal terms if the invariant ever broke.
+	if( wk.size() != wb.size() || hii.size() < wb.size() ) {
+	  int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD,&wr);
+	  std::cerr << " sbd: ERROR mult diagonal (stored): size mismatch wb="
+		    << wb.size() << " wk=" << wk.size() << " hii=" << hii.size()
+		    << " on world rank " << wr << std::endl;
+	  MPI_Abort(MPI_COMM_WORLD,1);
 	}
 #pragma omp parallel for
-	for(size_t i=0; i < ndiag_local; i++) {
-	  wb[i] += hii[i] * twk[i];
+	for(size_t i=0; i < wb.size(); i++) {
+	  wb[i] += hii[i] * wk[i];
 	}
       }
 
