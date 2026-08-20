@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <unordered_map>
 
 namespace sbd {
   namespace gdb {
@@ -363,6 +364,33 @@ namespace sbd {
 	// index sets are disjoint across slices (each bra determinant belongs to one
 	// alpha string, qcham.h:91), so the wb writes stay race-free.
 	const size_t nslice = len[task].size();
+	// SBD_CHECK_DISJOINT=1: the `omp parallel for` below is race-free ONLY if the
+	// row index sets ih[task][sl][*] are disjoint across sl. If two slices write
+	// the same row, `wb[ih] += ...` is a read-modify-write race: updates are lost
+	// nondeterministically, the applied operator is no longer symmetric, and the
+	// Rayleigh matrix <v_j,Hv_k> stops matching <v_k,Hv_j>. That is exactly the
+	// observed signature -- Hasym jumps from 1e-14 at OMP<=2 to 4.4e-9 at OMP=3,
+	// then grows geometrically until E falls below the true ground state.
+	// This verifies the assumption instead of trusting the comment.
+	if (std::getenv("SBD_CHECK_DISJOINT") != nullptr) {
+	  std::unordered_map<size_t,size_t> owner;   // row -> first slice that writes it
+	  size_t nshared = 0, worst_row = 0;
+	  for (size_t sl = 0; sl < nslice; sl++)
+	    for (size_t k = 0; k < len[task][sl]; k++) {
+	      const size_t r = ih[task][sl][k];
+	      auto itf = owner.find(r);
+	      if (itf == owner.end()) owner.emplace(r, sl);
+	      else if (itf->second != sl) { ++nshared; worst_row = r; }
+	    }
+	  if (nshared) {
+	    int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD, &wr);
+	    std::cerr << " sbd: ROWS NOT DISJOINT task=" << task
+		      << " nslice=" << nslice << " shared_writes=" << nshared
+		      << " e.g. row " << worst_row
+		      << " -- the parallel wb[ih] += is a RACE (world rank "
+		      << wr << ")" << std::endl;
+	  }
+	}
 #pragma omp parallel for schedule(static)
 	for(size_t sl = 0; sl < nslice; sl++) {
 	  for(size_t k=0; k < len[task][sl]; k++) {

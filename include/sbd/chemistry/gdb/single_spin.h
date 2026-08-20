@@ -1304,6 +1304,76 @@ namespace sbd {
             double _tmv = (tmr && tmr->on) ? _wtime() : 0.0;
             for (int jb = m; jb < ncur; jb++) matvec(v[jb], Hv[jb]);
             if (tmr && tmr->on) tmr->t_mv_outer += _wtime() - _tmv;
+            // SBD_SS_CHECK_PAIR=1: verify Hv[j] really is H*v[j] for EVERY j in the
+            // current basis, by recomputing the matvec and comparing.
+            //
+            // This is the invariant that variational collapse violates. Orthonormality
+            // and Rayleigh symmetry (SBD_SS_DUMP) both held to 1e-15 on runs whose
+            // energy was already wrong, because neither says anything about whether
+            // Hv is PAIRED with the right v. If the thick-restart Hv carry leaves
+            // Hv[j] stale while v[j] has changed, H[j,k] = <v_j, Hv_k> is a Rayleigh
+            // matrix of a different operator, and its lowest eigenvalue can fall
+            // below the true ground state -- which is exactly what the trace shows
+            // (E = -119.20 against a correct -108.83).
+            //
+            // Vectors [0, m) are the ones that SKIPPED the matvec this cycle, so a
+            // failure confined to j < m indicts the carry specifically.
+            // Only at a CARRY boundary (m > 0), i.e. the first cycle after a thick
+            // restart. Recomputing every matvec at every step is ~ncur times the
+            // cost of the solve and does not finish; the carry boundary is where
+            // the trace says the failure is, and it is one step per outer iteration.
+            // SBD_SS_CHECK_SYM=1: is the APPLIED operator symmetric? Compute
+            // <v_j, Hv_k> and <v_k, Hv_j> for the current basis and compare.
+            //
+            // Hasym in SBD_SS_DUMP measures the same thing but only AFTER the
+            // b_comm allreduce and the OpenMP-parallel build loop, so it cannot
+            // separate "mult applied a non-symmetric operator" from "the assembly
+            // of H lost symmetry". This computes both orderings serially, from the
+            // same v/Hv, with one reduction each -- so a nonzero result here indicts
+            // mult itself, and a zero result here with nonzero Hasym indicts the
+            // parallel build or the reduction.
+            if (std::getenv("SBD_SS_CHECK_SYM") != nullptr && ncur > 1) {
+              double worst = 0.0; int wj = -1, wk = -1;
+              for (int jb = 0; jb < ncur; ++jb)
+                for (int kb = jb+1; kb < ncur; ++kb) {
+                  double sjk = 0.0, skj = 0.0;
+                  for (int i = 0; i < K; ++i) {
+                    sjk += GetReal(v[jb][i]) * GetReal(Hv[kb][i]);
+                    skj += GetReal(v[kb][i]) * GetReal(Hv[jb][i]);
+                  }
+                  _bcomm_sum(&sjk, 1, b_comm);
+                  _bcomm_sum(&skj, 1, b_comm);
+                  const double d = std::abs(sjk - skj);
+                  if (d > worst) { worst = d; wj = jb; wk = kb; }
+                }
+              if (worst > 1.0e-11 && mpi_rank_b == 0 && mpi_rank_h == 0
+                  && mpi_rank_t == 0)
+                std::cerr << " sbdSYM it=" << it << "." << ib
+                          << " ncur=" << ncur << " worst=" << worst
+                          << " at (" << wj << "," << wk << ")" << std::endl;
+            }
+            if (std::getenv("SBD_SS_CHECK_PAIR") != nullptr && m > 0) {
+              std::vector<ElemT> chk(static_cast<size_t>(K));
+              for (int jb = 0; jb < ncur; ++jb) {
+                matvec(v[jb], chk);
+                double num = 0.0, den = 0.0;
+                for (int i = 0; i < K; ++i) {
+                  const double d = GetReal(chk[i]) - GetReal(Hv[jb][i]);
+                  num += d*d;
+                  den += GetReal(chk[i]) * GetReal(chk[i]);
+                }
+                _bcomm_sum(&num, 1, b_comm);
+                _bcomm_sum(&den, 1, b_comm);
+                const double rel = std::sqrt(num) / (den > 0 ? std::sqrt(den) : 1.0);
+                if (rel > 1.0e-10 && mpi_rank_b == 0 && mpi_rank_h == 0
+                    && mpi_rank_t == 0) {
+                  std::cerr << " sbdPAIR it=" << it << "." << ib
+                            << " j=" << jb << " of ncur=" << ncur
+                            << " carried=" << (jb < m ? 1 : 0)
+                            << " relerr=" << rel << std::endl;
+                }
+              }
+            }
           }
           m = ncur; ib = ncur - 1;
           nhv_valid = 0;  // consumed; only the first cycle after a restart carries Hv
