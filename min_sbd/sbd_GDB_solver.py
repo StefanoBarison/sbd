@@ -964,6 +964,84 @@ def _deinterleave_det_from_words(
     return alpha, beta
 
 
+def npz_to_pt2_flat(
+    npz_path: str | Path,
+    flat_path: str | Path,
+    e0: float,
+    norb: int,
+    bit_length: int = 20,
+) -> int:
+    """
+    Convert a merged ``experimental_SCIState`` ``.npz`` into the flat binary the
+    ``pt2`` app reads. Returns the number of determinants written.
+
+    The PT2 app deliberately does not link an npy/npz reader: ``.npz`` is a zip of
+    ``.npy`` members, and pulling a C++ implementation of that into a header-only
+    tree would be a new dependency for one file format. Converting here keeps the
+    ``.npz`` as the archival object -- it is the one that survives
+    ``delete_shards=True`` -- while the C++ side reads something trivial.
+
+    Layout (little-endian, matching ``pt2_wf_magic()`` in ``chemistry/gdb/pt2.h``)::
+
+        magic  uint64   0x5342445057463031  ("SBDPWF01")
+        ndet   uint64
+        nword  uint64   words per determinant
+        e0     float64  the variational energy this wavefunction converged to
+        dets   uint64[ndet][nword]
+        amps   float64[ndet]
+
+    ``e0`` is stored because every PT2 denominator depends on it, so carrying it with
+    the amplitudes removes the chance of pairing a wavefunction with the wrong
+    energy. The app cross-checks it against ``--e0`` when both are given and refuses
+    to proceed if they disagree.
+
+    Args:
+        npz_path: the merged archive written by :func:`_write_merged_wavefunction`.
+        flat_path: output path.
+        e0: variational (electronic) energy of this root.
+        norb: number of spatial orbitals.
+        bit_length: MUST match the solve; sets the determinant row width.
+
+    Raises:
+        ValueError: if the archive is missing the expected members, or if its
+            ``norb`` disagrees with the one passed.
+    """
+    import struct
+
+    with np.load(str(npz_path)) as z:
+        missing = [k for k in ("ci_strs_a", "ci_strs_b", "amplitudes") if k not in z]
+        if missing:
+            raise ValueError(f"{npz_path} is missing {missing}; not a merged wavefunction")
+        strs_a = np.asarray(z["ci_strs_a"], dtype=np.uint64)
+        strs_b = np.asarray(z["ci_strs_b"], dtype=np.uint64)
+        amps = np.asarray(z["amplitudes"], dtype=np.float64).ravel()
+        if "norb" in z and int(z["norb"]) != int(norb):
+            raise ValueError(
+                f"{npz_path} was written with norb={int(z['norb'])} but norb={norb} "
+                f"was passed; the determinant bit layout would not match"
+            )
+
+    if not (len(strs_a) == len(strs_b) == len(amps)):
+        raise ValueError(
+            f"paired arrays disagree in length: {len(strs_a)} alpha, {len(strs_b)} "
+            f"beta, {len(amps)} amplitudes"
+        )
+
+    nword = (2 * int(norb) + bit_length - 1) // bit_length
+    ndet = len(amps)
+    words = np.zeros((ndet, nword), dtype=np.uint64)
+    for i, (a, b) in enumerate(zip(strs_a, strs_b)):
+        full = _interleave_det(int(a), int(b), int(norb))
+        for w in range(nword):
+            words[i, w] = (full >> (w * bit_length)) & ((1 << bit_length) - 1)
+
+    with open(flat_path, "wb") as fh:
+        fh.write(struct.pack("<QQQd", 0x5342445057463031, ndet, nword, float(e0)))
+        fh.write(words.astype("<u8").tobytes())
+        fh.write(amps.astype("<f8").tobytes())
+    return ndet
+
+
 def _write_merged_wavefunction(
     out_path: Path,
     savename: str,
