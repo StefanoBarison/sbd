@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <map>
 #include <utility>
+#include <array>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -240,16 +241,48 @@ int main(int argc, char * argv[]) {
     }
   }
 
+  // --------------------------------------------- spin sector, for variant (c)
+  // Sz is a property of the reference list, not a user choice, so it is derived and
+  // cross-checked rather than passed in. derive_common_sz2 is collective on b_comm
+  // and aborts on a mixed-Sz list; every rank of a b_comm shares the same (h,t)
+  // coordinates, so `holds_dets` is uniform across it and the collective is safe.
+  int Sz2 = 0;
   if (opt.variant == sbd::gdb::PT2Variant::SpinPure) {
-    if (mpi_rank == 0) {
-      std::cerr << " sbd: ERROR pt2: --variant c (spin-pure) is not implemented yet."
-                << " Use --variant a." << std::endl;
+    if (holds_dets) {
+      Sz2 = sbd::gdb::derive_common_sz2(det, bit_length, L, b_comm, comm);
     }
-    MPI_Abort(comm, 5);
-    return 5;
+    MPI_Bcast(&Sz2, 1, MPI_INT, 0, h_comm);
+    MPI_Bcast(&Sz2, 1, MPI_INT, 0, t_comm);
+    // A multiplicity that cannot exist at this Sz would give n_up out of range for
+    // every configuration and a silently empty CSF space, i.e. E_PT2 = 0.
+    const int min_mult = std::abs(Sz2) + 1;
+    if (opt.multiplicity < min_mult) {
+      if (mpi_rank == 0) {
+        std::cerr << " sbd: ERROR pt2: --single_spin " << opt.multiplicity
+                  << " is impossible at the reference list's 2*Sz = " << Sz2
+                  << "; the multiplicity must be at least " << min_mult
+                  << " (2S+1 >= |2*Sz|+1)." << std::endl;
+      }
+      MPI_Abort(comm, 5);
+      return 5;
+    }
+    if (((opt.multiplicity - 1) % 2) != (std::abs(Sz2) % 2)) {
+      if (mpi_rank == 0) {
+        std::cerr << " sbd: ERROR pt2: --single_spin " << opt.multiplicity
+                  << " has the wrong parity for 2*Sz = " << Sz2
+                  << "; 2S and 2*Sz must both be even or both odd." << std::endl;
+      }
+      MPI_Abort(comm, 5);
+      return 5;
+    }
+    if (mpi_rank == 0) {
+      std::cout << " " << sbd::make_timestamp() << " pt2: spin-pure variant,"
+                << " multiplicity 2S+1 = " << opt.multiplicity
+                << ", 2*Sz = " << Sz2 << std::endl;
+    }
   }
 
-  // ------------------------------------------------------- variant (a): PT2
+  // ---------------------------------- generation, shared by both variants
   // NO round-robin over references here. `det` is ALREADY this b rank's disjoint
   // slice of the determinant list -- the b_comm partition is the work division. An
   // earlier version strided by b rank on top of that and so visited only 1/b_comm of
@@ -297,7 +330,10 @@ int main(int argc, char * argv[]) {
     }
   }
 
-  // Flatten, drop anything already variational, and accumulate.
+  // Flatten the running accumulation. std::map iterates in ITS key order
+  // (lexicographic over the words), not the canonical less_from_back order that
+  // remove_variational's binary search requires, so the sort below is load-bearing
+  // rather than tidying.
   std::vector<sbd::gdb::PT2Merged<Elem>> all;
   all.reserve(acc.size());
   for (const auto & [d, nh] : acc) {
@@ -310,8 +346,143 @@ int main(int argc, char * argv[]) {
             [](const auto & x, const auto & y) {
               return sbd::less_from_back(x.det, y.det);
             });
-  const size_t n_removed_local = sbd::gdb::remove_variational(all, det);
-  const auto res = sbd::gdb::accumulate_pt2(all, e0, opt.den_floor);
+
+  size_t n_removed_local = 0;
+  // Determinant-level perturber count, kept separately because in variant (c)
+  // res.n_perturbers counts CSFs, not determinants. Reporting the CSF count under a
+  // header that says "unique determinants" is how a mismatch that is fine gets read
+  // as a bug -- it cost a debugging round already.
+  size_t n_dets_pert_local = 0;
+  sbd::gdb::PT2Result res;
+  sbd::gdb::PT2SpinPureStats spst;
+
+  if (opt.variant == sbd::gdb::PT2Variant::Determinant) {
+    n_removed_local = sbd::gdb::remove_variational(all, det);
+    n_dets_pert_local = all.size();
+    res = sbd::gdb::accumulate_pt2(all, e0, opt.den_floor);
+  } else {
+    // ------------------------------------------- variant (c): spin-pure PT2
+    // NOTE the set-difference is NOT applied here. In (a) a variational determinant
+    // is simply not a perturber and is dropped on its own. In (c) the perturber is a
+    // CSF spanning a whole configuration, so a configuration with even ONE
+    // variational row cannot contribute at all -- dropping just that row would leave
+    // a CSF built from a strict subset of its spin-coupling set, which is neither
+    // normalized nor an S^2 eigenvector. group_pt2_configs therefore keeps every row
+    // and the accumulator excludes such configurations as units.
+    std::vector<sbd::gdb::PT2Config<Elem>> cfg;
+    std::vector<bool> row_var;
+    std::vector<size_t> row_off;
+    if (holds_dets) {
+      sbd::gdb::group_pt2_configs<Elem>(all, bit_length, L, nword, Sz2, det, cfg, spst);
+      // Cross-rank exposure specific to (c), checked rather than assumed. A completed
+      // orbit row's x_r is summed over THIS rank's references only, so if one
+      // perturbing configuration is reachable from references on two b ranks, each
+      // rank squares its own partial x_r and the CSF energy is wrong. Unlike (a)'s
+      // per-rank merge (dormant because perturber SETS turn out disjoint), this one
+      // depends on configurations being rank-local, which is what --do_redist_config
+      // provides. Count how many of this rank's perturbing configurations are also
+      // seen by another rank: zero means the property holds for this input.
+      if (b_comm_size > 1) {
+        // A cheap order-independent fingerprint of the configuration set. Summing
+        // per-config hashes over b_comm and comparing against the count of distinct
+        // configs would not localize a collision, so instead each rank hashes its
+        // config list into a fixed number of buckets and the buckets are summed: a
+        // config present on two ranks lands in the same bucket twice.
+        const size_t NB = 1u << 16;
+        std::vector<int> mine(NB, 0);
+        for (const auto & pc : cfg) {
+          size_t hh = 1469598103934665603ULL;
+          for (int v : pc.config) { hh ^= (size_t)(v + 1); hh *= 1099511628211ULL; }
+          mine[hh % NB] = 1;
+        }
+        std::vector<int> tot(NB, 0);
+        MPI_Allreduce(mine.data(), tot.data(), (int)NB, MPI_INT, MPI_SUM, b_comm);
+        size_t shared_buckets = 0;
+        for (size_t k2 = 0; k2 < NB; ++k2) if (tot[k2] > 1) ++shared_buckets;
+        int rb = 0; MPI_Comm_rank(b_comm, &rb);
+        if (rb == 0 && shared_buckets > 0) {
+          std::cout << " sbd: WARNING pt2: " << shared_buckets << " configuration"
+                    << " hash bucket(s) are populated on more than one b rank. If"
+                    << " those are genuinely the same configurations (not hash"
+                    << " collisions), variant (c) is INEXACT at b_comm_size > 1:"
+                    << " a completed orbit row's numerator is summed over one rank's"
+                    << " references only, then squared per rank. Re-run with"
+                    << " --b_comm_size 1 to get the exact value." << std::endl;
+        } else if (rb == 0) {
+          std::cout << " " << sbd::make_timestamp() << " pt2: configuration sets are"
+                    << " disjoint across all " << b_comm_size << " b ranks; the"
+                    << " spin-pure numerators are exact." << std::endl;
+        }
+      }
+      sbd::gdb::complete_pt2_numerators<Elem>(cfg, det, c, bit_length,
+                                              static_cast<size_t>(L),
+                                              I0, I1, I2, row_var, row_off, spst);
+      if (getenv("SBD_PT2_DECOMP")) {
+        // SBD_PT2_DECOMP=1 -- the check that validates (c) as a whole.
+        //
+        // (a) and (c) are evaluated on the SAME configurations and bucketed by orbit
+        // size. Configurations with block_dim == 1 have V = [1], so for them the two
+        // formulas are algebraically identical and the bucket difference must be
+        // exactly zero: that single line exercises the orbit reconstruction, the
+        // row-to-mask mapping, the numerator projection, the h_cc double sum and the
+        // denominator all at once, and any indexing error breaks it. The dim > 1
+        // buckets must then all have E_c > E_a (smaller magnitude), because (c) keeps
+        // only the target-S projection of the orbit's weight while (a) spends all of
+        // it. Measured on N2 top100: dim=1 diff = 0 over 245 configurations, and every
+        // larger bucket positive.
+        //
+        // (a) and (c) restricted to the same configurations, bucketed by block_dim.
+        // For block_dim == 1 the projector is V = [1], so the two MUST agree bit for
+        // bit: any difference there is a defect in the (c) path, not physics.
+        std::map<int, std::array<double,3>> buck;  // dim -> {E_a, E_c, count}
+        const double s2t = 0.25*(double(opt.multiplicity)*opt.multiplicity - 1.0);
+        std::vector<int> sc2(2*L,0), sd2(2*L,0); size_t od2=0;
+        for (size_t k = 0; k < cfg.size(); ++k) {
+          bool skip=false;
+          for (size_t rr=0; rr<cfg[k].rows.size(); ++rr)
+            if (row_var[row_off[k]+rr]) { skip=true; break; }
+          if (skip) continue;
+          const int d = (int)cfg[k].rows.size();
+          int bd=0,nc=0;
+          auto V = sbd::gdb::_canonical_csf_coeffs(cfg[k].n_open,
+                     (cfg[k].n_open+Sz2)/2, s2t, bd, nc);
+          std::vector<double> Hb((size_t)d*d,0.0);
+          for (int a2=0;a2<d;++a2){
+            Hb[(size_t)a2*d+a2]=std::real(std::complex<double>(
+              sbd::ZeroExcite(cfg[k].rows[a2],bit_length,(size_t)L,I0,I1,I2)));
+            for(int b2=a2+1;b2<d;++b2){
+              double h=std::real(std::complex<double>(sbd::Hij(cfg[k].rows[a2],
+                cfg[k].rows[b2],bit_length,(size_t)L,sc2,sd2,I0,I1,I2,od2)));
+              Hb[(size_t)a2*d+b2]=h; Hb[(size_t)b2*d+a2]=h; }
+          }
+          double ea=0.0, ec=0.0;
+          for(int a2=0;a2<d;++a2){
+            double den=e0-Hb[(size_t)a2*d+a2];
+            ea += std::norm(std::complex<double>(cfg[k].x[a2]))/den; }
+          for(int cc2=0;cc2<nc;++cc2){
+            Elem num(0.0); double hcc=0.0;
+            for(int a2=0;a2<d;++a2) num += (Elem)V[(size_t)a2*nc+cc2]*cfg[k].x[a2];
+            for(int a2=0;a2<d;++a2) for(int b2=0;b2<d;++b2)
+              hcc += V[(size_t)a2*nc+cc2]*V[(size_t)b2*nc+cc2]*Hb[(size_t)a2*d+b2];
+            ec += std::norm(std::complex<double>(num))/(e0-hcc); }
+          auto & B=buck[d]; B[0]+=ea; B[1]+=ec; B[2]+=1.0;
+        }
+        for (const auto & kv : buck)
+          std::cerr << " DECOMP dim=" << kv.first << " nconf=" << (long)kv.second[2]
+                    << " E_a=" << std::setprecision(12) << kv.second[0]
+                    << " E_c=" << kv.second[1]
+                    << " diff=" << (kv.second[1]-kv.second[0]) << std::endl;
+      }
+      res = sbd::gdb::accumulate_pt2_spinpure<Elem>(cfg, row_var, row_off, e0,
+                                                    opt.den_floor, opt.multiplicity,
+                                                    Sz2, bit_length,
+                                                    static_cast<size_t>(L),
+                                                    I0, I1, I2, spst);
+    }
+    n_removed_local = spst.n_rows_variational;
+    n_dets_pert_local = all.size();
+    all.clear();
+  }
 
   // Reduce over b_comm only: h/t ranks are replicas of the same determinant slice, so
   // including them would multiply every count and every energy by the replica factor.
@@ -321,7 +492,7 @@ int main(int argc, char * argv[]) {
   const double e_c   = holds_dets ? res.energy : 0.0;
   const double p_c   = holds_dets ? res.psi1_norm2 : 0.0;
   const double w_c   = holds_dets ? res.worst_ratio : 0.0;
-  const size_t np_c  = holds_dets ? res.n_perturbers : 0;
+  const size_t np_c  = holds_dets ? n_dets_pert_local : 0;
   const size_t nf_c  = holds_dets ? res.n_floored : 0;
   const size_t nr_c  = holds_dets ? n_refs_local : 0;
   const size_t ne_c  = holds_dets ? n_emitted_local : 0;
@@ -336,6 +507,26 @@ int main(int argc, char * argv[]) {
   MPI_Allreduce(&nrm_c, &n_removed, 1, SBD_MPI_SIZE_T,  MPI_SUM, b_comm);
   MPI_Bcast(&e_pt2, 1, MPI_DOUBLE, 0, h_comm);
   MPI_Bcast(&e_pt2, 1, MPI_DOUBLE, 0, t_comm);
+
+  // Variant (c) counters, reduced over b_comm on the same footing as the energy.
+  // Every one of these is here because it distinguishes a specific way (c) can be
+  // wrong from a way it can be right: rows_completed == 0 would mean the completion
+  // step never fired and (c) silently degenerated to a reweighted (a);
+  // configs_no_target_s accounts for the part of (a)'s perturber space that (c)
+  // legitimately discards; rows_variational accounts for the rest.
+  size_t sp[7] = {0, 0, 0, 0, 0, 0, 0};
+  if (opt.variant == sbd::gdb::PT2Variant::SpinPure) {
+    const size_t sc[7] = {
+      holds_dets ? spst.n_configs : 0,
+      holds_dets ? spst.n_configs_no_target_s : 0,
+      holds_dets ? spst.n_rows_total : 0,
+      holds_dets ? spst.n_rows_from_generator : 0,
+      holds_dets ? spst.n_rows_completed : 0,
+      holds_dets ? spst.n_configs_partly_variational : 0,
+      holds_dets ? spst.n_csf : 0,
+    };
+    MPI_Allreduce(sc, sp, 7, SBD_MPI_SIZE_T, MPI_SUM, b_comm);
+  }
 
   // A REMAINING GAP, dormant on the cases tested so far but real. Perturbers are
   // merged within each b rank, not across them, so a perturber reached from
@@ -356,11 +547,29 @@ int main(int argc, char * argv[]) {
   if (mpi_rank == 0) {
     const double t = MPI_Wtime() - t_pt2_start;
     std::cout << " " << sbd::make_timestamp() << " pt2: references=" << n_refs
-              << " emitted=" << n_emitted << " unique=" << n_pert
+              << " emitted=" << n_emitted << " unique_dets=" << n_pert
               << " removed_variational=" << n_removed
               << " floored=" << n_floored
               << " [" << std::fixed << std::setprecision(2) << t << " s]"
               << std::endl;
+    if (opt.variant == sbd::gdb::PT2Variant::SpinPure) {
+      std::cout << " " << sbd::make_timestamp() << " pt2: configs=" << sp[0]
+                << " (no_target_S=" << sp[1]
+                << ", partly_variational=" << sp[5] << ")"
+                << " orbit_rows=" << sp[2]
+                << " (emitted=" << sp[3] << ", completed=" << sp[4] << ")"
+                << " csfs=" << sp[6]
+                << " [complete " << std::fixed << std::setprecision(2) << spst.t_complete
+                << " s, numerators " << spst.t_numerators
+                << " s, denominators " << spst.t_denominators << " s]"
+                << std::defaultfloat << std::endl;
+      if (sp[2] > 0 && sp[4] == 0) {
+        std::cout << " sbd: WARNING pt2: no orbit row needed completion. Every"
+                  << " perturbing configuration was emitted whole, which is possible"
+                  << " but unusual; if it holds at every epsilon2 the completion step"
+                  << " is not running." << std::endl;
+      }
+    }
     std::cout << std::defaultfloat
               << " sbd: pt2 variant   = " << sbd::gdb::pt2_variant_name(opt.variant)
               << "\n sbd: pt2 epsilon2  = " << opt.epsilon2
@@ -384,6 +593,18 @@ int main(int argc, char * argv[]) {
       std::cout << " sbd: WARNING pt2: largest first-order coefficient is " << worst
                 << "; perturbation theory is not reliable when a perturber mixes"
                 << " that strongly -- it belongs in the variational space."
+                << std::endl;
+    }
+    if (opt.variant == sbd::gdb::PT2Variant::Determinant) {
+      std::cout << " sbd: NOTE pt2: variant (a) sums over DETERMINANT perturbers, whose"
+                << " space spans every spin. E_PT2 is therefore not a target-S"
+                << " quantity and E_var + E_PT2 must not be quoted as a single-spin"
+                << " energy -- use --variant c for that." << std::endl;
+    } else {
+      std::cout << " sbd: NOTE pt2: variant (c) sums over target-S CSF perturbers, one"
+                << " denominator <CSF|H|CSF> per CSF, so E_var + E_PT2 is a"
+                << " single-spin energy. It is expected to differ from variant (a):"
+                << " (a) also counts perturbers with no target-S component."
                 << std::endl;
     }
     if (b_comm_size > 1) {

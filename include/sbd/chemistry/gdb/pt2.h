@@ -682,6 +682,404 @@ namespace sbd {
       return r;
     }
 
+
+    // ======================================================================
+    // Variant (c): configuration-driven spin-pure PT2
+    // ======================================================================
+    //
+    // WHY THIS IS NOT A COSMETIC VARIANT OF (a)
+    // -----------------------------------------
+    // Write a perturbing configuration's Sz-orbit as determinants r = 1..d. Variant
+    // (a) treats each r as an independent perturber:
+    //
+    //     E_a = sum_r |x_r|^2 / (E_0 - H_rr),     x_r = sum_i H_ri c_i .        (2)
+    //
+    // The d determinants of one spin-coupled configuration have DIFFERENT H_rr, so
+    // (2) weights them by d different denominators. The resulting first-order vector
+    // is therefore NOT a combination of target-S CSFs even when Psi_0 is perfectly
+    // spin-pure: the relative weights inside the orbit are set by the denominators,
+    // not by the spin coupling. That contamination is a property of Epstein-Nesbet
+    // PT2 in a determinant basis and does not shrink as epsilon2 -> 0.
+    //
+    // Variant (c) resolves the orbit into its target-S CSFs first,
+    //
+    //     E_c = sum_c |num_c|^2 / (E_0 - h_cc),                                 (3)
+    //     num_c = sum_r V_rc x_r ,     h_cc = sum_{r,r'} V_rc V_r'c H_{r r'} ,
+    //
+    // one denominator per CSF, so every term of (3) is a target-S state and the sum
+    // may be added to a single-spin variational energy. Two consequences worth
+    // stating because each is a way to get (3) wrong:
+    //
+    //   * h_cc needs the FULL intra-block double sum, r != r' included. Using only
+    //     the diagonal r == r' is the identical mistake that once made the projected
+    //     Davidson preconditioner drop intra-configuration exchange and converge to
+    //     the right spin at a too-high energy.
+    //
+    //   * num_c needs x_r for EVERY row r of the completed orbit, not just the rows
+    //     the generator emitted. A row whose |H_ri c_i| fell under the threshold, or
+    //     which no reference reaches at all, still enters num_c through its V_rc, and
+    //     silently treating it as zero would truncate the projection. So the orbit is
+    //     completed and the missing rows' x_r are computed explicitly against the
+    //     reference list. This is the perturber-space analogue of the variational
+    //     requirement that a configuration be spin-complete, and it is why (c) is
+    //     driven by configurations rather than by determinants.
+    //
+    // Configurations that carry no target-S CSF (n_csf == 0, e.g. a closed-shell
+    // config when the target is a triplet) drop out of (3) entirely -- correctly:
+    // they have no target-S component to perturb into. Their weight is what (a)
+    // counts and (c) does not, and it is reported as `n_configs_no_target_s` so the
+    // difference between the two variants is accountable rather than mysterious.
+
+    /// A perturbing spatial configuration: its per-orbital occupation pattern, the
+    /// completed Sz-orbit determinants, and the numerators x_r accumulated so far.
+    template <typename ElemT>
+    struct PT2Config {
+      std::vector<int> config;                       ///< per-orbital 0/1/2, the key
+      std::vector<std::vector<size_t>> rows;         ///< the block_dim orbit determinants
+      std::vector<ElemT> x;                          ///< x_r = sum_i H_ri c_i, per row
+      std::vector<bool> x_from_generator;            ///< row was emitted (else x_r computed later)
+      int n_open = 0;
+    };
+
+    /// Report for the spin-pure accumulation, so the (a)-vs-(c) difference is
+    /// accountable and the completion cost is visible instead of inferred.
+    struct PT2SpinPureStats {
+      size_t n_configs = 0;              ///< distinct perturbing configurations
+      size_t n_configs_no_target_s = 0;  ///< dropped: no target-S CSF at all
+      size_t n_rows_total = 0;           ///< completed orbit determinants
+      size_t n_rows_from_generator = 0;  ///< of those, ones the generator emitted
+      size_t n_rows_completed = 0;       ///< of those, ones added by completion
+      size_t n_rows_variational = 0;     ///< orbit rows that are in the variational space
+      size_t n_configs_partly_variational = 0; ///< configs with >=1 such row
+      size_t n_csf = 0;                  ///< target-S CSFs summed over configs
+      double t_complete = 0.0;           ///< seconds spent completing orbits
+      double t_numerators = 0.0;         ///< seconds spent on the missing-row x_r
+      double t_denominators = 0.0;       ///< seconds spent on the h_cc double sums
+    };
+
+    /// Rebuild the determinant of one spin arrangement of a configuration.
+    ///
+    /// `config` is per-orbital 0/1/2 and `mask` says, for each singly-occupied
+    /// orbital in ascending order, whether it holds alpha (bit set) or beta. This is
+    /// the exact inverse of _det_config(), which is what makes the row order here
+    /// agree with the row order of the canonical S^2 eigenvectors: both index
+    /// arrangements by the same ascending-orbital slot convention.
+    inline void _det_from_config(const std::vector<int> & config,
+                                 unsigned long long mask,
+                                 size_t bit_length, size_t nword,
+                                 std::vector<size_t> & out) {
+      out.assign(nword, 0);
+      const int norb = static_cast<int>(config.size());
+      int slot = 0;
+      for (int p = 0; p < norb; ++p) {
+        if (config[p] == 2) {
+          sbd::setocc(out, bit_length, 2 * p,     true);
+          sbd::setocc(out, bit_length, 2 * p + 1, true);
+        } else if (config[p] == 1) {
+          const bool alpha = ((mask >> slot) & 1ULL) != 0ULL;
+          sbd::setocc(out, bit_length, alpha ? (2 * p) : (2 * p + 1), true);
+          ++slot;
+        }
+      }
+    }
+
+    /// Group emitted perturbers by spatial configuration and complete each orbit.
+    ///
+    /// Input `pert` is the merged determinant-level list (numerators already summed
+    /// over references, variational determinants NOT yet removed -- see below).
+    /// Output is one PT2Config per distinct configuration, with `rows` holding ALL
+    /// C(n_open, n_up) arrangements in canonical mask order and `x` holding the
+    /// generator's numerator where there was one and 0 where the row must still be
+    /// filled in.
+    ///
+    /// Variational rows are kept in the orbit and flagged, not dropped: a CSF spans
+    /// its whole configuration, so if part of an orbit is variational the CSF is not
+    /// a legitimate perturber at all and the config must be excluded as a unit. That
+    /// is decided in the accumulator, which is why the set-difference is NOT applied
+    /// to the input here.
+    template <typename ElemT, typename DetsContainer>
+    void group_pt2_configs(const std::vector<PT2Merged<ElemT>> & pert,
+                           size_t bit_length, int norb, size_t nword,
+                           int Sz2,
+                           const DetsContainer & det,
+                           std::vector<PT2Config<ElemT>> & out,
+                           PT2SpinPureStats & st) {
+      out.clear();
+      if (pert.empty()) return;
+
+      // Bucket the emitted perturbers by configuration, remembering each one's
+      // arrangement mask so it can be placed on the right orbit row.
+      std::map<std::vector<int>, std::vector<std::pair<unsigned long long, ElemT>>> by_config;
+      {
+        std::vector<int> config, open_slots;
+        for (const auto & p : pert) {
+          const unsigned long long m =
+              _det_config(p.det, bit_length, norb, config, open_slots);
+          by_config[config].push_back({m, p.num});
+        }
+      }
+
+      const double t0 = MPI_Wtime();
+      out.reserve(by_config.size());
+      for (const auto & kv : by_config) {
+        const std::vector<int> & config = kv.first;
+        int n_open = 0;
+        for (int cc : config) if (cc == 1) ++n_open;
+        const int n_up = (n_open + Sz2) / 2;
+        if (((n_open + Sz2) % 2) != 0 || n_up < 0 || n_up > n_open) {
+          // Wrong open-shell parity for this Sz. The generator preserves Sz exactly
+          // (every excitation copies the annihilated spin), so this cannot happen for
+          // perturbers of a single-Sz reference list; it is checked rather than
+          // assumed because a truncating division would make n_up silently wrong.
+          std::cerr << " sbd: ERROR pt2: a perturbing configuration has " << n_open
+                    << " open shells, incompatible with 2*Sz = " << Sz2
+                    << ". The generator preserves Sz, so this indicates the reference"
+                    << " list is not a single Sz sector." << std::endl;
+          MPI_Abort(MPI_COMM_WORLD, 6);
+        }
+
+        const auto arrangements = _open_shell_arrangements(n_open, n_up);
+        const size_t d = arrangements.size();
+        std::map<unsigned long long, size_t> mask_to_row;
+        for (size_t r = 0; r < d; ++r) mask_to_row[arrangements[r]] = r;
+
+        PT2Config<ElemT> pc;
+        pc.config = config;
+        pc.n_open = n_open;
+        pc.rows.resize(d);
+        pc.x.assign(d, ElemT(0.0));
+        pc.x_from_generator.assign(d, false);
+
+        for (size_t r = 0; r < d; ++r)
+          _det_from_config(config, arrangements[r], bit_length, nword, pc.rows[r]);
+
+        for (const auto & mn : kv.second) {
+          auto it = mask_to_row.find(mn.first);
+          if (it == mask_to_row.end()) {
+            std::cerr << " sbd: ERROR pt2: a perturber's spin arrangement is not in"
+                      << " its own configuration's Sz orbit. _det_config and"
+                      << " _open_shell_arrangements disagree on slot order."
+                      << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 6);
+          }
+          // Emitted perturbers were already merged, so one row gets at most one entry.
+          pc.x[it->second] = mn.second;
+          pc.x_from_generator[it->second] = true;
+        }
+
+        st.n_rows_total += d;
+        for (size_t r = 0; r < d; ++r) {
+          if (pc.x_from_generator[r]) ++st.n_rows_from_generator;
+          else                        ++st.n_rows_completed;
+        }
+        out.push_back(std::move(pc));
+      }
+      st.n_configs = out.size();
+      st.t_complete += MPI_Wtime() - t0;
+    }
+
+    /// Fill in x_r for the orbit rows the generator did not emit, and mark which
+    /// rows are variational.
+    ///
+    /// A completed row is a determinant nobody reached above threshold, so its x_r is
+    /// small -- but it is not zero, and it enters num_c with weight V_rc. Computing it
+    /// means H_ri against every LOCAL reference i; the reference list is this b rank's
+    /// slice, so the result is this rank's share of x_r, consistent with how (a)
+    /// accumulates. Rows that ARE in the variational space are flagged here so the
+    /// accumulator can drop their whole configuration.
+    template <typename ElemT, typename DetsContainer>
+    void complete_pt2_numerators(std::vector<PT2Config<ElemT>> & cfg,
+                                 const DetsContainer & det,
+                                 const std::vector<ElemT> & c,
+                                 size_t bit_length, size_t L,
+                                 const ElemT & I0,
+                                 const oneInt<ElemT> & I1,
+                                 const twoInt<ElemT> & I2,
+                                 std::vector<bool> & row_variational_flat,
+                                 std::vector<size_t> & row_offset,
+                                 PT2SpinPureStats & st) {
+      const double t0 = MPI_Wtime();
+      const int nso = static_cast<int>(2 * L);
+
+      row_offset.assign(cfg.size() + 1, 0);
+      for (size_t k = 0; k < cfg.size(); ++k)
+        row_offset[k + 1] = row_offset[k] + cfg[k].rows.size();
+      row_variational_flat.assign(row_offset.back(), false);
+
+      auto cmp = [](const auto & x, const auto & y) { return sbd::less_from_back(x, y); };
+
+      // Rows already in the variational space: a binary search per row against the
+      // canonically-ordered `det`.
+      for (size_t k = 0; k < cfg.size(); ++k) {
+        bool any = false;
+        for (size_t r = 0; r < cfg[k].rows.size(); ++r) {
+          auto it = std::lower_bound(det.begin(), det.end(), cfg[k].rows[r], cmp);
+          bool present = false;
+          if (it != det.end()) {
+            const std::vector<size_t> found = *it;
+            present = (found == cfg[k].rows[r]);
+          }
+          if (present) {
+            row_variational_flat[row_offset[k] + r] = true;
+            ++st.n_rows_variational;
+            any = true;
+          }
+        }
+        if (any) ++st.n_configs_partly_variational;
+      }
+
+      // x_r for the rows the generator skipped. Threaded over configurations, with
+      // per-thread Hij scratch: the loop body writes only into its own cfg[k], so
+      // there is no reduction and therefore no order-dependent summation -- the
+      // failure mode that produced the b_comm bug in the solver.
+      #pragma omp parallel
+      {
+        std::vector<int> sc(nso, 0), sd(nso, 0);
+        size_t orbDiff = 0;
+        #pragma omp for schedule(dynamic, 1)
+        for (size_t k = 0; k < cfg.size(); ++k) {
+          for (size_t r = 0; r < cfg[k].rows.size(); ++r) {
+            if (cfg[k].x_from_generator[r]) continue;
+            if (row_variational_flat[row_offset[k] + r]) continue;  // config will be dropped
+            ElemT acc(0.0);
+            for (size_t i = 0; i < det.size(); ++i) {
+              const double ac = std::abs(std::complex<double>(c[i]));
+              if (ac == 0.0) continue;
+              const std::vector<size_t> ref = det[i];
+              const ElemT h = sbd::Hij(ref, cfg[k].rows[r], bit_length, L, sc, sd,
+                                       I0, I1, I2, orbDiff);
+              if (h == ElemT(0.0)) continue;
+              acc += h * c[i];
+            }
+            cfg[k].x[r] = acc;
+          }
+        }
+      }
+      st.t_numerators += MPI_Wtime() - t0;
+    }
+
+    /// Sum (3) over the target-S CSFs of every perturbing configuration.
+    ///
+    /// A configuration with any variational row is skipped WHOLE: its CSFs overlap
+    /// the variational space, so they are not perturbers, and keeping the rest of the
+    /// orbit would give a CSF that is not an S^2 eigenvector. This is stricter than
+    /// (a)'s per-determinant set-difference, and necessarily so -- the perturber index
+    /// is the CSF, not the determinant.
+    template <typename ElemT>
+    PT2Result accumulate_pt2_spinpure(const std::vector<PT2Config<ElemT>> & cfg,
+                                      const std::vector<bool> & row_variational_flat,
+                                      const std::vector<size_t> & row_offset,
+                                      double e0, double den_floor,
+                                      int multiplicity, int Sz2,
+                                      size_t bit_length, size_t L,
+                                      const ElemT & I0,
+                                      const oneInt<ElemT> & I1,
+                                      const twoInt<ElemT> & I2,
+                                      PT2SpinPureStats & st) {
+      PT2Result r;
+      const double s2_target = 0.25 * (static_cast<double>(multiplicity) * multiplicity - 1.0);
+      const int nso = static_cast<int>(2 * L);
+      const double t0 = MPI_Wtime();
+
+      // The S^2 eigenvectors depend only on (n_open, n_up), not on which orbitals are
+      // open -- the spin-coupling matrix is orbital-independent. So one cache serves
+      // every configuration with the same open-shell count, which is what makes
+      // completing many perturber configurations affordable. Same reasoning, and same
+      // helper, as the variational projector: _canonical_csf_coeffs is called here
+      // too, so the two cannot drift apart.
+      std::map<int, std::vector<double>> coeff_cache;
+      std::map<int, std::pair<int, int>> dim_cache;   // n_open -> (block_dim, n_csf)
+
+      std::vector<int> sc(nso, 0), sd(nso, 0);
+      size_t orbDiff = 0;
+
+      for (size_t k = 0; k < cfg.size(); ++k) {
+        const auto & pc = cfg[k];
+        bool skip = false;
+        for (size_t rr = 0; rr < pc.rows.size(); ++rr)
+          if (row_variational_flat[row_offset[k] + rr]) { skip = true; break; }
+        if (skip) continue;
+
+        const int n_open = pc.n_open;
+        const int n_up = (n_open + Sz2) / 2;
+        if (coeff_cache.find(n_open) == coeff_cache.end()) {
+          int bd = 0, nc = 0;
+          coeff_cache[n_open] = _canonical_csf_coeffs(n_open, n_up, s2_target, bd, nc);
+          dim_cache[n_open] = {bd, nc};
+        }
+        const int block_dim = dim_cache[n_open].first;
+        const int n_csf     = dim_cache[n_open].second;
+        if (n_csf == 0) {
+          // No target-S component: this configuration cannot be perturbed into by a
+          // target-S wavefunction, so it contributes nothing. Variant (a) DOES count
+          // its determinants, and that is a real part of the (a)-(c) difference.
+          ++st.n_configs_no_target_s;
+          continue;
+        }
+        if (block_dim != static_cast<int>(pc.rows.size())) {
+          std::cerr << " sbd: ERROR pt2: orbit size " << pc.rows.size()
+                    << " does not match the canonical block dimension " << block_dim
+                    << " for n_open = " << n_open << "." << std::endl;
+          MPI_Abort(MPI_COMM_WORLD, 6);
+        }
+        const std::vector<double> & V = coeff_cache[n_open];   // (block_dim x n_csf)
+
+        // H over the orbit. Symmetric, so only the upper triangle is evaluated; the
+        // diagonal comes from ZeroExcite and the off-diagonals from Hij. This is the
+        // dominant cost of (c) at large n_open, and it is why the block is built once
+        // per configuration and reused for all its CSFs.
+        std::vector<double> Hblk(static_cast<size_t>(block_dim) * block_dim, 0.0);
+        for (int a = 0; a < block_dim; ++a) {
+          Hblk[static_cast<size_t>(a) * block_dim + a] = static_cast<double>(std::real(
+              std::complex<double>(sbd::ZeroExcite(pc.rows[a], bit_length, L, I0, I1, I2))));
+          for (int b = a + 1; b < block_dim; ++b) {
+            const double h = static_cast<double>(std::real(std::complex<double>(
+                sbd::Hij(pc.rows[a], pc.rows[b], bit_length, L, sc, sd,
+                         I0, I1, I2, orbDiff))));
+            Hblk[static_cast<size_t>(a) * block_dim + b] = h;
+            Hblk[static_cast<size_t>(b) * block_dim + a] = h;
+          }
+        }
+
+        for (int cc = 0; cc < n_csf; ++cc) {
+          // num_c = sum_r V_rc x_r
+          ElemT num(0.0);
+          for (int a = 0; a < block_dim; ++a)
+            num += static_cast<ElemT>(V[static_cast<size_t>(a) * n_csf + cc]) * pc.x[a];
+
+          // h_cc = sum_{a,b} V_ac V_bc H_ab -- the FULL double sum. Dropping b != a
+          // is the same error that made the projected preconditioner lose
+          // intra-configuration exchange.
+          double hcc = 0.0;
+          for (int a = 0; a < block_dim; ++a) {
+            const double va = V[static_cast<size_t>(a) * n_csf + cc];
+            if (va == 0.0) continue;
+            for (int b = 0; b < block_dim; ++b) {
+              const double vb = V[static_cast<size_t>(b) * n_csf + cc];
+              if (vb == 0.0) continue;
+              hcc += va * vb * Hblk[static_cast<size_t>(a) * block_dim + b];
+            }
+          }
+
+          double den = e0 - hcc;
+          const double ad = std::abs(den);
+          if (ad < den_floor) {
+            den = (den < 0.0) ? -den_floor : den_floor;
+            r.n_floored += 1;
+          }
+          const double n2 = std::norm(std::complex<double>(num));
+          r.energy += n2 / den;
+          const double coef = std::sqrt(n2) / std::abs(den);
+          r.psi1_norm2 += coef * coef;
+          r.worst_ratio = std::max(r.worst_ratio, coef);
+          r.n_perturbers += 1;
+          st.n_csf += 1;
+        }
+      }
+      st.t_denominators += MPI_Wtime() - t0;
+      return r;
+    }
+
   } // namespace gdb
 
 } // namespace sbd
