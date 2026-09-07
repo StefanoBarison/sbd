@@ -11,8 +11,11 @@
   cannot destabilise a production run, and epsilon2 can be re-swept without
   redoing the solve.
 */
+#include <algorithm>
 #include <complex>
 #include <iomanip>
+#include <map>
+#include <utility>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -237,13 +240,160 @@ int main(int argc, char * argv[]) {
     }
   }
 
-  // Perturber generation and the energy accumulation follow. Deliberately not
-  // stubbed with a fake number: an app that prints a plausible-looking energy
-  // before the physics exists is how a wrong result gets trusted.
+  if (opt.variant == sbd::gdb::PT2Variant::SpinPure) {
+    if (mpi_rank == 0) {
+      std::cerr << " sbd: ERROR pt2: --variant c (spin-pure) is not implemented yet."
+                << " Use --variant a." << std::endl;
+    }
+    MPI_Abort(comm, 5);
+    return 5;
+  }
+
+  // ------------------------------------------------------- variant (a): PT2
+  // NO round-robin over references here. `det` is ALREADY this b rank's disjoint
+  // slice of the determinant list -- the b_comm partition is the work division. An
+  // earlier version strided by b rank on top of that and so visited only 1/b_comm of
+  // an already-partitioned list: 196 references of 391 at b_comm=2, 98 at b_comm=4,
+  // and an E_PT2 wrong by 37%. (Dice strides because its reference list is replicated
+  // in shared memory on every rank, which is the opposite situation.)
+  //
+  // Batching bounds memory: the perturber space is far larger than the variational
+  // one, so a batch is merged and reduced to scalars before the next is generated,
+  // and the full list never exists at once. Merging per batch also means duplicates
+  // WITHIN a batch are combined early; duplicates ACROSS batches are handled by
+  // accumulating into a running map rather than by a second global merge.
+  const double t_pt2_start = MPI_Wtime();
+  int mpi_rank_b_; MPI_Comm_rank(b_comm, &mpi_rank_b_);
+  int mpi_size_b_; MPI_Comm_size(b_comm, &mpi_size_b_);
+
+  sbd::gdb::PT2Scratch scratch;
+  std::vector<sbd::gdb::PT2Perturber<Elem>> raw;
+  std::vector<sbd::gdb::PT2Merged<Elem>> merged;
+
+  // Running accumulation keyed by determinant. This is the cross-batch equivalent of
+  // the hash-partitioned merge: contributions to one perturber from references in
+  // different batches must still be SUMMED before squaring, so the energy cannot be
+  // accumulated per batch -- only the numerators can.
+  std::map<std::vector<size_t>, std::pair<Elem, double>> acc;
+
+  size_t n_refs_local = 0, n_emitted_local = 0;
+  if (holds_dets) {
+    for (size_t i = 0; i < det.size(); ++i) {
+      const double ac = std::abs(std::complex<double>(c[i]));
+      if (ac == 0.0) continue;            // a zero-weight reference contributes nothing
+      ++n_refs_local;
+      const std::vector<size_t> ref = det[i];
+      raw.clear();
+      sbd::gdb::generate_perturbers_from<Elem>(ref, c[i], opt.epsilon2 / ac,
+                                              bit_length, static_cast<size_t>(L),
+                                              I0, I1, I2, scratch, raw);
+      n_emitted_local += raw.size();
+      sbd::gdb::merge_pt2_perturbers(raw, merged);
+      for (const auto & m : merged) {
+        auto it = acc.find(m.det);
+        if (it == acc.end()) acc.emplace(m.det, std::make_pair(m.num, m.haa));
+        else it->second.first += m.num;
+      }
+    }
+  }
+
+  // Flatten, drop anything already variational, and accumulate.
+  std::vector<sbd::gdb::PT2Merged<Elem>> all;
+  all.reserve(acc.size());
+  for (const auto & [d, nh] : acc) {
+    sbd::gdb::PT2Merged<Elem> m;
+    m.det = d; m.num = nh.first; m.haa = nh.second; m.n_parents = 1;
+    all.push_back(std::move(m));
+  }
+  acc.clear();
+  std::sort(all.begin(), all.end(),
+            [](const auto & x, const auto & y) {
+              return sbd::less_from_back(x.det, y.det);
+            });
+  const size_t n_removed_local = sbd::gdb::remove_variational(all, det);
+  const auto res = sbd::gdb::accumulate_pt2(all, e0, opt.den_floor);
+
+  // Reduce over b_comm only: h/t ranks are replicas of the same determinant slice, so
+  // including them would multiply every count and every energy by the replica factor.
+  // (The same trap that reported 195 of 391 matches during the reader work.)
+  double e_pt2 = 0.0, psi1 = 0.0, worst = 0.0;
+  size_t n_pert = 0, n_floored = 0, n_refs = 0, n_emitted = 0, n_removed = 0;
+  const double e_c   = holds_dets ? res.energy : 0.0;
+  const double p_c   = holds_dets ? res.psi1_norm2 : 0.0;
+  const double w_c   = holds_dets ? res.worst_ratio : 0.0;
+  const size_t np_c  = holds_dets ? res.n_perturbers : 0;
+  const size_t nf_c  = holds_dets ? res.n_floored : 0;
+  const size_t nr_c  = holds_dets ? n_refs_local : 0;
+  const size_t ne_c  = holds_dets ? n_emitted_local : 0;
+  const size_t nrm_c = holds_dets ? n_removed_local : 0;
+  MPI_Allreduce(&e_c,   &e_pt2,     1, MPI_DOUBLE,      MPI_SUM, b_comm);
+  MPI_Allreduce(&p_c,   &psi1,      1, MPI_DOUBLE,      MPI_SUM, b_comm);
+  MPI_Allreduce(&w_c,   &worst,     1, MPI_DOUBLE,      MPI_MAX, b_comm);
+  MPI_Allreduce(&np_c,  &n_pert,    1, SBD_MPI_SIZE_T,  MPI_SUM, b_comm);
+  MPI_Allreduce(&nf_c,  &n_floored, 1, SBD_MPI_SIZE_T,  MPI_SUM, b_comm);
+  MPI_Allreduce(&nr_c,  &n_refs,    1, SBD_MPI_SIZE_T,  MPI_SUM, b_comm);
+  MPI_Allreduce(&ne_c,  &n_emitted, 1, SBD_MPI_SIZE_T,  MPI_SUM, b_comm);
+  MPI_Allreduce(&nrm_c, &n_removed, 1, SBD_MPI_SIZE_T,  MPI_SUM, b_comm);
+  MPI_Bcast(&e_pt2, 1, MPI_DOUBLE, 0, h_comm);
+  MPI_Bcast(&e_pt2, 1, MPI_DOUBLE, 0, t_comm);
+
+  // A REMAINING GAP, dormant on the cases tested so far but real. Perturbers are
+  // merged within each b rank, not across them, so a perturber reached from
+  // references on two different ranks would contribute |x|^2 + |y|^2 where the exact
+  // answer is |x+y|^2. Dice avoids this with a hash-partitioned MPI_Alltoallv that
+  // co-locates every copy of a perturber before squaring.
+  //
+  // MEASURED: on N2 top100 the summed unique-perturber count is 79399 at b_comm = 1,
+  // 2 and 4 alike, and E_PT2 is bit-identical (-0.104076265516). Equal totals over
+  // disjoint reference slices mean the per-rank perturber sets are themselves
+  // disjoint here -- nothing is reached twice, so there is nothing to sum across
+  // ranks. That is a consequence of --do_redist_config keeping whole spatial
+  // configurations rank-local, NOT a guarantee: a determinant list partitioned some
+  // other way could easily produce cross-rank duplicates, and then b_comm > 1 would
+  // be silently wrong. Hence the invariance check below stays, and the count is
+  // printed so a future case that breaks the property is visible rather than
+  // discovered as a discrepancy.
   if (mpi_rank == 0) {
-    std::cout << " " << sbd::make_timestamp()
-              << " pt2: input verified; correction not yet implemented."
+    const double t = MPI_Wtime() - t_pt2_start;
+    std::cout << " " << sbd::make_timestamp() << " pt2: references=" << n_refs
+              << " emitted=" << n_emitted << " unique=" << n_pert
+              << " removed_variational=" << n_removed
+              << " floored=" << n_floored
+              << " [" << std::fixed << std::setprecision(2) << t << " s]"
               << std::endl;
+    std::cout << std::defaultfloat
+              << " sbd: pt2 variant   = " << sbd::gdb::pt2_variant_name(opt.variant)
+              << "\n sbd: pt2 epsilon2  = " << opt.epsilon2
+              << "\n sbd: E_var         = " << std::setprecision(12) << e0
+              << "\n sbd: E_PT2         = " << std::setprecision(12) << e_pt2
+              << "\n sbd: E_var + E_PT2 = " << std::setprecision(12) << (e0 + e_pt2)
+              << "\n sbd: |Psi_1|^2     = " << std::setprecision(6) << psi1
+              << "\n sbd: max |c_a^(1)| = " << std::setprecision(6) << worst
+              << std::endl;
+    if (e_pt2 > 0.0) {
+      std::cout << " sbd: WARNING pt2: E_PT2 is POSITIVE. For a ground-state root every"
+                << " perturber lies above E_0, so this indicates a wrong --e0, an"
+                << " excited root, or a defect." << std::endl;
+    }
+    if (n_floored > 0) {
+      std::cout << " sbd: WARNING pt2: " << n_floored << " denominator(s) hit the"
+                << " floor (" << opt.den_floor << "); the correction is partly held up"
+                << " by regularization." << std::endl;
+    }
+    if (worst > 0.5) {
+      std::cout << " sbd: WARNING pt2: largest first-order coefficient is " << worst
+                << "; perturbation theory is not reliable when a perturber mixes"
+                << " that strongly -- it belongs in the variational space."
+                << std::endl;
+    }
+    if (b_comm_size > 1) {
+      std::cout << " sbd: NOTE pt2: b_comm_size = " << b_comm_size
+                << "; perturbers are merged per rank only. This is exact as long as"
+                << " no perturber is reached from references on two different ranks,"
+                << " which holds when whole configurations are rank-local"
+                << " (--do_redist_config). Confirm against b_comm_size = 1 on a new"
+                << " system." << std::endl;
+    }
   }
 
   MPI_Finalize();

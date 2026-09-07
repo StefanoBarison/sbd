@@ -539,6 +539,149 @@ namespace sbd {
       }
     }
 
+
+    // ======================================================================
+    // Merge, set-difference, and the energy
+    // ======================================================================
+    //
+    // THE ONE THING THIS FILE MUST GET RIGHT. A perturber |D_a> reachable from
+    // several references contributes
+    //
+    //     |sum_i H_ai c_i|^2       NOT       sum_i |H_ai c_i|^2 .
+    //
+    // Summing the squares instead of squaring the sum is a plausible-looking error
+    // that changes the answer, does not crash, and does not obviously show up in an
+    // epsilon2 sweep. So the contributions are accumulated LINEARLY here and squared
+    // exactly once, per unique perturber, in the energy loop -- and there is a
+    // dedicated test for it (tests/pt2/merge_properties.cc).
+    //
+    // Order of operations also matters. The set-difference against the variational
+    // space assumes its input is already deduplicated: it advances past an equal
+    // entry unconditionally, so a perturber duplicated in the list would have only
+    // its first copy removed. Dedup FIRST, subtract second.
+
+    /// A perturber after merging: one entry per distinct determinant, with the
+    /// numerator contributions from every reference already summed.
+    template <typename ElemT>
+    struct PT2Merged {
+      std::vector<size_t> det;
+      ElemT  num = ElemT(0.0);   ///< sum_i H_ai c_i  -- squared later, once
+      double haa = 0.0;
+      int    n_parents = 0;      ///< how many contributions were summed (diagnostic)
+    };
+
+    /// Sort by determinant and combine duplicates, SUMMING their numerators.
+    ///
+    /// `haa` is a property of the perturber alone, so all copies must agree; a
+    /// disagreement means two different determinants compared equal, which would be a
+    /// defect in the ordering rather than a numerical issue. It is checked, not
+    /// assumed.
+    template <typename ElemT>
+    void merge_pt2_perturbers(std::vector<PT2Perturber<ElemT>> & in,
+                              std::vector<PT2Merged<ElemT>> & out,
+                              double haa_tol = 1.0e-8) {
+      out.clear();
+      if (in.empty()) return;
+
+      std::sort(in.begin(), in.end(),
+                [](const PT2Perturber<ElemT> & x, const PT2Perturber<ElemT> & y) {
+                  return sbd::less_from_back(x.det, y.det);
+                });
+
+      out.reserve(in.size());
+      for (size_t i = 0; i < in.size(); ++i) {
+        if (!out.empty() && out.back().det == in[i].det) {
+          // THE accumulation. Linear, never squared here.
+          out.back().num += in[i].num;
+          out.back().n_parents += 1;
+          if (std::abs(out.back().haa - in[i].haa) >
+              haa_tol * std::max(1.0, std::abs(in[i].haa))) {
+            std::cerr << " sbd: ERROR pt2: two perturbers compared equal but carry"
+                      << " different diagonal energies (" << out.back().haa
+                      << " vs " << in[i].haa << "). H_aa depends only on the"
+                      << " determinant, so this indicates an ordering defect."
+                      << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 4);
+          }
+        } else {
+          PT2Merged<ElemT> m;
+          m.det = in[i].det;
+          m.num = in[i].num;
+          m.haa = in[i].haa;
+          m.n_parents = 1;
+          out.push_back(std::move(m));
+        }
+      }
+    }
+
+    /// Remove from `pert` every determinant present in `det`, in place.
+    ///
+    /// Those are not perturbers: their contribution is already in the variational
+    /// energy, and including them would double-count it. `pert` must be deduplicated
+    /// (see the note above) and `det` must be in canonical less_from_back order.
+    /// Returns how many were removed.
+    template <typename ElemT, typename DetsContainer>
+    size_t remove_variational(std::vector<PT2Merged<ElemT>> & pert,
+                              const DetsContainer & det) {
+      if (pert.empty() || det.size() == 0) return 0;
+      auto cmp = [](const auto & x, const auto & y) {
+        return sbd::less_from_back(x, y);
+      };
+      size_t keep = 0, removed = 0;
+      for (size_t i = 0; i < pert.size(); ++i) {
+        auto it = std::lower_bound(det.begin(), det.end(), pert[i].det, cmp);
+        bool present = false;
+        if (it != det.end()) {
+          const std::vector<size_t> found = *it;
+          present = (found == pert[i].det);
+        }
+        if (present) { ++removed; continue; }
+        if (keep != i) pert[keep] = std::move(pert[i]);
+        ++keep;
+      }
+      pert.resize(keep);
+      return removed;
+    }
+
+    /// Accumulated PT2 result, so the caller can report more than one number.
+    struct PT2Result {
+      double energy = 0.0;      ///< the correction; negative for a ground-state root
+      double psi1_norm2 = 0.0;  ///< |Psi_1|^2, a measure of how perturbative this is
+      size_t n_perturbers = 0;
+      size_t n_floored = 0;     ///< how many denominators hit the floor
+      double worst_ratio = 0.0; ///< largest |num/(E0-haa)|; a big value means trouble
+    };
+
+    /// Sum |num|^2 / (E_0 - H_aa) over the merged perturbers.
+    ///
+    /// The denominator is floored in magnitude WITH ITS SIGN PRESERVED. Dice applies
+    /// no floor at all, so a perturber that happens to be near-degenerate with E_0
+    /// contributes an unbounded term; flipping the sign instead of preserving it would
+    /// turn a downward correction into an upward one. `n_floored` is reported because
+    /// a nonzero count means the result is being held up by regularization, and that
+    /// should be visible rather than silent.
+    template <typename ElemT>
+    PT2Result accumulate_pt2(const std::vector<PT2Merged<ElemT>> & pert,
+                             double e0,
+                             double den_floor) {
+      PT2Result r;
+      r.n_perturbers = pert.size();
+      for (const auto & p : pert) {
+        double den = e0 - p.haa;
+        const double ad = std::abs(den);
+        if (ad < den_floor) {
+          den = (den < 0.0) ? -den_floor : den_floor;
+          r.n_floored += 1;
+        }
+        const double n2 = std::norm(std::complex<double>(p.num));
+        r.energy += n2 / den;
+        const double coef = std::sqrt(n2) / std::abs(den);
+        r.psi1_norm2 += coef * coef;
+        r.worst_ratio = std::max(r.worst_ratio, coef);
+      }
+      return r;
+    }
+
   } // namespace gdb
 
 } // namespace sbd
