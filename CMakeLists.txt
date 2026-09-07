@@ -113,5 +113,6 @@ endfunction()
 # ── Apps ──────────────────────────────────────────────────────────────────────
 add_subdirectory(apps/caop_selected_basis_diagonalization)
 add_subdirectory(apps/chemistry_gdb_selected_basis_diagonalization)
+add_subdirectory(apps/chemistry_gdb_pt2)
 add_subdirectory(apps/chemistry_tpb_selected_basis_diagonalization)
 add_subdirectory(apps/gen_dets)

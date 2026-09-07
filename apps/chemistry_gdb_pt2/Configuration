@@ -1,0 +1,25 @@
+# Path to the SBD library
+SBD_PATH=../..
+
+# mpi c++ compiler
+# Set MPICC environment variable to override (e.g., export MPICC=/custom/path/to/mpicxx)
+# If your system's default mpicxx is found automatically, you can use: CCCOM=mpicxx
+CCCOM=$(if $(MPICC),$(MPICC),$(HOME)/openmpi/bin/mpicxx)
+
+CCFLAGS= -std=c++17 -fopenmp -O3
+
+# flags for linking: include link to lapack and blas.
+# If BLAS/LAPACK are found automatically by your compiler, you may not need explicit library names
+SYSLIB= -llapack -lblas -fopenmp
+
+### Example for the Fugaku
+# SBD_PATH=../../
+# CCCOM=mpiFCCpx
+# CCFLAGS= -Nclang -std=c++17 -stdlib=libc++ -Kfast,openmp -Xpreprocessor -fopenmp
+# SYSLIB= -SSL2
+#
+### Trad-mode for Fugaku
+# SBD_PATH=../../
+# CCCOM=mpiFCCpx
+# CCFLAGS= -std=c++17 -Kfast,openmp -DSBD_TRADMODE
+# SYSLIB= -SSL2
