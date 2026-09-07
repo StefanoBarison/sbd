@@ -57,6 +57,8 @@ specification only; no code is derived from it.
 #define SBD_CHEMISTRY_GDB_PT2_H
 
 #include <algorithm>
+#include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -379,6 +381,161 @@ namespace sbd {
         if (found != wf.dets[i]) continue;
         c[static_cast<size_t>(it - det.begin())] = wf.amps[i];
         ++n_matched;
+      }
+    }
+
+
+    // ======================================================================
+    // Perturber generation
+    // ======================================================================
+    //
+    // For each reference determinant |D_i> with coefficient c_i, emit every
+    // determinant |D_a> reachable by a single or double excitation whose
+    // contribution passes the screening test
+    //
+    //     |H_ai * c_i| > epsilon2 .
+    //
+    // Following Dice, the threshold is divided by |c_i| ONCE per reference and the
+    // test is then applied to the matrix element alone. That is not a
+    // micro-optimization: it is what allows a screening decision to be made before
+    // the perturber determinant is constructed, and it means a large-weight
+    // reference automatically gets a looser per-element threshold.
+    //
+    // Sz is preserved by construction: an excitation moves an electron from an
+    // occupied spin-orbital to an empty one OF THE SAME SPIN, so the alpha and beta
+    // counts are individually conserved. Nothing here needs to check that.
+    //
+    // WHAT THIS DOES NOT DO. Dice screens its doubles against a table of two-electron
+    // integrals pre-sorted in descending magnitude, so its inner loop breaks at the
+    // first element below threshold and the cost of generation is proportional to the
+    // number of perturbers PRODUCED rather than to the size of the orbital space. SBD
+    // has no such table (`makeHeatbathLookup` in expansion.h is exhaustive
+    // enumeration, not magnitude-sorted screening). This implementation therefore
+    // evaluates H_ai for every candidate and tests it, which is correct but costs
+    // O(n_occ^2 * n_virt^2) per reference regardless of how many perturbers survive.
+    // Building the sorted table is the obvious optimization if generation turns out
+    // to dominate; it is deliberately not done first, because a correct slow number
+    // is worth more than a fast unverified one.
+
+    /// One emitted perturber: the determinant, its numerator contribution
+    /// H_ai * c_i, and its diagonal energy H_aa.
+    ///
+    /// `num` is a CONTRIBUTION, not the numerator: the same determinant reached from
+    /// several references contributes several of these, and they must be summed before
+    /// squaring. That summation happens in the merge step, not here.
+    template <typename ElemT>
+    struct PT2Perturber {
+      std::vector<size_t> det;
+      ElemT  num = ElemT(0.0);
+      double haa = 0.0;
+    };
+
+    /// Scratch buffers reused across references, so the inner loops allocate nothing.
+    /// `Hij`'s convenient overload takes std::vector<size_t> and det_vector::row
+    /// converts implicitly -- which allocates two vectors per call. In a loop that
+    /// calls Hij O(n_occ^2 n_virt^2) times per reference that allocation dominates, so
+    /// the scratch-buffer overload (determinants.h:568) is used with these instead.
+    struct PT2Scratch {
+      std::vector<int> open;      ///< empty spin-orbitals of the reference
+      std::vector<int> closed;    ///< occupied spin-orbitals of the reference
+      std::vector<int> c;         ///< Hij scratch
+      std::vector<int> d;         ///< Hij scratch
+      std::vector<size_t> cand;   ///< candidate determinant being built
+    };
+
+    /// Generate the perturbers of one reference determinant, appending to `out`.
+    ///
+    /// @param ref      the reference determinant, as stored (interleaved, 2L bits)
+    /// @param ci       its coefficient
+    /// @param eps_over_ci  epsilon2 / |c_i|; the test applied to |H_ai|
+    /// @param L        spatial orbitals (so 2L spin-orbitals)
+    template <typename ElemT>
+    void generate_perturbers_from(const std::vector<size_t> & ref,
+                                  const ElemT & ci,
+                                  double eps_over_ci,
+                                  size_t bit_length,
+                                  size_t L,
+                                  const ElemT & I0,
+                                  const oneInt<ElemT> & I1,
+                                  const twoInt<ElemT> & I2,
+                                  PT2Scratch & s,
+                                  std::vector<PT2Perturber<ElemT>> & out) {
+      const int nso = static_cast<int>(2 * L);   // spin-orbitals
+      const int nocc = sbd::bitcount(ref, bit_length, nso);
+      const int nvir = nso - nocc;
+      if (nocc == 0 || nvir == 0) return;
+
+      // getOpenClosed writes through .at() and does NOT resize (its resize calls are
+      // commented out at determinants.h:216-217), so pre-sizing is mandatory.
+      s.closed.assign(static_cast<size_t>(nocc), 0);
+      s.open.assign(static_cast<size_t>(nvir), 0);
+      sbd::getOpenClosed(ref, bit_length, nso, s.open, s.closed);
+
+      // Hij's scratch overload (determinants.h:568) writes c[nc] / d[nd] with RAW
+      // operator[], no resize and no bounds check -- an empty scratch vector is a
+      // segfault, which is exactly what an untested first version produced here. A
+      // single or double excitation differs in at most 2 spin-orbitals per side, but
+      // size to nso: the cost is nothing and it cannot be too small for any
+      // determinant pair, including ones a future caller might pass.
+      if (s.c.size() < static_cast<size_t>(nso)) s.c.assign(nso, 0);
+      if (s.d.size() < static_cast<size_t>(nso)) s.d.assign(nso, 0);
+
+      size_t orbDiff = 0;
+
+      // ---- singles: i -> a, same spin (parity of the spin-orbital index) --------
+      for (int ii = 0; ii < nocc; ++ii) {
+        const int i = s.closed[ii];
+        for (int aa = 0; aa < nvir; ++aa) {
+          const int a = s.open[aa];
+          if ((i & 1) != (a & 1)) continue;      // spin-flip: Sz would change
+          s.cand = ref;
+          sbd::setocc(s.cand, bit_length, i, false);
+          sbd::setocc(s.cand, bit_length, a, true);
+          const ElemT h = sbd::Hij(ref, s.cand, bit_length, L, s.c, s.d,
+                                   I0, I1, I2, orbDiff);
+          if (std::abs(h) <= eps_over_ci) continue;
+          PT2Perturber<ElemT> p;
+          p.det = s.cand;
+          p.num = h * ci;
+          p.haa = static_cast<double>(std::real(
+              std::complex<double>(sbd::ZeroExcite(s.cand, bit_length, L, I0, I1, I2))));
+          out.push_back(std::move(p));
+        }
+      }
+
+      // ---- doubles: (i,j) -> (a,b), each replacement spin-preserving ------------
+      for (int ii = 0; ii < nocc; ++ii) {
+        const int i = s.closed[ii];
+        for (int jj = ii + 1; jj < nocc; ++jj) {
+          const int j = s.closed[jj];
+          for (int aa = 0; aa < nvir; ++aa) {
+            const int a = s.open[aa];
+            for (int bb = aa + 1; bb < nvir; ++bb) {
+              const int b = s.open[bb];
+              // The pair of created spins must match the pair of annihilated spins,
+              // in one assignment or the other. Checking the multiset rather than
+              // (i,a) and (j,b) individually is what admits the ia-jb and ib-ja
+              // pairings that a same-spin double legitimately has.
+              const int spin_in  = (i & 1) + (j & 1);
+              const int spin_out = (a & 1) + (b & 1);
+              if (spin_in != spin_out) continue;
+              s.cand = ref;
+              sbd::setocc(s.cand, bit_length, i, false);
+              sbd::setocc(s.cand, bit_length, j, false);
+              sbd::setocc(s.cand, bit_length, a, true);
+              sbd::setocc(s.cand, bit_length, b, true);
+              const ElemT h = sbd::Hij(ref, s.cand, bit_length, L, s.c, s.d,
+                                       I0, I1, I2, orbDiff);
+              if (std::abs(h) <= eps_over_ci) continue;
+              PT2Perturber<ElemT> p;
+              p.det = s.cand;
+              p.num = h * ci;
+              p.haa = static_cast<double>(std::real(
+                  std::complex<double>(sbd::ZeroExcite(s.cand, bit_length, L, I0, I1, I2))));
+              out.push_back(std::move(p));
+            }
+          }
+        }
       }
     }
 
