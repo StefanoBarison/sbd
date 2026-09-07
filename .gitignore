@@ -58,6 +58,7 @@ __pycache__/
 # commit a multi-megabyte binary.
 apps/*/diag
 apps/*/diag_*
+apps/*/pt2
 apps/gen_dets/gdet
 
 # NOT ignored, deliberately: apps/*/Configuration. The local macOS build config is
