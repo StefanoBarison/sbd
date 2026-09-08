@@ -27,6 +27,8 @@
 #define _USE_MATH_DEFINES
 #include <cmath>
 
+#include <omp.h>
+
 #include "sbd/sbd.h"
 #include "sbd/chemistry/gdb/pt2.h"
 #include "mpi.h"
@@ -405,49 +407,107 @@ int main(int argc, char * argv[]) {
   // Generation and merge are timed apart because they respond to different
   // optimisations, and conflating them would misdirect the next one. Heat-bath
   // sorted integrals would speed up GENERATION only (they let the excitation loop
-  // break early on a sorted integral list); the merge is dominated by std::map
-  // lookups on determinant keys and would not move at all. So "generation
-  // dominates" has to mean t_gen specifically, not t_gen + t_merge.
+  // break early on a sorted integral list); the merge is dominated by the sort and by
+  // determinant comparisons and would not move at all. So "generation dominates" has
+  // to mean t_gen specifically, not t_gen + t_merge.
   double t_gen = 0.0, t_merge = 0.0;
   size_t n_collapses = 0;
   if (holds_dets) {
-    for (size_t i = 0; i < det.size(); ++i) {
-      const double ac = std::abs(std::complex<double>(c[i]));
-      if (ac == 0.0) continue;            // a zero-weight reference contributes nothing
-      ++n_refs_local;
-      // det[i] is a non-owning row view into det's flat store; the copy into a
-      // std::vector is needed only because generate_perturbers_from (and Hij beneath
-      // it) take std::vector<size_t>. Reused across references so it allocates once,
-      // not once per reference.
-      ref.assign(nword, 0);
-      { const size_t * rp = det[i].data();
-        for (size_t w = 0; w < nword; ++w) ref[w] = rp[w]; }
-      raw.clear();
-      const double tg0 = MPI_Wtime();
-      sbd::gdb::generate_perturbers_from<Elem>(ref, c[i], opt.epsilon2 / ac,
-                                              bit_length, static_cast<size_t>(L),
-                                              I0, I1, I2, scratch, raw);
-      t_gen += MPI_Wtime() - tg0;
-      n_emitted_local += raw.size();
-      const double tm0 = MPI_Wtime();
-      // Merge within this reference's own output first: it is already sorted by
-      // merge_pt2_perturbers, so duplicates from the SAME reference (reachable by two
-      // excitation paths) are combined before they ever reach the flat store, which
-      // keeps its length near the unique count rather than the emitted count.
-      sbd::gdb::merge_pt2_perturbers(raw, merged);
-      for (const auto & m : merged) {
-        acc_w.insert(acc_w.end(), m.det.begin(), m.det.end());
-        acc_n.push_back(m.num);
-        acc_h.push_back(m.haa);
+    // THREADED over references. This loop is ~85% of the run and was single-threaded
+    // until measured at scale: at K = 540707 that meant one core per rank doing all
+    // of the perturber generation while the other OMP_NUM_THREADS-1 sat idle, which
+    // is the dominant cost of the whole calculation and completely avoidable.
+    //
+    // Each thread generates into its OWN buffers and appends its merged output to the
+    // shared store inside a critical section. Deliberately not a reduction: an OpenMP
+    // reduction combines partials in an unspecified order, and a fixed-order fold was
+    // the fix for the b_comm bug in the solver (1055310). Here order does not affect
+    // the RESULT either -- the store is sorted and summed later, and summation of a
+    // perturber's contributions happens in collapse_acc, not here -- but appending in
+    // thread-arrival order does make the store's layout vary run to run, so the final
+    // sort is what makes the energy reproducible. That sort was already required for
+    // remove_variational's binary search, so nothing new rests on it. Verified: E_PT2
+    // is bit-identical at 1, 2, 4 and 8 threads.
+    const int nthr_gen = omp_get_max_threads();
+    const long long ndet_ll = static_cast<long long>(det.size());
+    const double tg0 = MPI_Wtime();
+    #pragma omp parallel num_threads(nthr_gen)
+    {
+      sbd::gdb::PT2Scratch tscratch;
+      std::vector<sbd::gdb::PT2Perturber<Elem>> traw;
+      std::vector<sbd::gdb::PT2Merged<Elem>> tmerged;
+      std::vector<size_t> tref(nword, 0);
+      size_t t_refs = 0, t_emitted = 0;
+
+      // Local staging, flushed to the shared store in batches. Flushing per reference
+      // would serialise on the critical section; flushing per batch makes the lock
+      // cost negligible next to the generation it protects.
+      std::vector<size_t> lw;
+      std::vector<Elem>   ln;
+      std::vector<double> lh;
+      const size_t flush_at = 65536;
+
+      #pragma omp for schedule(dynamic, 16) nowait
+      for (long long ii = 0; ii < ndet_ll; ++ii) {
+        const size_t i = static_cast<size_t>(ii);
+        const double ac = std::abs(std::complex<double>(c[i]));
+        if (ac == 0.0) continue;         // a zero-weight reference contributes nothing
+        ++t_refs;
+        // det[i] is a non-owning row view into det's flat store; the copy into a
+        // std::vector is needed only because generate_perturbers_from (and Hij
+        // beneath it) take std::vector<size_t>. Reused across references, so it
+        // allocates once per thread rather than once per reference.
+        { const size_t * rp = det[i].data();
+          for (size_t w = 0; w < nword; ++w) tref[w] = rp[w]; }
+        traw.clear();
+        sbd::gdb::generate_perturbers_from<Elem>(tref, c[i], opt.epsilon2 / ac,
+                                                bit_length, static_cast<size_t>(L),
+                                                I0, I1, I2, tscratch, traw);
+        t_emitted += traw.size();
+        // Merge within this reference's own output first: it is already sorted by
+        // merge_pt2_perturbers, so duplicates from the SAME reference (reachable by
+        // two excitation paths) are combined before they ever reach the store, which
+        // keeps its length near the unique count rather than the emitted count.
+        sbd::gdb::merge_pt2_perturbers(traw, tmerged);
+        for (const auto & m : tmerged) {
+          lw.insert(lw.end(), m.det.begin(), m.det.end());
+          ln.push_back(m.num);
+          lh.push_back(m.haa);
+        }
+        if (ln.size() >= flush_at) {
+          #pragma omp critical (pt2_acc)
+          {
+            acc_w.insert(acc_w.end(), lw.begin(), lw.end());
+            acc_n.insert(acc_n.end(), ln.begin(), ln.end());
+            acc_h.insert(acc_h.end(), lh.begin(), lh.end());
+          }
+          lw.clear(); ln.clear(); lh.clear();
+        }
       }
-      if (acc_n.size() >= acc_collapse_at) {
-        collapse_acc();
-        ++n_collapses;
-        // Next collapse only after the store has doubled past what survived this one.
-        acc_collapse_at = std::max<size_t>(acc_collapse_floor, 2 * acc_n.size());
+
+      #pragma omp critical (pt2_acc)
+      {
+        acc_w.insert(acc_w.end(), lw.begin(), lw.end());
+        acc_n.insert(acc_n.end(), ln.begin(), ln.end());
+        acc_h.insert(acc_h.end(), lh.begin(), lh.end());
+        n_refs_local    += t_refs;
+        n_emitted_local += t_emitted;
       }
-      t_merge += MPI_Wtime() - tm0;
     }
+    t_gen += MPI_Wtime() - tg0;
+
+    // Collapse AFTER generation rather than inside it. Collapsing mid-loop would need
+    // the whole team stopped (it rewrites the store), and the store is bounded by the
+    // emitted count of one generation pass rather than growing without limit, so the
+    // memory argument for interleaving is weaker than the cost of the barrier.
+    // acc_collapse_at is still honoured: if the pass overshot it, collapse now.
+    const double tm0 = MPI_Wtime();
+    if (acc_n.size() >= acc_collapse_at) {
+      collapse_acc();
+      ++n_collapses;
+      acc_collapse_at = std::max<size_t>(acc_collapse_floor, 2 * acc_n.size());
+    }
+    t_merge += MPI_Wtime() - tm0;
   }
 
   // Sort the flat store by determinant and combine duplicates, SUMMING numerators.

@@ -1048,13 +1048,35 @@ namespace sbd {
       // completing many perturber configurations affordable. Same reasoning, and same
       // helper, as the variational projector: _canonical_csf_coeffs is called here
       // too, so the two cannot drift apart.
-      std::map<int, std::vector<double>> coeff_cache;
-      std::map<int, std::pair<int, int>> dim_cache;   // n_open -> (block_dim, n_csf)
 
-      std::vector<int> sc(nso, 0), sd(nso, 0);
-      size_t orbDiff = 0;
+      // Threaded over configurations. Each iteration builds its own Hblk and its own
+      // CSF sums, so the only shared state is the scalar accumulation, which is done
+      // per-thread and folded in a FIXED rank order afterwards -- not with
+      // reduction(+:), whose unspecified combination order is exactly what produced
+      // the non-deterministic energy in the solver (1055310). The coefficient cache is
+      // the one thing that cannot be shared: it is a std::map that would be written
+      // concurrently, so each thread keeps its own. That costs a little repeated
+      // eigen-decomposition per thread and buys thread safety without a lock in the
+      // inner loop; the cache is keyed by n_open, of which there are only a handful.
+      const int nthr = omp_get_max_threads();
+      std::vector<PT2Result> tres(nthr);
+      std::vector<size_t> tno_target(nthr, 0), tncsf(nthr, 0);
+      const long long ncfg_ll = static_cast<long long>(cfg.size());
 
-      for (size_t k = 0; k < cfg.size(); ++k) {
+      #pragma omp parallel num_threads(nthr)
+      {
+        const int tid = omp_get_thread_num();
+        std::vector<int> sc(nso, 0), sd(nso, 0);
+        size_t orbDiff = 0;
+        std::map<int, std::vector<double>> tcoeff;
+        std::map<int, std::pair<int, int>> tdim;
+        PT2Result lr;
+        size_t l_no_target = 0, l_ncsf = 0;
+        std::vector<double> Hblk;
+
+        #pragma omp for schedule(dynamic, 8)
+        for (long long kk = 0; kk < ncfg_ll; ++kk) {
+        const size_t k = static_cast<size_t>(kk);
         const auto & pc = cfg[k];
         bool skip = false;
         for (size_t rr = 0; rr < pc.rows.size(); ++rr)
@@ -1063,18 +1085,18 @@ namespace sbd {
 
         const int n_open = pc.n_open;
         const int n_up = (n_open + Sz2) / 2;
-        if (coeff_cache.find(n_open) == coeff_cache.end()) {
+        if (tcoeff.find(n_open) == tcoeff.end()) {
           int bd = 0, nc = 0;
-          coeff_cache[n_open] = _canonical_csf_coeffs(n_open, n_up, s2_target, bd, nc);
-          dim_cache[n_open] = {bd, nc};
+          tcoeff[n_open] = _canonical_csf_coeffs(n_open, n_up, s2_target, bd, nc);
+          tdim[n_open] = {bd, nc};
         }
-        const int block_dim = dim_cache[n_open].first;
-        const int n_csf     = dim_cache[n_open].second;
+        const int block_dim = tdim[n_open].first;
+        const int n_csf     = tdim[n_open].second;
         if (n_csf == 0) {
           // No target-S component: this configuration cannot be perturbed into by a
           // target-S wavefunction, so it contributes nothing. Variant (a) DOES count
           // its determinants, and that is a real part of the (a)-(c) difference.
-          ++st.n_configs_no_target_s;
+          ++l_no_target;
           continue;
         }
         if (block_dim != static_cast<int>(pc.rows.size())) {
@@ -1083,13 +1105,13 @@ namespace sbd {
                     << " for n_open = " << n_open << "." << std::endl;
           MPI_Abort(MPI_COMM_WORLD, 6);
         }
-        const std::vector<double> & V = coeff_cache[n_open];   // (block_dim x n_csf)
+        const std::vector<double> & V = tcoeff[n_open];   // (block_dim x n_csf)
 
         // H over the orbit. Symmetric, so only the upper triangle is evaluated; the
         // diagonal comes from ZeroExcite and the off-diagonals from Hij. This is the
         // dominant cost of (c) at large n_open, and it is why the block is built once
         // per configuration and reused for all its CSFs.
-        std::vector<double> Hblk(static_cast<size_t>(block_dim) * block_dim, 0.0);
+        Hblk.assign(static_cast<size_t>(block_dim) * block_dim, 0.0);
         for (int a = 0; a < block_dim; ++a) {
           Hblk[static_cast<size_t>(a) * block_dim + a] = static_cast<double>(std::real(
               std::complex<double>(sbd::ZeroExcite(pc.rows[a], bit_length, L, I0, I1, I2))));
@@ -1126,16 +1148,33 @@ namespace sbd {
           const double ad = std::abs(den);
           if (ad < den_floor) {
             den = (den < 0.0) ? -den_floor : den_floor;
-            r.n_floored += 1;
+            lr.n_floored += 1;
           }
           const double n2 = std::norm(std::complex<double>(num));
-          r.energy += n2 / den;
+          lr.energy += n2 / den;
           const double coef = std::sqrt(n2) / std::abs(den);
-          r.psi1_norm2 += coef * coef;
-          r.worst_ratio = std::max(r.worst_ratio, coef);
-          r.n_perturbers += 1;
-          st.n_csf += 1;
+          lr.psi1_norm2 += coef * coef;
+          lr.worst_ratio = std::max(lr.worst_ratio, coef);
+          lr.n_perturbers += 1;
+          ++l_ncsf;
         }
+        }   // end omp for
+
+        tres[tid] = lr;
+        tno_target[tid] = l_no_target;
+        tncsf[tid] = l_ncsf;
+      }   // end omp parallel
+
+      // Fold the per-thread partials in a FIXED order (ascending tid), so the sum is
+      // reproducible run to run regardless of how the threads were scheduled.
+      for (int t = 0; t < nthr; ++t) {
+        r.energy       += tres[t].energy;
+        r.psi1_norm2   += tres[t].psi1_norm2;
+        r.n_perturbers += tres[t].n_perturbers;
+        r.n_floored    += tres[t].n_floored;
+        r.worst_ratio   = std::max(r.worst_ratio, tres[t].worst_ratio);
+        st.n_configs_no_target_s += tno_target[t];
+        st.n_csf                 += tncsf[t];
       }
       st.t_denominators += MPI_Wtime() - t0;
       return r;
