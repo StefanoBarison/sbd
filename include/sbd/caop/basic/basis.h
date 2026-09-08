@@ -7,6 +7,7 @@
 
 #include <sys/stat.h>
 #include <iomanip>
+#include <cstdint>   // std::uint64_t below; do not rely on type_def.h to supply it
 
 #include "sbd/framework/type_def.h"
 #include "sbd/framework/mpi_utility.h"

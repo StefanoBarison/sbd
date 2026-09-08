@@ -13,6 +13,8 @@
 */
 #include <algorithm>
 #include <complex>
+#include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <map>
 #include <utility>

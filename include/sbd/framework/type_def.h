@@ -9,6 +9,16 @@
 #include <complex>
 #include <limits.h>
 #include <cassert>
+// <cstdint> is required, not optional: SIZE_MAX and UINT*_MAX come from it (and from
+// <stdint.h>), and uint32_t is declared there. <limits.h> alone supplies only the
+// CHAR/SHRT/INT/LONG/LLONG limits, NOT SIZE_MAX.
+//
+// This built for years without it because every app happened to include a standard
+// header that pulled <cstdint> in transitively first -- <random> in the diag app, for
+// instance. An app that includes only what it uses hits `#error SIZE_MAX` plus ~30
+// cascading "SBD_MPI_SIZE_T was not declared" errors, which is what the chemistry_gdb_pt2
+// app did on GCC with a newer libstdc++, where the transitive include is gone.
+#include <cstdint>
 
 #include "mpi.h"
 
