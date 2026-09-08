@@ -169,12 +169,13 @@ class SBDPT2Corrector:
                 different ones otherwise, and nothing downstream would reveal it.
             mpi_np: total rank count. Must equal
                 ``h_comm_size x b_comm_size x t_comm_size``.
-            b_comm_size: determinant-partition communicator. Note the exactness
-                caveat: perturbers are merged per rank, which is exact only when no
-                perturber is reachable from references on two different ranks. The
-                binary CHECKS this for variant (c) and prints whether the
-                configuration sets are genuinely disjoint -- read that line rather
-                than assuming it.
+            b_comm_size: reference-partition communicator, and the main parallel
+                axis of variant (a): the determinant list is redistributed across
+                these ranks and perturbers are merged back across them by a
+                hash-partitioned Alltoallv, so E_PT2 is exact and bit-identical for
+                any b_comm_size. Variant (c) does NOT support b_comm_size > 1 and
+                this constructor rejects it -- its perturber index is a CSF spanning
+                a whole configuration, which a determinant-level partition splits.
             t_comm_size: task communicator. Must not exceed ``b_comm_size``; the
                 binary aborts otherwise rather than returning a plausible number.
             variant: ``"a"`` (determinant perturbers) or ``"c"`` (target-S CSF
@@ -238,6 +239,15 @@ class SBDPT2Corrector:
                 f"t_comm_size ({t_comm_size}) must not exceed b_comm_size "
                 f"({b_comm_size}); t_comm partitions exactly b_comm_size "
                 f"ring-rotation tasks, so surplus t ranks would get an empty range"
+            )
+        if variant == "c" and b_comm_size > 1:
+            raise ValueError(
+                f"variant='c' requires b_comm_size=1 (got {b_comm_size}). A target-S "
+                f"CSF spans a whole spatial configuration, so its orbit must live on "
+                f"one rank; splitting the references across b ranks splits the CSF "
+                f"numerators and each rank then squares its own partial. Use "
+                f"omp_num_threads for parallelism -- the generation and denominator "
+                f"loops are threaded -- or variant='a', which merges across ranks."
             )
         if mpi_np % (b_comm_size * t_comm_size) != 0:
             raise ValueError(

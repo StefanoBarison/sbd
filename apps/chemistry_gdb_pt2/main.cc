@@ -107,9 +107,32 @@ int main(int argc, char * argv[]) {
   sbd::det_vector<size_t> det;
   if (mpi_rank_h == 0 && mpi_rank_t == 0) {
     sbd::load_basis_from_files(opt.detfiles, det, bit_length, 2 * L, b_comm);
-    // Canonical order. ~25 lower_bound calls elsewhere in the tree assume it, and
-    // the set-difference against the variational space below relies on it too.
-    sbd::sort_bitarray(det);
+    // REDISTRIBUTE. load_basis_from_files partitions by FILE, not by determinant: it
+    // splits detfiles.size() across the ranks of b_comm. With a single determinant
+    // file -- which is how every caller and the Python wrapper drive this -- rank 0
+    // gets all of them and every other rank gets an empty list. b_comm_size then buys
+    // nothing at all, and the energy still comes out RIGHT because the empty ranks
+    // contribute zero to the reduction, so the failure is invisible in the result.
+    //
+    // Measured before this fix, K = 17688 on one detfile: b_comm = 4 and b_comm = 1
+    // both processed 17496 references in ~9 s. At K = 540707 that meant a single rank
+    // generating every perturber for 494 s while 23 ranks idled. It is also why the
+    // MPI-invariance checks passed so convincingly: every layout was really running
+    // single-rank, so of course they agreed to the last bit.
+    //
+    // equal_config rather than plain redistribution: it keeps all determinants of one
+    // spatial configuration on the same rank. That is what makes variant (c) exact --
+    // a configuration split across ranks would have its orbit numerators summed over
+    // one rank's references only and then squared per rank -- and it is the same
+    // property --do_redist_config gives the solver.
+    if (b_comm_size > 1) {
+      sbd::redistribution_equal_config(det, bit_length, 2 * L, b_comm);
+    } else {
+      // Canonical order. ~25 lower_bound calls elsewhere in the tree assume it, and
+      // the set-difference against the variational space below relies on it too.
+      // (redistribution_equal_config restores that order itself.)
+      sbd::sort_bitarray(det);
+    }
   }
 
   size_t ndet_local = det.size();
@@ -303,6 +326,38 @@ int main(int argc, char * argv[]) {
   // and aborts on a mixed-Sz list; every rank of a b_comm shares the same (h,t)
   // coordinates, so `holds_dets` is uniform across it and the collective is safe.
   int Sz2 = 0;
+  if (opt.variant == sbd::gdb::PT2Variant::SpinPure && b_comm_size > 1) {
+    // REFUSED, rather than returned wrong.
+    //
+    // Variant (c)'s perturber index is a CSF spanning a whole spatial configuration,
+    // so a configuration's orbit must be complete on ONE rank: num_c = sum_r V_rc x_r
+    // needs every row's x_r, and x_r is summed over that rank's references only. With
+    // the references partitioned across b_comm, a perturbing configuration reachable
+    // from two ranks has its numerator split, and each rank then squares its own
+    // partial. Measured at K = 17688: E_PT2 = -0.390 against the correct -0.0441 at
+    // b_comm = 4, with the CSF count inflated from 243556 to 522857.
+    //
+    // The determinant-level cross-rank merge added for variant (a) does not fix this:
+    // it routes by determinant, which SPLITS configurations across owners -- the exact
+    // opposite of what (c) needs. Doing it properly means hashing on the configuration
+    // key so whole orbits co-locate, and completing each orbit against the global
+    // reference list rather than the local slice. That is not a small change, and
+    // shipping a plausible wrong number in the meantime is worse than refusing.
+    if (mpi_rank == 0) {
+      std::cerr << " sbd: ERROR pt2: --variant c requires --b_comm_size 1.\n"
+                << "      A target-S CSF spans a whole spatial configuration, so its"
+                << " orbit must live on one rank; with the references split across "
+                << b_comm_size << " b ranks the CSF numerators are split too and each"
+                << " rank squares its own partial.\n"
+                << "      Re-run with --b_comm_size 1 (use OMP_NUM_THREADS for"
+                << " parallelism -- the generation and denominator loops are"
+                << " threaded), or use --variant a, which merges across ranks"
+                << " correctly." << std::endl;
+    }
+    MPI_Abort(comm, 8);
+    return 8;
+  }
+
   if (opt.variant == sbd::gdb::PT2Variant::SpinPure) {
     if (holds_dets) {
       Sz2 = sbd::gdb::derive_common_sz2(det, bit_length, L, b_comm, comm);
@@ -570,7 +625,155 @@ int main(int argc, char * argv[]) {
   // and the variational-row scan in variant (c) both binary-search `det` in that
   // order, and the merge below relies on equal determinants being adjacent.
   const double tsort0 = MPI_Wtime();
-  collapse_acc();      // final sort-and-sum; leaves the store unique and ordered
+  // Hash-routed copy of the variational determinants, built only when b_comm_size > 1.
+  std::vector<std::vector<size_t>> det_owned;
+  bool use_det_owned = false;
+  collapse_acc();      // local sort-and-sum; leaves the store unique and ordered
+
+  // ---- CROSS-RANK MERGE (required whenever b_comm_size > 1) -----------------
+  //
+  // Each rank generated perturbers from ITS OWN references, but one perturber is
+  // typically reachable from references on several ranks. Its numerator is
+  //
+  //     num_a = sum_i H_ai c_i        summed over ALL references, everywhere,
+  //
+  // and only then squared. Merging per rank and squaring locally computes
+  // |x|^2 + |y|^2 where the answer is |x+y|^2 -- and since every cross term is
+  // missing, the error does not average out. Measured at K = 17688 on 4 ranks:
+  // E_PT2 = -0.4199 against the correct -0.0457, with the unique count inflated from
+  // 1.02e6 to 2.31e6 because the same determinant was being counted once per rank.
+  //
+  // So every copy of a perturber is sent to a single owner rank, chosen by a hash of
+  // the determinant words alone. The hash MUST depend on nothing else -- not on which
+  // rank generated it, not on arrival order -- or copies of one perturber would land
+  // on different owners and the sum would still be split.
+  if (b_comm_size > 1) {
+    const int bs = mpi_size_b_;
+    const size_t nloc = acc_n.size();
+
+    auto owner_of = [bs, nword](const size_t * w) {
+      // FNV-1a over the determinant words. A bijective lexical index (Dice's choice)
+      // would also work; any order-independent function of the words alone is enough,
+      // since correctness needs only that all copies agree on the owner.
+      uint64_t h = 1469598103934665603ULL;
+      for (size_t k = 0; k < nword; ++k) {
+        h ^= static_cast<uint64_t>(w[k]);
+        h *= 1099511628211ULL;
+      }
+      return static_cast<int>(h % static_cast<uint64_t>(bs));
+    };
+
+    std::vector<int> scount(bs, 0);
+    for (size_t i = 0; i < nloc; ++i) scount[owner_of(acc_w.data() + i * nword)]++;
+
+    std::vector<int> rcount(bs, 0);
+    MPI_Alltoall(scount.data(), 1, MPI_INT, rcount.data(), 1, MPI_INT, b_comm);
+
+    std::vector<int> sdisp(bs, 0), rdisp(bs, 0);
+    for (int r = 1; r < bs; ++r) {
+      sdisp[r] = sdisp[r - 1] + scount[r - 1];
+      rdisp[r] = rdisp[r - 1] + rcount[r - 1];
+    }
+    const size_t nsend = static_cast<size_t>(sdisp[bs - 1] + scount[bs - 1]);
+    const size_t nrecv = static_cast<size_t>(rdisp[bs - 1] + rcount[bs - 1]);
+
+    // Pack grouped by destination.
+    std::vector<size_t> sw(nsend * nword);
+    std::vector<double> sn(nsend), sh(nsend);
+    {
+      std::vector<int> fill(sdisp);
+      for (size_t i = 0; i < nloc; ++i) {
+        const size_t * w = acc_w.data() + i * nword;
+        const int dst = owner_of(w);
+        const size_t slot = static_cast<size_t>(fill[dst]++);
+        for (size_t k = 0; k < nword; ++k) sw[slot * nword + k] = w[k];
+        sn[slot] = static_cast<double>(std::real(std::complex<double>(acc_n[i])));
+        sh[slot] = acc_h[i];
+      }
+    }
+
+    // Words move nword per entry; counts and displacements scale accordingly.
+    std::vector<int> scw(bs), rcw(bs), sdw(bs), rdw(bs);
+    for (int r = 0; r < bs; ++r) {
+      scw[r] = static_cast<int>(scount[r] * nword);
+      rcw[r] = static_cast<int>(rcount[r] * nword);
+      sdw[r] = static_cast<int>(sdisp[r]  * nword);
+      rdw[r] = static_cast<int>(rdisp[r]  * nword);
+    }
+
+    std::vector<size_t> rw(nrecv * nword);
+    std::vector<double> rn(nrecv), rh(nrecv);
+    MPI_Alltoallv(sw.data(), scw.data(), sdw.data(), SBD_MPI_SIZE_T,
+                  rw.data(), rcw.data(), rdw.data(), SBD_MPI_SIZE_T, b_comm);
+    MPI_Alltoallv(sn.data(), scount.data(), sdisp.data(), MPI_DOUBLE,
+                  rn.data(), rcount.data(), rdisp.data(), MPI_DOUBLE, b_comm);
+    MPI_Alltoallv(sh.data(), scount.data(), sdisp.data(), MPI_DOUBLE,
+                  rh.data(), rcount.data(), rdisp.data(), MPI_DOUBLE, b_comm);
+
+    // This rank now owns every copy of its share of the perturbers. Re-run the same
+    // collapse: sorted, duplicates summed LINEARLY, squared later exactly once.
+    acc_w.swap(rw); acc_h.swap(rh);
+    acc_n.assign(nrecv, Elem(0.0));
+    for (size_t i = 0; i < nrecv; ++i) acc_n[i] = static_cast<Elem>(rn[i]);
+    collapse_acc();
+
+    // The variational determinants must be routed by the SAME hash, or the
+    // set-difference below cannot see them.
+    //
+    // remove_variational binary-searches this rank's `det` slice, but after the
+    // shuffle a perturber is owned by whichever rank the hash chose -- which is
+    // generally NOT the rank holding that determinant in its slice. The search then
+    // misses, the determinant stays in the perturber list, and it is squared over a
+    // near-zero denominator: measured, removed_variational fell from 17492 to 4150 at
+    // b_comm = 4 and E_PT2 went to -0.412 against the correct -0.0457.
+    //
+    // So the det list is redistributed by the identical owner_of(), giving each rank
+    // exactly the determinants whose perturber copies it now holds. `det_owned` is
+    // used ONLY for the set-difference; `det` itself is left untouched because the
+    // reference loop is finished and variant (c) still needs its own slice.
+    {
+      std::vector<int> dsc(bs, 0);
+      const size_t ndl = det.size();
+      for (size_t i = 0; i < ndl; ++i) dsc[owner_of(det[i].data())]++;
+      std::vector<int> drc(bs, 0);
+      MPI_Alltoall(dsc.data(), 1, MPI_INT, drc.data(), 1, MPI_INT, b_comm);
+      std::vector<int> dsd(bs, 0), drd(bs, 0);
+      for (int r = 1; r < bs; ++r) {
+        dsd[r] = dsd[r - 1] + dsc[r - 1];
+        drd[r] = drd[r - 1] + drc[r - 1];
+      }
+      const size_t dns = static_cast<size_t>(dsd[bs - 1] + dsc[bs - 1]);
+      const size_t dnr = static_cast<size_t>(drd[bs - 1] + drc[bs - 1]);
+      std::vector<size_t> dsw(dns * nword);
+      {
+        std::vector<int> fill(dsd);
+        for (size_t i = 0; i < ndl; ++i) {
+          const size_t * w = det[i].data();
+          const size_t slot = static_cast<size_t>(fill[owner_of(w)]++);
+          for (size_t k = 0; k < nword; ++k) dsw[slot * nword + k] = w[k];
+        }
+      }
+      std::vector<int> dscw(bs), drcw(bs), dsdw(bs), drdw(bs);
+      for (int r = 0; r < bs; ++r) {
+        dscw[r] = static_cast<int>(dsc[r] * nword);
+        drcw[r] = static_cast<int>(drc[r] * nword);
+        dsdw[r] = static_cast<int>(dsd[r] * nword);
+        drdw[r] = static_cast<int>(drd[r] * nword);
+      }
+      std::vector<size_t> drw(dnr * nword);
+      MPI_Alltoallv(dsw.data(), dscw.data(), dsdw.data(), SBD_MPI_SIZE_T,
+                    drw.data(), drcw.data(), drdw.data(), SBD_MPI_SIZE_T, b_comm);
+      det_owned.resize(dnr, std::vector<size_t>(nword, 0));
+      for (size_t i = 0; i < dnr; ++i)
+        for (size_t k = 0; k < nword; ++k) det_owned[i][k] = drw[i * nword + k];
+      // Canonical order: remove_variational binary-searches this with less_from_back.
+      std::sort(det_owned.begin(), det_owned.end(),
+                [](const std::vector<size_t> & x, const std::vector<size_t> & y) {
+                  return sbd::less_from_back(x, y);
+                });
+      use_det_owned = true;
+    }
+  }
   std::vector<sbd::gdb::PT2Merged<Elem>> all;
   {
     const size_t nacc = acc_n.size();
@@ -602,7 +805,10 @@ int main(int argc, char * argv[]) {
   sbd::gdb::PT2SpinPureStats spst;
 
   if (opt.variant == sbd::gdb::PT2Variant::Determinant) {
-    n_removed_local = sbd::gdb::remove_variational(all, det);
+    // det_owned when the perturbers were hash-routed, `det` otherwise: the search has
+    // to be against the determinants that share this rank's hash bucket.
+    n_removed_local = use_det_owned ? sbd::gdb::remove_variational(all, det_owned)
+                                    : sbd::gdb::remove_variational(all, det);
     n_dets_pert_local = all.size();
     res = sbd::gdb::accumulate_pt2(all, e0, opt.den_floor);
   } else {
