@@ -310,6 +310,13 @@ int main(int argc, char * argv[]) {
   std::map<std::vector<size_t>, std::pair<Elem, double>> acc;
 
   size_t n_refs_local = 0, n_emitted_local = 0;
+  // Generation and merge are timed apart because they respond to different
+  // optimisations, and conflating them would misdirect the next one. Heat-bath
+  // sorted integrals would speed up GENERATION only (they let the excitation loop
+  // break early on a sorted integral list); the merge is dominated by std::map
+  // lookups on determinant keys and would not move at all. So "generation
+  // dominates" has to mean t_gen specifically, not t_gen + t_merge.
+  double t_gen = 0.0, t_merge = 0.0;
   if (holds_dets) {
     for (size_t i = 0; i < det.size(); ++i) {
       const double ac = std::abs(std::complex<double>(c[i]));
@@ -317,16 +324,20 @@ int main(int argc, char * argv[]) {
       ++n_refs_local;
       const std::vector<size_t> ref = det[i];
       raw.clear();
+      const double tg0 = MPI_Wtime();
       sbd::gdb::generate_perturbers_from<Elem>(ref, c[i], opt.epsilon2 / ac,
                                               bit_length, static_cast<size_t>(L),
                                               I0, I1, I2, scratch, raw);
+      t_gen += MPI_Wtime() - tg0;
       n_emitted_local += raw.size();
+      const double tm0 = MPI_Wtime();
       sbd::gdb::merge_pt2_perturbers(raw, merged);
       for (const auto & m : merged) {
         auto it = acc.find(m.det);
         if (it == acc.end()) acc.emplace(m.det, std::make_pair(m.num, m.haa));
         else it->second.first += m.num;
       }
+      t_merge += MPI_Wtime() - tm0;
     }
   }
 
@@ -415,7 +426,7 @@ int main(int argc, char * argv[]) {
         }
       }
       sbd::gdb::complete_pt2_numerators<Elem>(cfg, det, c, bit_length,
-                                              static_cast<size_t>(L),
+                                              static_cast<size_t>(L), nword,
                                               I0, I1, I2, row_var, row_off, spst);
       if (getenv("SBD_PT2_DECOMP")) {
         // SBD_PT2_DECOMP=1 -- the check that validates (c) as a whole.
@@ -544,8 +555,29 @@ int main(int argc, char * argv[]) {
   // be silently wrong. Hence the invariance check below stays, and the count is
   // printed so a future case that breaks the property is visible rather than
   // discovered as a discrepancy.
+  // Phase times as the MAX over b ranks: the slowest rank sets the wall clock, so an
+  // average would understate the bound and a sum would overstate it.
+  double tg = 0.0, tm = 0.0, tsp[3] = {0.0, 0.0, 0.0};
+  {
+    const double gc = holds_dets ? t_gen : 0.0;
+    const double mc = holds_dets ? t_merge : 0.0;
+    const double sc[3] = {holds_dets ? spst.t_complete : 0.0,
+                          holds_dets ? spst.t_numerators : 0.0,
+                          holds_dets ? spst.t_denominators : 0.0};
+    MPI_Allreduce(&gc, &tg, 1, MPI_DOUBLE, MPI_MAX, b_comm);
+    MPI_Allreduce(&mc, &tm, 1, MPI_DOUBLE, MPI_MAX, b_comm);
+    MPI_Allreduce(sc, tsp, 3, MPI_DOUBLE, MPI_MAX, b_comm);
+  }
+
   if (mpi_rank == 0) {
     const double t = MPI_Wtime() - t_pt2_start;
+    std::cout << " " << sbd::make_timestamp() << " pt2: timing: generate " << std::fixed
+              << std::setprecision(2) << tg << " s, merge " << tm << " s";
+    if (opt.variant == sbd::gdb::PT2Variant::SpinPure) {
+      std::cout << ", complete " << tsp[0] << " s, numerators " << tsp[1]
+                << " s, denominators " << tsp[2] << " s";
+    }
+    std::cout << ", total " << t << " s" << std::defaultfloat << std::endl;
     std::cout << " " << sbd::make_timestamp() << " pt2: references=" << n_refs
               << " emitted=" << n_emitted << " unique_dets=" << n_pert
               << " removed_variational=" << n_removed
@@ -558,11 +590,7 @@ int main(int argc, char * argv[]) {
                 << ", partly_variational=" << sp[5] << ")"
                 << " orbit_rows=" << sp[2]
                 << " (emitted=" << sp[3] << ", completed=" << sp[4] << ")"
-                << " csfs=" << sp[6]
-                << " [complete " << std::fixed << std::setprecision(2) << spst.t_complete
-                << " s, numerators " << spst.t_numerators
-                << " s, denominators " << spst.t_denominators << " s]"
-                << std::defaultfloat << std::endl;
+                << " csfs=" << sp[6] << std::endl;
       if (sp[2] > 0 && sp[4] == 0) {
         std::cout << " sbd: WARNING pt2: no orbit row needed completion. Every"
                   << " perturbing configuration was emitted whole, which is possible"

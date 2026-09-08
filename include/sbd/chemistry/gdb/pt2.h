@@ -891,7 +891,7 @@ namespace sbd {
     void complete_pt2_numerators(std::vector<PT2Config<ElemT>> & cfg,
                                  const DetsContainer & det,
                                  const std::vector<ElemT> & c,
-                                 size_t bit_length, size_t L,
+                                 size_t bit_length, size_t L, size_t nword,
                                  const ElemT & I0,
                                  const oneInt<ElemT> & I1,
                                  const twoInt<ElemT> & I2,
@@ -928,25 +928,59 @@ namespace sbd {
         if (any) ++st.n_configs_partly_variational;
       }
 
-      // x_r for the rows the generator skipped. Threaded over configurations, with
-      // per-thread Hij scratch: the loop body writes only into its own cfg[k], so
-      // there is no reduction and therefore no order-dependent summation -- the
-      // failure mode that produced the b_comm bug in the solver.
+      // x_r for the rows the generator skipped. This is the dominant cost of variant
+      // (c) and the only phase that scales worse than the space: it is
+      // (completed rows) x (references), so on N2 it went from 0.02 s at top100 to
+      // 7.62 s at top1000 -- 381x for a 45x larger space, while every other phase
+      // grew 6-59x. Two things make that affordable without changing the algorithm:
+      //
+      //   * References are copied into one flat buffer ONCE. `det[i]` on a det_vector
+      //     materialises a std::vector per access, so reading it in the innermost
+      //     loop meant ~1.4e9 heap allocations at top1000 -- more expensive than the
+      //     matrix element it was fetching an argument for.
+      //
+      //   * A popcount prefilter before Hij. H_ri vanishes unless the two
+      //     determinants differ by at most 2 spin-orbitals (4 differing bits), so
+      //     nearly every pair in that product is a guaranteed zero. Testing it with
+      //     an XOR-popcount over `nword` words rejects those without entering Hij,
+      //     which would otherwise walk every bit position to build its c/d lists
+      //     before reaching the same conclusion. This is exact, not a screening
+      //     threshold: it drops only pairs whose matrix element is identically zero.
+      //
+      // Threaded over configurations. The loop body writes only into its own cfg[k],
+      // so there is no reduction and no order-dependent summation -- the failure mode
+      // that produced the b_comm bug in the solver.
+      std::vector<size_t> refw(det.size() * nword, 0);
+      std::vector<size_t> refi;             // references with a nonzero coefficient
+      refi.reserve(det.size());
+      for (size_t i = 0; i < det.size(); ++i) {
+        if (std::abs(std::complex<double>(c[i])) == 0.0) continue;
+        const std::vector<size_t> ri = det[i];
+        for (size_t w = 0; w < nword; ++w) refw[i * nword + w] = ri[w];
+        refi.push_back(i);
+      }
+
       #pragma omp parallel
       {
         std::vector<int> sc(nso, 0), sd(nso, 0);
+        std::vector<size_t> rbuf(nword, 0);
         size_t orbDiff = 0;
         #pragma omp for schedule(dynamic, 1)
         for (size_t k = 0; k < cfg.size(); ++k) {
           for (size_t r = 0; r < cfg[k].rows.size(); ++r) {
             if (cfg[k].x_from_generator[r]) continue;
             if (row_variational_flat[row_offset[k] + r]) continue;  // config will be dropped
+            const std::vector<size_t> & row = cfg[k].rows[r];
             ElemT acc(0.0);
-            for (size_t i = 0; i < det.size(); ++i) {
-              const double ac = std::abs(std::complex<double>(c[i]));
-              if (ac == 0.0) continue;
-              const std::vector<size_t> ref = det[i];
-              const ElemT h = sbd::Hij(ref, cfg[k].rows[r], bit_length, L, sc, sd,
+            for (size_t q = 0; q < refi.size(); ++q) {
+              const size_t i = refi[q];
+              const size_t * rp = &refw[i * nword];
+              int nd = 0;
+              for (size_t w = 0; w < nword; ++w)
+                nd += __builtin_popcountll(rp[w] ^ row[w]);
+              if (nd > 4) continue;   // more than a double excitation: H_ri == 0
+              for (size_t w = 0; w < nword; ++w) rbuf[w] = rp[w];
+              const ElemT h = sbd::Hij(rbuf, row, bit_length, L, sc, sd,
                                        I0, I1, I2, orbDiff);
               if (h == ElemT(0.0)) continue;
               acc += h * c[i];
