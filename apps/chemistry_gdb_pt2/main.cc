@@ -28,6 +28,7 @@
 #include <cmath>
 
 #include <limits>
+#include <set>
 #include <omp.h>
 
 #include "sbd/sbd.h"
@@ -39,6 +40,11 @@ using Elem = std::complex<double>;
 #else
 using Elem = double;
 #endif
+
+// Total number of orbit rows described by a row_offset table.
+static inline size_t row_variational_size(const std::vector<size_t> & row_off) {
+  return row_off.empty() ? 0 : row_off.back();
+}
 
 int main(int argc, char * argv[]) {
 
@@ -326,38 +332,6 @@ int main(int argc, char * argv[]) {
   // and aborts on a mixed-Sz list; every rank of a b_comm shares the same (h,t)
   // coordinates, so `holds_dets` is uniform across it and the collective is safe.
   int Sz2 = 0;
-  if (opt.variant == sbd::gdb::PT2Variant::SpinPure && b_comm_size > 1) {
-    // REFUSED, rather than returned wrong.
-    //
-    // Variant (c)'s perturber index is a CSF spanning a whole spatial configuration,
-    // so a configuration's orbit must be complete on ONE rank: num_c = sum_r V_rc x_r
-    // needs every row's x_r, and x_r is summed over that rank's references only. With
-    // the references partitioned across b_comm, a perturbing configuration reachable
-    // from two ranks has its numerator split, and each rank then squares its own
-    // partial. Measured at K = 17688: E_PT2 = -0.390 against the correct -0.0441 at
-    // b_comm = 4, with the CSF count inflated from 243556 to 522857.
-    //
-    // The determinant-level cross-rank merge added for variant (a) does not fix this:
-    // it routes by determinant, which SPLITS configurations across owners -- the exact
-    // opposite of what (c) needs. Doing it properly means hashing on the configuration
-    // key so whole orbits co-locate, and completing each orbit against the global
-    // reference list rather than the local slice. That is not a small change, and
-    // shipping a plausible wrong number in the meantime is worse than refusing.
-    if (mpi_rank == 0) {
-      std::cerr << " sbd: ERROR pt2: --variant c requires --b_comm_size 1.\n"
-                << "      A target-S CSF spans a whole spatial configuration, so its"
-                << " orbit must live on one rank; with the references split across "
-                << b_comm_size << " b ranks the CSF numerators are split too and each"
-                << " rank squares its own partial.\n"
-                << "      Re-run with --b_comm_size 1 (use OMP_NUM_THREADS for"
-                << " parallelism -- the generation and denominator loops are"
-                << " threaded), or use --variant a, which merges across ranks"
-                << " correctly." << std::endl;
-    }
-    MPI_Abort(comm, 8);
-    return 8;
-  }
-
   if (opt.variant == sbd::gdb::PT2Variant::SpinPure) {
     if (holds_dets) {
       Sz2 = sbd::gdb::derive_common_sz2(det, bit_length, L, b_comm, comm);
@@ -825,49 +799,205 @@ int main(int argc, char * argv[]) {
     std::vector<size_t> row_off;
     if (holds_dets) {
       sbd::gdb::group_pt2_configs<Elem>(all, bit_length, L, nword, Sz2, det, cfg, spst);
-      // Cross-rank exposure specific to (c), checked rather than assumed. A completed
-      // orbit row's x_r is summed over THIS rank's references only, so if one
-      // perturbing configuration is reachable from references on two b ranks, each
-      // rank squares its own partial x_r and the CSF energy is wrong. Unlike (a)'s
-      // per-rank merge (dormant because perturber SETS turn out disjoint), this one
-      // depends on configurations being rank-local, which is what --do_redist_config
-      // provides. Count how many of this rank's perturbing configurations are also
-      // seen by another rank: zero means the property holds for this input.
+      // ---- MULTI-RANK VARIANT (c) --------------------------------------------
+      //
+      // Two things break variant (c) when the references are partitioned, and only
+      // the first is the one (a) had:
+      //
+      //   1. A perturbing configuration is reachable from references on several
+      //      ranks, so each rank sees only part of its orbit.
+      //   2. Worse, x_r = sum_i H_ri c_i is summed over THIS rank's references only.
+      //      Even given the whole orbit, the numerators would be partial.
+      //
+      // The determinant-level hash that fixes (a) cannot fix either: routing by
+      // determinant SPLITS configurations, which is the opposite of what a CSF needs.
+      //
+      // So the configuration set is REPLICATED across b_comm and the numerators are
+      // summed globally. That is affordable because configurations are far fewer than
+      // determinants and each carries only its orbit: at K = 17688, 42747 configs and
+      // 1.11e6 orbit rows, so ~18 MB of rows and a ~9 MB allreduce against a
+      // calculation that already holds a million perturbers per rank. Replicating
+      // DETERMINANTS would not be affordable; replicating configurations is.
+      //
+      // Each rank then contributes its own partial x_r for every row of every
+      // configuration -- emitted rows and completion-only rows alike, since both are
+      // partial once the references are split -- and one allreduce over b_comm makes
+      // every x_r the global sum. After that each rank holds the identical, exact
+      // orbit numerators, and the projection is partitioned so no work is repeated.
       if (b_comm_size > 1) {
-        // A cheap order-independent fingerprint of the configuration set. Summing
-        // per-config hashes over b_comm and comparing against the count of distinct
-        // configs would not localize a collision, so instead each rank hashes its
-        // config list into a fixed number of buckets and the buckets are summed: a
-        // config present on two ranks lands in the same bucket twice.
-        const size_t NB = 1u << 16;
-        std::vector<int> mine(NB, 0);
-        for (const auto & pc : cfg) {
-          size_t hh = 1469598103934665603ULL;
-          for (int v : pc.config) { hh ^= (size_t)(v + 1); hh *= 1099511628211ULL; }
-          mine[hh % NB] = 1;
-        }
-        std::vector<int> tot(NB, 0);
-        MPI_Allreduce(mine.data(), tot.data(), (int)NB, MPI_INT, MPI_SUM, b_comm);
-        size_t shared_buckets = 0;
-        for (size_t k2 = 0; k2 < NB; ++k2) if (tot[k2] > 1) ++shared_buckets;
         int rb = 0; MPI_Comm_rank(b_comm, &rb);
-        if (rb == 0 && shared_buckets > 0) {
-          std::cout << " sbd: WARNING pt2: " << shared_buckets << " configuration"
-                    << " hash bucket(s) are populated on more than one b rank. If"
-                    << " those are genuinely the same configurations (not hash"
-                    << " collisions), variant (c) is INEXACT at b_comm_size > 1:"
-                    << " a completed orbit row's numerator is summed over one rank's"
-                    << " references only, then squared per rank. Re-run with"
-                    << " --b_comm_size 1 to get the exact value." << std::endl;
-        } else if (rb == 0) {
-          std::cout << " " << sbd::make_timestamp() << " pt2: configuration sets are"
-                    << " disjoint across all " << b_comm_size << " b ranks; the"
-                    << " spin-pure numerators are exact." << std::endl;
+
+        // (a) Gather the union of every rank's perturbing configurations. The key is
+        // the per-orbital 0/1/2 pattern, packed two bits per orbital so it is a plain
+        // byte string and can go through Allgatherv without a custom datatype.
+        const int kw = (L + 31) / 32;   // 64-bit words holding 2 bits per orbital
+        auto pack_cfg = [kw, L](const std::vector<int> & cf, size_t * out) {
+          for (int w = 0; w < kw; ++w) out[w] = 0;
+          for (int q = 0; q < L; ++q) {
+            const size_t v = static_cast<size_t>(cf[q] & 3);
+            out[q / 32] |= (v << (2 * (q % 32)));
+          }
+        };
+        auto unpack_cfg = [kw, L](const size_t * in, std::vector<int> & cf) {
+          cf.assign(L, 0);
+          for (int q = 0; q < L; ++q)
+            cf[q] = static_cast<int>((in[q / 32] >> (2 * (q % 32))) & 3);
+        };
+
+        std::vector<size_t> mykeys(cfg.size() * kw, 0);
+        for (size_t k2 = 0; k2 < cfg.size(); ++k2)
+          pack_cfg(cfg[k2].config, mykeys.data() + k2 * kw);
+
+        int myn = static_cast<int>(cfg.size());
+        std::vector<int> alln(b_comm_size, 0);
+        MPI_Allgather(&myn, 1, MPI_INT, alln.data(), 1, MPI_INT, b_comm);
+        std::vector<int> cnt(b_comm_size), dsp(b_comm_size, 0);
+        for (int r = 0; r < b_comm_size; ++r) cnt[r] = alln[r] * kw;
+        for (int r = 1; r < b_comm_size; ++r) dsp[r] = dsp[r - 1] + cnt[r - 1];
+        const size_t tot_words = static_cast<size_t>(dsp[b_comm_size - 1] + cnt[b_comm_size - 1]);
+        std::vector<size_t> allkeys(tot_words, 0);
+        MPI_Allgatherv(mykeys.data(), myn * kw, SBD_MPI_SIZE_T,
+                       allkeys.data(), cnt.data(), dsp.data(), SBD_MPI_SIZE_T, b_comm);
+
+        // (b) Deduplicate into one globally identical, deterministically ordered list.
+        // std::set on the packed key gives the same order on every rank without
+        // further communication, which the allreduce below depends on absolutely: the
+        // i-th row on one rank must be the i-th row on all of them.
+        std::set<std::vector<size_t>> uniq;
+        const size_t ncfg_all = tot_words / static_cast<size_t>(kw);
+        for (size_t k2 = 0; k2 < ncfg_all; ++k2)
+          uniq.insert(std::vector<size_t>(allkeys.begin() + k2 * kw,
+                                          allkeys.begin() + (k2 + 1) * kw));
+
+        // (c) Rebuild cfg from the union, preserving any numerators this rank already
+        // has for configurations it generated itself.
+        std::map<std::vector<size_t>, size_t> mine_by_key;
+        for (size_t k2 = 0; k2 < cfg.size(); ++k2) {
+          std::vector<size_t> key(kw, 0);
+          pack_cfg(cfg[k2].config, key.data());
+          mine_by_key[key] = k2;
+        }
+        std::vector<sbd::gdb::PT2Config<Elem>> ncfg;
+        ncfg.reserve(uniq.size());
+        for (const auto & key : uniq) {
+          auto it = mine_by_key.find(key);
+          if (it != mine_by_key.end()) {
+            ncfg.push_back(std::move(cfg[it->second]));
+          } else {
+            // A configuration only another rank reached. Build its orbit from scratch
+            // with x = 0; this rank's contribution to every row comes from the
+            // completion pass below.
+            std::vector<int> cf;
+            unpack_cfg(key.data(), cf);
+            int n_open = 0;
+            for (int v : cf) if (v == 1) ++n_open;
+            const int n_up = (n_open + Sz2) / 2;
+            if (((n_open + Sz2) % 2) != 0 || n_up < 0 || n_up > n_open) continue;
+            const auto masks = sbd::gdb::_open_shell_arrangements(n_open, n_up);
+            sbd::gdb::PT2Config<Elem> pc;
+            pc.config = cf;
+            pc.n_open = n_open;
+            pc.rows.resize(masks.size());
+            pc.x.assign(masks.size(), Elem(0.0));
+            // No row is marked as coming from the generator: on THIS rank none did,
+            // so every row's x_r must be computed in the completion pass.
+            pc.x_from_generator.assign(masks.size(), false);
+            for (size_t r2 = 0; r2 < masks.size(); ++r2)
+              sbd::gdb::_det_from_config(cf, masks[r2], bit_length, nword, pc.rows[r2]);
+            ncfg.push_back(std::move(pc));
+          }
+        }
+        cfg.swap(ncfg);
+
+        // (d) Every row's x_r is now partial on every rank, including the ones this
+        // rank's generator emitted -- those summed only over local references too. So
+        // clear the "already have it" flags and let the completion pass compute this
+        // rank's contribution for ALL rows uniformly, then sum over b_comm.
+        for (auto & pc : cfg)
+          pc.x_from_generator.assign(pc.rows.size(), false);
+
+        // Restate the counts for the REPLICATED set. group_pt2_configs filled these
+        // from this rank's own perturbers, which is no longer what is being projected:
+        // reporting those would print a per-rank fragment under a global heading, the
+        // same class of misleading diagnostic that cost a debugging round when
+        // `unique` was printing CSFs under a determinant label.
+        spst.n_configs = cfg.size();
+        spst.n_rows_total = 0;
+        for (const auto & pc : cfg) spst.n_rows_total += pc.rows.size();
+
+        if (rb == 0) {
+          std::cout << " " << sbd::make_timestamp() << " pt2: variant (c) multi-rank:"
+                    << " " << cfg.size() << " configurations replicated across "
+                    << b_comm_size << " b ranks; numerators summed globally."
+                    << std::endl;
         }
       }
+
       sbd::gdb::complete_pt2_numerators<Elem>(cfg, det, c, bit_length,
                                               static_cast<size_t>(L), nword,
                                               I0, I1, I2, row_var, row_off, spst);
+
+      if (b_comm_size > 1) {
+        // COST NOTE. Completion above scanned every orbit row against this rank's
+        // references, and every rank does that for the full replicated config set, so
+        // the numerator phase does NOT get cheaper with b_comm -- it is
+        // (all orbit rows) x (this rank's references), and the second factor shrinks
+        // while the first grows to the global union. Measured at K = 17688: 1.9 s at
+        // b_comm = 1 against 14.8 s at b_comm = 2, then falling again (7.5 s at 4,
+        // 3.7 s at 8) as the per-rank reference count drops. It cannot be avoided by
+        // partitioning: x_r is a sum over ALL references, so every rank must
+        // contribute its own share for every row it does not own.
+        //
+        // Sum the partial x_r over b_comm. Every rank holds the identical orbit rows
+        // in the identical order (the set<> ordering above guarantees it), so a flat
+        // allreduce is a row-for-row sum and needs no matching step.
+        //
+        // MPI_SUM over doubles combines in an implementation-defined order, so the
+        // last bits of x_r can vary with rank count -- unavoidable for a distributed
+        // sum, and different in kind from the reduction(+:) hazard in the solver:
+        // there the varying order broke an INVARIANT (a symmetric Rayleigh matrix)
+        // and produced energies below the true ground state. Here it perturbs a
+        // numerator by ~1e-16 relative, so agreement across layouts is to round-off
+        // rather than bit-for-bit, and that is what the tests assert.
+        size_t nrow_tot = 0;
+        for (const auto & pc : cfg) nrow_tot += pc.x.size();
+        std::vector<double> xbuf(nrow_tot, 0.0), xsum(nrow_tot, 0.0);
+        size_t at = 0;
+        for (const auto & pc : cfg)
+          for (size_t r2 = 0; r2 < pc.x.size(); ++r2)
+            xbuf[at++] = static_cast<double>(std::real(std::complex<double>(pc.x[r2])));
+        MPI_Allreduce(xbuf.data(), xsum.data(), static_cast<int>(nrow_tot),
+                      MPI_DOUBLE, MPI_SUM, b_comm);
+        at = 0;
+        for (auto & pc : cfg)
+          for (size_t r2 = 0; r2 < pc.x.size(); ++r2)
+            pc.x[r2] = static_cast<Elem>(xsum[at++]);
+
+        // A row that is variational on ANY rank makes its configuration ineligible
+        // everywhere, so the flags must be OR-ed across b_comm too. `det` is this
+        // rank's slice, so each rank only sees part of the variational space.
+        std::vector<int> vloc(row_variational_size(row_off), 0), vglb;
+        for (size_t q = 0; q < vloc.size(); ++q) vloc[q] = row_var[q] ? 1 : 0;
+        vglb.assign(vloc.size(), 0);
+        MPI_Allreduce(vloc.data(), vglb.data(), static_cast<int>(vloc.size()),
+                      MPI_INT, MPI_MAX, b_comm);
+        for (size_t q = 0; q < vglb.size(); ++q) row_var[q] = (vglb[q] != 0);
+
+        // Partition the CSF projection: every rank now holds identical data, so
+        // without this each would compute the whole sum and the allreduce would
+        // multiply E_PT2 by b_comm_size. Skipping a configuration is expressed by
+        // marking it variational, which the accumulator already treats as "exclude
+        // this configuration whole" -- no new code path, and no risk of the two
+        // exclusion rules diverging.
+        {
+          int rb2 = 0; MPI_Comm_rank(b_comm, &rb2);
+          for (size_t k2 = 0; k2 < cfg.size(); ++k2) {
+            if (static_cast<int>(k2 % static_cast<size_t>(b_comm_size)) == rb2) continue;
+            for (size_t r2 = 0; r2 < cfg[k2].rows.size(); ++r2)
+              row_var[row_off[k2] + r2] = true;
+          }
+        }
+      }
       if (getenv("SBD_PT2_DECOMP")) {
         // SBD_PT2_DECOMP=1 -- the check that validates (c) as a whole.
         //
@@ -967,6 +1097,12 @@ int main(int argc, char * argv[]) {
   // legitimately discards; rows_variational accounts for the rest.
   size_t sp[7] = {0, 0, 0, 0, 0, 0, 0};
   if (opt.variant == sbd::gdb::PT2Variant::SpinPure) {
+    // With b_comm_size > 1 the CONFIGURATION set is replicated on every rank, so
+    // summing the config/row counts over b_comm would multiply them by the rank count
+    // -- it reported 67631 configs at b_comm = 2 where the true number is 42747. Only
+    // the CSF count is genuinely partitioned (each rank projects its own slice), so
+    // that one is summed and the rest are taken from one rank. At b_comm_size == 1
+    // the two agree, so the same code covers both.
     const size_t sc[7] = {
       holds_dets ? spst.n_configs : 0,
       holds_dets ? spst.n_configs_no_target_s : 0,
@@ -976,7 +1112,17 @@ int main(int argc, char * argv[]) {
       holds_dets ? spst.n_configs_partly_variational : 0,
       holds_dets ? spst.n_csf : 0,
     };
-    MPI_Allreduce(sc, sp, 7, SBD_MPI_SIZE_T, MPI_SUM, b_comm);
+    if (b_comm_size > 1) {
+      // csfs: summed (partitioned). Everything else: rank 0's copy (replicated).
+      size_t ncsf_sum = 0;
+      const size_t ncsf_c = holds_dets ? spst.n_csf : 0;
+      MPI_Allreduce(&ncsf_c, &ncsf_sum, 1, SBD_MPI_SIZE_T, MPI_SUM, b_comm);
+      for (int q = 0; q < 7; ++q) sp[q] = sc[q];
+      MPI_Bcast(sp, 6, SBD_MPI_SIZE_T, 0, b_comm);
+      sp[6] = ncsf_sum;
+    } else {
+      MPI_Allreduce(sc, sp, 7, SBD_MPI_SIZE_T, MPI_SUM, b_comm);
+    }
   }
 
   // A REMAINING GAP, dormant on the cases tested so far but real. Perturbers are

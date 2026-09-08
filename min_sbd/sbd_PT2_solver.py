@@ -175,7 +175,16 @@ class SBDPT2Corrector:
                 hash-partitioned Alltoallv, so E_PT2 is exact and bit-identical for
                 any b_comm_size. Variant (c) does NOT support b_comm_size > 1 and
                 this constructor rejects it -- its perturber index is a CSF spanning
-                a whole configuration, which a determinant-level partition splits.
+                a whole configuration, which a determinant-level partition
+                splits. Variant (c) supports it too, by a different route: the
+                configuration set is replicated across b_comm and the orbit
+                numerators are summed globally, so its result agrees across layouts
+                to round-off (~1e-9 relative) rather than bit-for-bit, since a
+                distributed MPI_SUM combines in an implementation-defined order.
+                Note that (c)'s numerator phase does not speed up monotonically
+                with b_comm: each rank scans every replicated orbit row against its
+                own references, so the row count grows to the global union as the
+                per-rank reference count falls.
             t_comm_size: task communicator. Must not exceed ``b_comm_size``; the
                 binary aborts otherwise rather than returning a plausible number.
             variant: ``"a"`` (determinant perturbers) or ``"c"`` (target-S CSF
@@ -239,15 +248,6 @@ class SBDPT2Corrector:
                 f"t_comm_size ({t_comm_size}) must not exceed b_comm_size "
                 f"({b_comm_size}); t_comm partitions exactly b_comm_size "
                 f"ring-rotation tasks, so surplus t ranks would get an empty range"
-            )
-        if variant == "c" and b_comm_size > 1:
-            raise ValueError(
-                f"variant='c' requires b_comm_size=1 (got {b_comm_size}). A target-S "
-                f"CSF spans a whole spatial configuration, so its orbit must live on "
-                f"one rank; splitting the references across b ranks splits the CSF "
-                f"numerators and each rank then squares its own partial. Use "
-                f"omp_num_threads for parallelism -- the generation and denominator "
-                f"loops are threaded -- or variant='a', which merges across ranks."
             )
         if mpi_np % (b_comm_size * t_comm_size) != 0:
             raise ValueError(
