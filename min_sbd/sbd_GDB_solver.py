@@ -998,7 +998,9 @@ def npz_to_pt2_flat(
     Args:
         npz_path: the merged archive written by :func:`_write_merged_wavefunction`.
         flat_path: output path.
-        e0: variational (electronic) energy of this root.
+        e0: variational energy of this root INCLUDING the FCIDUMP core energy, i.e.
+            ``result.energy + core_energy``. PT2's diagonal elements carry ECORE, so
+            an electronic E_0 puts the denominators on the wrong scale.
         norb: number of spatial orbitals.
         bit_length: MUST match the solve; sets the determinant row width.
 

@@ -86,7 +86,14 @@ namespace sbd {
       std::vector<std::string> detfiles;///< variational determinant list
       std::string loadname;             ///< wavefunction: flat binary, or shard prefix
       double epsilon2   = 1.0e-8;       ///< screening: keep |H_ai c_i| > epsilon2
-      double e0         = 0.0;          ///< variational energy E_0 (electronic)
+      /// Variational energy E_0, on the SAME scale as H_aa -- i.e. INCLUDING the
+      /// FCIDUMP core energy. ZeroExcite returns `energy + I0`, so every diagonal
+      /// element here carries ECORE and E_0 must too. Passing an electronic energy
+      /// (ECORE excluded) shifts every denominator by |ECORE| and yields a small
+      /// POSITIVE E_PT2, which reads like a converged answer rather than an error.
+      /// The app checks for this against the reference space's own diagonal minimum
+      /// and aborts with the corrected value, so it cannot pass silently.
+      double e0         = 0.0;
       bool   e0_given   = false;        ///< false => must be read from the wavefunction file
       PT2Variant variant = PT2Variant::Determinant;
       int    multiplicity = -1;         ///< 2S+1 for the spin-pure variant; <1 = off

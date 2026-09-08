@@ -27,6 +27,7 @@
 #define _USE_MATH_DEFINES
 #include <cmath>
 
+#include <limits>
 #include <omp.h>
 
 #include "sbd/sbd.h"
@@ -242,6 +243,57 @@ int main(int argc, char * argv[]) {
                 << std::abs(nrm2 - 1.0)
                 << "; PT2 numerators scale with c, so the correction will be"
                 << " scaled by the same factor." << std::endl;
+    }
+  }
+
+  // ------------------------------------------ E_0 must be on the SAME SCALE as H_aa
+  //
+  // ZeroExcite returns `energy + I0`, and I0 is the FCIDUMP's ECORE line. So every
+  // H_aa here INCLUDES the core energy, and E_0 must too. Passing the electronic
+  // energy (ECORE excluded) instead shifts every denominator by |ECORE| -- for N2 in
+  // this basis, by 83.4 Ha -- and produces a small POSITIVE E_PT2 rather than an
+  // obviously broken one, which is a result a caller can easily mistake for a
+  // converged answer. Observed in the field: E_var = -25.410478 (electronic) passed
+  // where -108.843540 (total) was needed, giving E_PT2 = +1.8e-4.
+  //
+  // This is checked, not documented and hoped for. The variational energy of a
+  // ground-state root is at or below the lowest diagonal element of its own space
+  // (it is a Rayleigh quotient over that space, and the diagonal entries are the
+  // quotients of the individual basis vectors). So E_0 > min_i H_ii + a tolerance
+  // means the scales disagree, and the size of the gap says by how much -- which is
+  // usually recognisably ECORE.
+  {
+    double hmin_local = std::numeric_limits<double>::max();
+    if (holds_dets && det.size() > 0) {
+      std::vector<int> sc0(2 * L, 0), sd0(2 * L, 0);
+      const size_t nprobe = std::min<size_t>(det.size(), 4096);
+      for (size_t i = 0; i < nprobe; ++i) {
+        std::vector<size_t> row(nword, 0);
+        const size_t * rp = det[i].data();
+        for (size_t w = 0; w < nword; ++w) row[w] = rp[w];
+        const double hii = static_cast<double>(std::real(std::complex<double>(
+            sbd::ZeroExcite(row, bit_length, static_cast<size_t>(L), I0, I1, I2))));
+        hmin_local = std::min(hmin_local, hii);
+      }
+    }
+    double hmin = std::numeric_limits<double>::max();
+    MPI_Allreduce(&hmin_local, &hmin, 1, MPI_DOUBLE, MPI_MIN, comm);
+    if (hmin != std::numeric_limits<double>::max() && e0 > hmin + 1.0e-6) {
+      if (mpi_rank == 0) {
+        const double i0 = static_cast<double>(std::real(std::complex<double>(I0)));
+        std::cerr << " sbd: ERROR pt2: E_0 = " << std::setprecision(12) << e0
+                  << " lies ABOVE the lowest diagonal energy of its own reference"
+                  << " space (" << hmin << ").\n"
+                  << "      A ground-state Rayleigh quotient cannot do that, so E_0"
+                  << " and H_aa are on different energy scales.\n"
+                  << "      H_aa here includes the FCIDUMP core energy ECORE = "
+                  << i0 << ", so --e0 must be the TOTAL energy, not the electronic"
+                  << " one.\n"
+                  << "      If the solver reported an electronic energy E_elec, pass"
+                  << " --e0 " << (e0 + i0) << " (that is E_0 + ECORE)." << std::endl;
+      }
+      MPI_Abort(comm, 7);
+      return 7;
     }
   }
 

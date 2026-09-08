@@ -309,7 +309,13 @@ class SBDPT2Corrector:
 
         Args:
             npz_path: the merged archive.
-            e0: variational (electronic) energy of the root being corrected.
+            e0: variational energy of the root, INCLUDING the FCIDUMP core energy.
+                This is the number that matches the diagonal elements PT2 computes,
+                which carry ECORE. `SBDGdbSolver` reports an ELECTRONIC energy, so
+                what goes here is ``result.energy + core_energy``, not
+                ``result.energy``. Getting it wrong shifts every denominator by
+                |ECORE| and gives a small positive E_PT2 -- the binary detects that
+                and aborts with the corrected value rather than returning it.
             norb: spatial orbitals.
             ci_strings: ``(strs_a, strs_b)``, paired, as handed to the solver.
             detfile: an existing determinant file, if you prefer.
@@ -342,6 +348,8 @@ class SBDPT2Corrector:
         files are named ``<prefix>000000.bin``, ``<prefix>000001.bin``, ... so a
         multi-root solve writing ``wf_root0000000.bin`` has prefix ``wf_root0``.
         Getting this wrong produces "no shard found", not a wrong answer.
+
+        ``e0`` includes the core energy here too -- see :meth:`correct_from_npz`.
 
         Shards carry no energy, so ``e0`` is required here and is not cross-checked
         against anything -- unlike the ``.npz`` path, where the flat file stores
