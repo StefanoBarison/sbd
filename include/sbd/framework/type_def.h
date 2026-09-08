@@ -13,11 +13,12 @@
 // <stdint.h>), and uint32_t is declared there. <limits.h> alone supplies only the
 // CHAR/SHRT/INT/LONG/LLONG limits, NOT SIZE_MAX.
 //
-// This built for years without it because every app happened to include a standard
-// header that pulled <cstdint> in transitively first -- <random> in the diag app, for
-// instance. An app that includes only what it uses hits `#error SIZE_MAX` plus ~30
-// cascading "SBD_MPI_SIZE_T was not declared" errors, which is what the chemistry_gdb_pt2
-// app did on GCC with a newer libstdc++, where the transitive include is gone.
+// This header built for years without it by relying on <complex> -- its OWN first
+// include -- to pull <cstdint> in transitively. libc++ does; libstdc++ does not. So the
+// same header compiles on Apple clang and fails on GCC with `#error SIZE_MAX` plus ~30
+// cascading "SBD_MPI_SIZE_T was not declared" errors, which is what building the
+// chemistry_gdb_pt2 app on a GCC cluster produced. The dependency is on the standard
+// library implementation, not on anything the including app does.
 #include <cstdint>
 
 #include "mpi.h"
