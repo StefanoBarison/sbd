@@ -300,14 +300,104 @@ int main(int argc, char * argv[]) {
   int mpi_size_b_; MPI_Comm_size(b_comm, &mpi_size_b_);
 
   sbd::gdb::PT2Scratch scratch;
+  std::vector<size_t> ref;      // reused reference row; see the loop below
   std::vector<sbd::gdb::PT2Perturber<Elem>> raw;
   std::vector<sbd::gdb::PT2Merged<Elem>> merged;
 
-  // Running accumulation keyed by determinant. This is the cross-batch equivalent of
-  // the hash-partitioned merge: contributions to one perturber from references in
-  // different batches must still be SUMMED before squaring, so the energy cannot be
-  // accumulated per batch -- only the numerators can.
-  std::map<std::vector<size_t>, std::pair<Elem, double>> acc;
+  // Running accumulation of every emitted perturber, as a FLAT packed store:
+  // `acc_w` holds the determinant words back to back (nword per entry) and `acc_n` /
+  // `acc_h` the numerator and diagonal energy. Contributions to one perturber from
+  // different references must be SUMMED before squaring, so they cannot be reduced
+  // as they arrive; they are appended here and combined in one sort-and-merge pass
+  // after the loop.
+  //
+  // This replaced a std::map<std::vector<size_t>, ...>, which cost about 120 bytes
+  // per unique perturber -- a red-black node, a std::vector object, a heap block for
+  // its two words, and the payload -- against 24 bytes here. At K = 17688 (1.02e6
+  // unique perturbers) that map was ~122 MB of the run's 254 MB peak, and its
+  // per-insert allocation and pointer-chasing were also why the merge phase was the
+  // worst-scaling part of the calculation (59x for a 45x larger space).
+  std::vector<size_t> acc_w;
+  std::vector<Elem>   acc_n;
+  std::vector<double> acc_h;
+
+  // The flat store grows with the EMITTED count, not the unique count -- 9.06e6
+  // against 1.02e6 at K = 17688, because the per-reference merge only removes
+  // duplicates within one reference. Left unbounded that is a 4x memory regression
+  // against the std::map it replaced (measured: 739 MB against 175 MB), so the store
+  // is collapsed in place whenever it exceeds a bound: sorted, duplicates summed,
+  // and shrunk back to the unique count. Collapsing is the SAME operation as the
+  // final merge -- linear accumulation of numerators, never a square -- so doing it
+  // early cannot change the result, only when the memory is released.
+  //
+  // The trigger GROWS with the unique count instead of being a fixed number, and that
+  // is not tuning -- a fixed threshold is quadratic whenever it lands below the unique
+  // count. Tried 6e5 on a case whose unique count is 1.02e6: the collapse could never
+  // bring the store under the threshold, so it re-sorted ~1e6 entries after almost
+  // every reference and the merge went from 1.3 s to 237 s, with peak RSS rising to
+  // 793 MB because each collapse's shrink_to_fit churned the allocator. Growth-based
+  // triggering cannot fall into that: the store must DOUBLE past what survived the
+  // last collapse before paying for another, so the collapse count is logarithmic in
+  // the emitted count and each one discards at least half of what it looks at.
+  const size_t acc_collapse_floor = std::max<size_t>(1, opt.batch_size);
+  size_t acc_collapse_at = acc_collapse_floor;   // grows to 2x the survivors of each collapse
+
+  // Sort the flat store by canonical from-back order and combine duplicates, SUMMING
+  // their numerators. Used for the periodic collapse and for the final pass, so the
+  // two cannot drift apart. An index permutation is sorted, so determinant words are
+  // moved once, at the rewrite, rather than during the sort.
+  auto collapse_acc = [&acc_w, &acc_n, &acc_h, nword]() {
+    const size_t n = acc_n.size();
+    if (n < 2) return;
+    std::vector<size_t> ord(n);
+    for (size_t i = 0; i < n; ++i) ord[i] = i;
+    const size_t * wp = acc_w.data();
+    std::sort(ord.begin(), ord.end(), [wp, nword](size_t x, size_t y) {
+      const size_t * a = wp + x * nword;
+      const size_t * b = wp + y * nword;
+      for (size_t k = nword; k > 0; --k) {
+        if (a[k - 1] < b[k - 1]) return true;
+        if (a[k - 1] > b[k - 1]) return false;
+      }
+      return false;
+    });
+    // Rewritten OUT OF PLACE, into fresh arrays, then swapped in.
+    //
+    // An in-place rewrite through the permutation looks tempting -- the write index
+    // never overtakes the loop counter -- but it is WRONG, and measurably so: ord[q]
+    // can point at a slot below the write cursor whose contents have already been
+    // overwritten, so the row read back is garbage and no longer matches its own
+    // duplicate. Tried, and it inflated the unique count from 79399 to 123608 and
+    // E_PT2 from -0.1041 to -0.0042. Permuting in place needs cycle-following, not a
+    // forward sweep, and is not worth it here: the cost of doing it correctly is one
+    // transient copy of a store that has already been bounded by acc_collapse_at.
+    std::vector<size_t> ow; ow.reserve(acc_w.size());
+    std::vector<Elem>   on; on.reserve(n);
+    std::vector<double> oh; oh.reserve(n);
+    for (size_t q = 0; q < n; ++q) {
+      const size_t i = ord[q];
+      const size_t * a = acc_w.data() + i * nword;
+      bool same = false;
+      if (!on.empty()) {
+        same = true;
+        const size_t * b = ow.data() + (on.size() - 1) * nword;
+        for (size_t w = 0; w < nword; ++w)
+          if (b[w] != a[w]) { same = false; break; }
+      }
+      if (same) {
+        on.back() += acc_n[i];       // linear; the square happens once, later
+      } else {
+        ow.insert(ow.end(), a, a + nword);
+        on.push_back(acc_n[i]);
+        oh.push_back(acc_h[i]);
+      }
+    }
+    // Swap, but do NOT shrink_to_fit here. The freed capacity is about to be refilled
+    // by the next batch of references, and returning it to the allocator on every
+    // collapse measurably raised peak RSS rather than lowering it. It is released once,
+    // after the final collapse, where it actually stays released.
+    acc_w.swap(ow); acc_n.swap(on); acc_h.swap(oh);
+  };
 
   size_t n_refs_local = 0, n_emitted_local = 0;
   // Generation and merge are timed apart because they respond to different
@@ -317,12 +407,19 @@ int main(int argc, char * argv[]) {
   // lookups on determinant keys and would not move at all. So "generation
   // dominates" has to mean t_gen specifically, not t_gen + t_merge.
   double t_gen = 0.0, t_merge = 0.0;
+  size_t n_collapses = 0;
   if (holds_dets) {
     for (size_t i = 0; i < det.size(); ++i) {
       const double ac = std::abs(std::complex<double>(c[i]));
       if (ac == 0.0) continue;            // a zero-weight reference contributes nothing
       ++n_refs_local;
-      const std::vector<size_t> ref = det[i];
+      // det[i] is a non-owning row view into det's flat store; the copy into a
+      // std::vector is needed only because generate_perturbers_from (and Hij beneath
+      // it) take std::vector<size_t>. Reused across references so it allocates once,
+      // not once per reference.
+      ref.assign(nword, 0);
+      { const size_t * rp = det[i].data();
+        for (size_t w = 0; w < nword; ++w) ref[w] = rp[w]; }
       raw.clear();
       const double tg0 = MPI_Wtime();
       sbd::gdb::generate_perturbers_from<Elem>(ref, c[i], opt.epsilon2 / ac,
@@ -331,32 +428,55 @@ int main(int argc, char * argv[]) {
       t_gen += MPI_Wtime() - tg0;
       n_emitted_local += raw.size();
       const double tm0 = MPI_Wtime();
+      // Merge within this reference's own output first: it is already sorted by
+      // merge_pt2_perturbers, so duplicates from the SAME reference (reachable by two
+      // excitation paths) are combined before they ever reach the flat store, which
+      // keeps its length near the unique count rather than the emitted count.
       sbd::gdb::merge_pt2_perturbers(raw, merged);
       for (const auto & m : merged) {
-        auto it = acc.find(m.det);
-        if (it == acc.end()) acc.emplace(m.det, std::make_pair(m.num, m.haa));
-        else it->second.first += m.num;
+        acc_w.insert(acc_w.end(), m.det.begin(), m.det.end());
+        acc_n.push_back(m.num);
+        acc_h.push_back(m.haa);
+      }
+      if (acc_n.size() >= acc_collapse_at) {
+        collapse_acc();
+        ++n_collapses;
+        // Next collapse only after the store has doubled past what survived this one.
+        acc_collapse_at = std::max<size_t>(acc_collapse_floor, 2 * acc_n.size());
       }
       t_merge += MPI_Wtime() - tm0;
     }
   }
 
-  // Flatten the running accumulation. std::map iterates in ITS key order
-  // (lexicographic over the words), not the canonical less_from_back order that
-  // remove_variational's binary search requires, so the sort below is load-bearing
-  // rather than tidying.
+  // Sort the flat store by determinant and combine duplicates, SUMMING numerators.
+  // An index permutation is sorted rather than the rows themselves, so no determinant
+  // words are moved during the sort.
+  //
+  // The order is canonical less_from_back, which is not optional: remove_variational
+  // and the variational-row scan in variant (c) both binary-search `det` in that
+  // order, and the merge below relies on equal determinants being adjacent.
+  const double tsort0 = MPI_Wtime();
+  collapse_acc();      // final sort-and-sum; leaves the store unique and ordered
   std::vector<sbd::gdb::PT2Merged<Elem>> all;
-  all.reserve(acc.size());
-  for (const auto & [d, nh] : acc) {
-    sbd::gdb::PT2Merged<Elem> m;
-    m.det = d; m.num = nh.first; m.haa = nh.second; m.n_parents = 1;
-    all.push_back(std::move(m));
+  {
+    const size_t nacc = acc_n.size();
+    all.reserve(nacc);
+    for (size_t i = 0; i < nacc; ++i) {
+      const size_t * a = acc_w.data() + i * nword;
+      sbd::gdb::PT2Merged<Elem> m;
+      m.det.assign(a, a + nword);
+      m.num = acc_n[i];
+      m.haa = acc_h[i];
+      m.n_parents = 1;
+      all.push_back(std::move(m));
+    }
   }
-  acc.clear();
-  std::sort(all.begin(), all.end(),
-            [](const auto & x, const auto & y) {
-              return sbd::less_from_back(x.det, y.det);
-            });
+  // Release the staging store before the perturber list is walked again: at K =
+  // 17688 it is the largest single allocation in the run.
+  acc_w.clear(); acc_w.shrink_to_fit();
+  acc_n.clear(); acc_n.shrink_to_fit();
+  acc_h.clear(); acc_h.shrink_to_fit();
+  t_merge += MPI_Wtime() - tsort0;
 
   size_t n_removed_local = 0;
   // Determinant-level perturber count, kept separately because in variant (c)

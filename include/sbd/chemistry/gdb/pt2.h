@@ -93,7 +93,29 @@ namespace sbd {
       size_t bit_length = 20;           ///< MUST match the solve that wrote the wavefunction
       int    b_comm_size = 1;
       int    t_comm_size = 1;
-      size_t batch_size = 200000;       ///< references per batch; bounds perturber memory
+      /// Perturber count at which the flat accumulation store is collapsed (sorted,
+      /// duplicates summed, shrunk to the unique count).
+      ///
+      /// This is a SAFETY FLOOR, not a memory dial, and the distinction is worth
+      /// stating because it is easy to assume otherwise. The trigger only ever grows
+      /// from this value -- after each collapse it is raised to twice the number of
+      /// survivors -- so peak memory is set by the UNIQUE perturber count, which the
+      /// physics fixes, and not by this setting. Measured on N2 K = 17688 (1.02e6
+      /// unique), variant (a): 1e5 -> 400 MB / 1.45 s, 1e6 -> 389 MB / 1.41 s,
+      /// 4e6 -> 373 MB / 1.25 s. Three settings spanning 40x, an 8% spread.
+      ///
+      /// The growth rule exists to make a too-small value harmless rather than
+      /// catastrophic. A FIXED threshold below the unique count is quadratic: the
+      /// collapse can never bring the store under it, so it re-sorts a ~1e6-entry
+      /// array after nearly every reference. Measured, with the growth rule removed:
+      /// merge 1.4 s -> 237 s and peak RSS 391 MB -> 793 MB.
+      ///
+      /// For reference, the std::map this replaced held the same 1.02e6 perturbers in
+      /// 175 MB against 391 MB here, but merged in 3.6 s against 1.4 s. The flat store
+      /// trades ~2x peak memory for ~2.6x merge speed; if memory is ever the binding
+      /// constraint on a large run, that trade is the thing to revisit -- lowering
+      /// this value will not do it.
+      size_t batch_size = 1000000;      ///< floor on the collapse trigger
       /// Floor on |E_0 - H_aa|. Dice applies none, so a perturber that happens to be
       /// near-degenerate with E_0 produces an unbounded contribution. The floor keeps
       /// the sign (flipping it would flip the sign of that term's contribution) and
@@ -185,7 +207,7 @@ namespace sbd {
                 << "# bit_length:    " << o.bit_length << "\n"
                 << "# b_comm_size:   " << o.b_comm_size << "\n"
                 << "# t_comm_size:   " << o.t_comm_size << "\n"
-                << "# batch_size:    " << o.batch_size << "\n"
+                << "# collapse_at:   " << o.batch_size << "\n"
                 << "# loadname:      " << o.loadname << "\n"
                 << "# fcidump:       " << o.fcidumpfile << "\n"
                 << "# detfiles:      ";
@@ -377,8 +399,10 @@ namespace sbd {
       for (size_t i = 0; i < wf.dets.size(); ++i) {
         auto it = std::lower_bound(det.begin(), det.end(), wf.dets[i], cmp);
         if (it == det.end()) continue;
-        const std::vector<size_t> found = *it;
-        if (found != wf.dets[i]) continue;
+        // *it is a non-owning row view and row has operator== against a vector, so
+        // this compares in place. Materialising it into a std::vector first, as an
+        // earlier version did, allocated once per determinant for nothing.
+        if (*it != wf.dets[i]) continue;
         c[static_cast<size_t>(it - det.begin())] = wf.amps[i];
         ++n_matched;
       }
@@ -630,11 +654,8 @@ namespace sbd {
       size_t keep = 0, removed = 0;
       for (size_t i = 0; i < pert.size(); ++i) {
         auto it = std::lower_bound(det.begin(), det.end(), pert[i].det, cmp);
-        bool present = false;
-        if (it != det.end()) {
-          const std::vector<size_t> found = *it;
-          present = (found == pert[i].det);
-        }
+        // Compared in place: row::operator== memcmps against the vector directly.
+        const bool present = (it != det.end()) && (*it == pert[i].det);
         if (present) { ++removed; continue; }
         if (keep != i) pert[keep] = std::move(pert[i]);
         ++keep;
@@ -914,11 +935,7 @@ namespace sbd {
         bool any = false;
         for (size_t r = 0; r < cfg[k].rows.size(); ++r) {
           auto it = std::lower_bound(det.begin(), det.end(), cfg[k].rows[r], cmp);
-          bool present = false;
-          if (it != det.end()) {
-            const std::vector<size_t> found = *it;
-            present = (found == cfg[k].rows[r]);
-          }
+          const bool present = (it != det.end()) && (*it == cfg[k].rows[r]);
           if (present) {
             row_variational_flat[row_offset[k] + r] = true;
             ++st.n_rows_variational;
@@ -934,10 +951,16 @@ namespace sbd {
       // 7.62 s at top1000 -- 381x for a 45x larger space, while every other phase
       // grew 6-59x. Two things make that affordable without changing the algorithm:
       //
-      //   * References are copied into one flat buffer ONCE. `det[i]` on a det_vector
-      //     materialises a std::vector per access, so reading it in the innermost
-      //     loop meant ~1.4e9 heap allocations at top1000 -- more expensive than the
-      //     matrix element it was fetching an argument for.
+      //   * The references are read IN PLACE. det_vector is already one flat
+      //     contiguous store and det[i] returns a non-owning `row&` into it -- but
+      //     `std::vector<size_t> ref = det[i]` invokes row's conversion operator and
+      //     copies. That copy in the innermost loop meant ~1.4e9 heap allocations at
+      //     top1000, more expensive than the matrix element it was fetching an
+      //     argument for. Binding `const auto & ri = det[i]` and reading ri.data()
+      //     costs nothing and needs no buffer of its own: an earlier version of this
+      //     fix staged the references into a second flat array, which was a duplicate
+      //     of storage that was already flat and added det.size()*nword*8 bytes
+      //     (140 MB at K = 1.1e6, 16 orbitals) for no gain.
       //
       //   * A popcount prefilter before Hij. H_ri vanishes unless the two
       //     determinants differ by at most 2 spin-orbitals (4 differing bits), so
@@ -950,15 +973,13 @@ namespace sbd {
       // Threaded over configurations. The loop body writes only into its own cfg[k],
       // so there is no reduction and no order-dependent summation -- the failure mode
       // that produced the b_comm bug in the solver.
-      std::vector<size_t> refw(det.size() * nword, 0);
-      std::vector<size_t> refi;             // references with a nonzero coefficient
+      // Only the indices of references with a nonzero coefficient. This is the one
+      // small array worth keeping: it is O(ndet) words, not O(ndet * nword), and it
+      // keeps the zero-coefficient test out of the innermost loop.
+      std::vector<size_t> refi;
       refi.reserve(det.size());
-      for (size_t i = 0; i < det.size(); ++i) {
-        if (std::abs(std::complex<double>(c[i])) == 0.0) continue;
-        const std::vector<size_t> ri = det[i];
-        for (size_t w = 0; w < nword; ++w) refw[i * nword + w] = ri[w];
-        refi.push_back(i);
-      }
+      for (size_t i = 0; i < det.size(); ++i)
+        if (std::abs(std::complex<double>(c[i])) != 0.0) refi.push_back(i);
 
       #pragma omp parallel
       {
@@ -974,11 +995,17 @@ namespace sbd {
             ElemT acc(0.0);
             for (size_t q = 0; q < refi.size(); ++q) {
               const size_t i = refi[q];
-              const size_t * rp = &refw[i * nword];
+              // A reference into det's flat store, NOT a copy.
+              const size_t * rp = det[i].data();
               int nd = 0;
               for (size_t w = 0; w < nword; ++w)
                 nd += __builtin_popcountll(rp[w] ^ row[w]);
               if (nd > 4) continue;   // more than a double excitation: H_ri == 0
+              // Hij takes std::vector<size_t> in both its overloads, so the surviving
+              // pairs still need the words in a vector. That is now paid AFTER the
+              // filter -- on the ~1e-4 of pairs that are actually connected, not on
+              // all of them -- and into a per-thread buffer that is reused, so it
+              // allocates once per thread rather than once per pair.
               for (size_t w = 0; w < nword; ++w) rbuf[w] = rp[w];
               const ElemT h = sbd::Hij(rbuf, row, bit_length, L, sc, sd,
                                        I0, I1, I2, orbDiff);
