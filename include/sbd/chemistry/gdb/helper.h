@@ -743,6 +743,60 @@ namespace sbd {
       MPI_Comm_split(a_comm,b_comm_color,mpi_rank,&b_comm);
     }
     
+    /// Validate an (h,b,t) rank decomposition BEFORE any of it is used.
+    ///
+    /// t_comm partitions exactly `b_comm_size` tasks -- the ring-rotation steps of
+    /// the ket over b_comm -- so t_comm_size > b_comm_size leaves surplus t ranks
+    /// with an EMPTY task range. MakeHelpers then does exidx.resize(0) and reads
+    /// exidx[0].slide, off the end of an empty vector. Observed as signal 11 at null
+    /// in every one of 48 ranks, during helper construction, with no message:
+    ///   --b_comm_size 6 --t_comm_size 8   (6 tasks over 8 t ranks)
+    ///
+    /// Returns false, after a diagnosis from rank 0, when the layout is unusable, so
+    /// the caller returns instead of crashing. Checks in order:
+    ///   b,t >= 1                 a zero divides by zero below
+    ///   b*t <= mpi_size          else h_comm_size truncates to 0
+    ///   b*t divides mpi_size     else ranks are silently left unused
+    ///   t <= b                   the constraint above
+    inline bool ValidateCommLayout(int mpi_size, int b_comm_size, int t_comm_size,
+				   int mpi_rank) {
+      const char * why = nullptr;
+      if( b_comm_size < 1 || t_comm_size < 1 ) {
+	why = "--b_comm_size and --t_comm_size must both be >= 1";
+      } else if( b_comm_size * t_comm_size > mpi_size ) {
+	why = "b_comm_size * t_comm_size exceeds the number of ranks, so"
+	      " h_comm_size would be 0";
+      } else if( mpi_size % (b_comm_size * t_comm_size) != 0 ) {
+	why = "b_comm_size * t_comm_size does not divide the number of ranks,"
+	      " so some ranks would be left unused";
+      } else if( t_comm_size > b_comm_size ) {
+	why = "t_comm_size exceeds b_comm_size. t_comm partitions exactly"
+	      " b_comm_size ring-rotation tasks, so the surplus t ranks would get"
+	      " an empty task range and read exidx[0] off an empty vector";
+      }
+      if( why == nullptr ) return true;
+      // ABORT rather than returning to the caller. Returning let the caller fall
+      // through to its normal reporting path and print an UNINITIALISED energy
+      // ("sbd: Energy = 4.74e-322"), which the Python wrapper parses -- so a
+      // rejected layout would be indistinguishable from a completed run. A bad
+      // layout is a usage error with no valid result, so it must not produce a
+      // parseable energy line.
+      if( mpi_rank == 0 ) {
+	const int h = (b_comm_size > 0 && t_comm_size > 0)
+	  ? mpi_size / (b_comm_size * t_comm_size) : 0;
+	std::cerr << " sbd: ERROR invalid rank decomposition: " << why << ".\n"
+		  << "      got mpi_size=" << mpi_size
+		  << " b_comm_size=" << b_comm_size
+		  << " t_comm_size=" << t_comm_size
+		  << " -> h_comm_size=" << h << "\n"
+		  << "      Require t_comm_size <= b_comm_size, and"
+		  << " b_comm_size * t_comm_size to divide mpi_size."
+		  << std::endl;
+      }
+      MPI_Abort(MPI_COMM_WORLD,2);
+      return false;
+    }
+
     void MakeHelpers(const sbd::det_vector<size_t> & det,
 		     size_t bit_length,
 		     size_t norb,
@@ -785,6 +839,18 @@ namespace sbd {
       sbd::det_vector<size_t> ket_det;
       sbd::det_vector<size_t, sbd::det_kind::half> ket_adet;
       sbd::det_vector<size_t, sbd::det_kind::half> ket_bdet;
+      // exidx can legitimately be EMPTY only if the layout was invalid
+      // (t_comm_size > b_comm_size); ValidateCommLayout rejects that before we get
+      // here. Guard anyway: indexing exidx[0] on an empty vector is how this
+      // presented -- signal 11 at null in every rank, during helper construction,
+      // with no message at all.
+      if ( exidx.empty() ) {
+	int wr = 0; MPI_Comm_rank(MPI_COMM_WORLD,&wr);
+	std::cerr << " sbd: ERROR MakeHelpers: this rank owns no excitation task"
+		  << " (t_comm_size > b_comm_size?). world rank " << wr
+		  << std::endl;
+	MPI_Abort(MPI_COMM_WORLD,1);
+      }
       if ( task_begin != static_cast<size_t>(0) ) {
 	int slide = - exidx[0].slide;
 	sbd::MpiSlideWithScratch(det,ket_det,slide,b_comm,det_scratch_send,det_scratch_recv);

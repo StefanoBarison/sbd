@@ -47,3 +47,19 @@ cmake_install.cmake
 
 
 test/
+
+# ---- Python bytecode ----
+__pycache__/
+*.pyc
+
+# ---- compiled app executables ----
+# These have no extension, so the *.o / *.out rules above miss them and they show
+# up as untracked on every status. Listed by path so a stray `git add -A` cannot
+# commit a multi-megabyte binary.
+apps/*/diag
+apps/*/diag_*
+apps/gen_dets/gdet
+
+# NOT ignored, deliberately: apps/*/Configuration. The local macOS build config is
+# intentionally modified and must stay VISIBLE in git status so it is never
+# committed by accident (it would break the cluster build).

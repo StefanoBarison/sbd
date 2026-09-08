@@ -254,6 +254,8 @@ namespace sbd {
       int b_comm_size = sbd_data.b_comm_size;
       int t_comm_size = sbd_data.t_comm_size;
       int h_comm_size = mpi_size / (t_comm_size * b_comm_size);
+      if( !sbd::gdb::ValidateCommLayout(mpi_size,b_comm_size,t_comm_size,mpi_rank) )
+	return;
       int L;
       int N;
       int method = sbd_data.method;
@@ -1080,6 +1082,8 @@ namespace sbd {
       int t_comm_size = sbd_data.t_comm_size;
       int b_comm_size = sbd_data.b_comm_size;
       int h_comm_size = mpi_size / (t_comm_size*b_comm_size);
+      if( !sbd::gdb::ValidateCommLayout(mpi_size,b_comm_size,t_comm_size,mpi_rank) )
+	return;
       size_t bit_length = sbd_data.bit_length;
       det_vector<size_t>::init_elem_size((2*L + bit_length - 1) / bit_length);
       det_vector<size_t, det_kind::half>::init_elem_size((L + bit_length - 1) / bit_length);

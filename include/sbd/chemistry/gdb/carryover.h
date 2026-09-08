@@ -24,9 +24,22 @@ namespace sbd {
       std::vector<size_t> ranking(r.size());
       mpi_find_ranking(r,ranking,b_comm);
       size_t rdet_size = 0;
-      size_t num_threads = omp_get_max_threads();
+      // Pin the team size on BOTH regions below with num_threads(nthr).
+      //
+      // These two regions must use the IDENTICAL strided partition: the first
+      // counts per-thread hits, offset[] is a prefix sum over those counts, and
+      // the second writes into rdet starting at offset[thread_id]. The stride is
+      // `nthr`, so a team smaller than nthr in either region would cover
+      // different residue classes than the offsets were computed for --
+      // overlapping writes into rdet and a wrong rdet_size, silently.
+      // omp_get_max_threads() is the size of the NEXT team, not a guarantee, and
+      // dynamic adjustment is ON by default in libgomp. num_threads() makes both
+      // teams exactly nthr, so the two partitions match by construction.
+      int nthr = omp_get_max_threads();
+      if( nthr < 1 ) nthr = 1;
+      const size_t num_threads = static_cast<size_t>(nthr);
       std::vector<size_t> local_size(num_threads,0);
-#pragma omp parallel
+#pragma omp parallel num_threads(nthr)
       {
 	size_t thread_id = omp_get_thread_num();
 	for(size_t k=thread_id; k < det.size(); k+=num_threads) {
@@ -44,7 +57,7 @@ namespace sbd {
       }
       rdet.resize(rdet_size);
       std::vector<RealT> keep_weight_local(num_threads,0.0);
-#pragma omp parallel
+#pragma omp parallel num_threads(nthr)   // must match the counting region above
       {
 	size_t thread_id = omp_get_thread_num();
 	size_t local_addr = offset[thread_id];

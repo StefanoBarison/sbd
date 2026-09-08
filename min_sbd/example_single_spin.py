@@ -22,8 +22,22 @@ from sbd_GDB_solver import SBDGdbSolver
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 DIAG = os.path.join(REPO, "apps/chemistry_gdb_selected_basis_diagonalization/diag")
-FCIDUMP = "/Users/efa/Downloads/for_claude_n2/N2_R2.0_6-31g_10e_16o.dat"
-DETFILE = "/Users/efa/Documents/github/new_sqdrift-exc/single_spin_workflow/sbd_dets_top50.txt"
+# Inputs are not in the repo (FCIDUMPs and determinant lists are large and
+# molecule-specific), so point at them with SBD_EXAMPLE_FCIDUMP / SBD_EXAMPLE_DETFILE.
+# The fallbacks are $HOME-relative rather than absolute so the script at least fails
+# with a readable message on a machine that is not the author's.
+FCIDUMP = os.environ.get(
+    "SBD_EXAMPLE_FCIDUMP",
+    os.path.expanduser("~/Downloads/for_claude_n2/N2_R2.0_6-31g_10e_16o.dat"))
+DETFILE = os.environ.get(
+    "SBD_EXAMPLE_DETFILE",
+    os.path.expanduser("~/sbd_dets_top50.txt"))
+for _label, _path in (("FCIDUMP", FCIDUMP), ("DETFILE", DETFILE)):
+    if not os.path.isfile(_path):
+        raise SystemExit(
+            f"{_label} not found: {_path}\n"
+            f"Set SBD_EXAMPLE_{_label} to a readable path, e.g.\n"
+            f"  SBD_EXAMPLE_{_label}=/path/to/file python {os.path.basename(__file__)}")
 
 NORB = 16
 MULTIPLICITY = 3   # spin multiplicity 2S+1: 1=singlet, 2=doublet, 3=triplet, 4=quartet, ...
