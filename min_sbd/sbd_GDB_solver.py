@@ -140,14 +140,14 @@ import warnings
 import math
 import struct
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Callable, cast
 
 import numpy as np
 from pyscf.tools import fcidump as _pyscf_fcidump
 
 from collections.abc import Sequence
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from qiskit_addon_sqd.counts import bitstring_matrix_to_integers
 
@@ -1444,3 +1444,69 @@ class experimental_SCIResult:
 
     spin_square: float | None = None
     """The spin square of the state."""
+
+@dataclass
+class experimental_SCIHistory:
+    """SCIHistory class to record per-iteration diagnostic data."""
+
+    result_history: list = field(default_factory=list)
+    energy_hist: list = field(default_factory=list)
+    occupancy_hist: list = field(default_factory=list)
+    spin_sq_hist: list = field(default_factory=list)
+    subspace_dimension_hist: list = field(default_factory=list)
+
+
+def make_callback_experimental(
+    history: experimental_SCIHistory,
+    molecule: MoleculeFromFCIDUMP,
+    save_wf: bool = False,
+    output_path: str | None = None,
+):
+    """Callback invoked after each diagonalization step of the SCI procedure.
+
+    Args:
+        tmp_results : list[experimental_SCIResult]
+            A list of experimental_SCIResult objects produced in the current iteration.
+
+    Side Effects:
+        - Appends iteration-level information to:
+            * result_history
+            * energy_hist
+            * occupancy_hist
+            * spin_sq_hist
+            * subspace_dimension_hist
+        - Writes iteration summaries to the standard output."""
+
+    def _callback(tmp_results: list[experimental_SCIResult]):
+        history.result_history.append(tmp_results)
+        iteration = len(history.result_history)
+
+        print(f"Iteration {iteration}")
+        for i, result in enumerate(tmp_results):
+
+            sci_state = result.sci_state
+            energy = result.energy + molecule.core_energy
+            subspace_dimension = int(np.prod(sci_state.amplitudes.shape))
+
+            print(f"\tSubsample {i + 1}")
+            print(f"\t\tEnergy {energy}")
+            print(f"\t\tSubspace dimension {subspace_dimension}")
+            print(f"\t\tSpin square {result.spin_square}")
+
+        best_batch = min(tmp_results, key=lambda res: res.energy)
+
+        sci_state = best_batch.sci_state
+        energy = best_batch.energy + molecule.core_energy
+        subspace_dimension = int(np.prod(sci_state.amplitudes.shape))
+
+        if save_wf:
+            if output_path is None:
+                raise ValueError("Provide valid path to save the wave-function.")
+            sci_state.save(output_path / f"wf_{iteration}")
+
+        history.energy_hist.append(energy)
+        history.occupancy_hist.append(best_batch.orbital_occupancies)
+        history.spin_sq_hist.append(best_batch.spin_square)
+        history.subspace_dimension_hist.append(subspace_dimension)
+
+    return _callback

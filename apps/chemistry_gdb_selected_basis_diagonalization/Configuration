@@ -3,8 +3,8 @@ SBD_PATH=../..
 
 # mpi c++ compiler
 # Set MPICC environment variable to override (e.g., export MPICC=/custom/path/to/mpicxx)
-# If your system's default mpicxx is found automatically, you can use: CCCOM=mpicxx
-CCCOM=$(if $(MPICC),$(MPICC),$(HOME)/openmpi/bin/mpicxx)
+# If your system's default mpicxx is found automatically, you can use: CCCOM=mpicxx #$(if $(MPICC),$(MPICC),$(HOME)/openmpi/bin/mpicxx)
+CCCOM=mpicxx
 
 CCFLAGS= -std=c++17 -fopenmp -O3
 
