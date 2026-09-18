@@ -1,6 +1,7 @@
 #ifndef SBD_CHEMISTRY_GDB_INC_ALL_H
 #define SBD_CHEMISTRY_GDB_INC_ALL_H
 
+#include "sbd/chemistry/gdb/grid_distribution.h"
 #include "sbd/chemistry/gdb/helper.h"
 #ifdef SBD_THRUST
 #include "sbd/chemistry/gdb/helper_thrust.h"
@@ -22,5 +23,10 @@
 #include "sbd/chemistry/gdb/carryover.h"
 #include "sbd/chemistry/gdb/expansion.h"
 #include "sbd/chemistry/gdb/sbdiag.h"
+
+#ifndef SBD_THRUST
+#include "sbd/chemistry/gdb/stat_evaluator.h"
+#include "sbd/chemistry/gdb/exact_external_observable.h"
+#endif
 
 #endif

@@ -5,6 +5,8 @@
 #ifndef SBD_CHEMISTRY_TPB_SBDIAG_H
 #define SBD_CHEMISTRY_TPB_SBDIAG_H
 
+#include "sbd/framework/determinant_initialization.h"
+
 #ifdef SBD_USE_NCCL
 #include <nccl.h>
 #endif
@@ -31,6 +33,8 @@ namespace sbd {
       double eps = 1.0e-4;
       double max_time = 86400.0;
       int init = 0;
+      std::string initial_adeterminant_bitstring;
+      std::string initial_bdeterminant_bitstring;
       size_t seed = 1729;
       int do_shuffle = 0;
       int do_rdm = 0;
@@ -66,6 +70,14 @@ namespace sbd {
 	}
 	if( std::string(argv[i]) == "--init" ) {
 	  sbd_data.init = std::atoi(argv[++i]);
+	}
+	if( std::string(argv[i]) == "--initial_adeterminant_bitstring" ||
+	    std::string(argv[i]) == "--initial-adeterminant-bitstring" ) {
+	  sbd_data.initial_adeterminant_bitstring = std::string(argv[++i]);
+	}
+	if( std::string(argv[i]) == "--initial_bdeterminant_bitstring" ||
+	    std::string(argv[i]) == "--initial-bdeterminant-bitstring" ) {
+	  sbd_data.initial_bdeterminant_bitstring = std::string(argv[++i]);
 	}
 	if( std::string(argv[i]) == "--seed" ) {
 	  sbd_data.seed = std::atoi(argv[++i]);
@@ -139,14 +151,14 @@ namespace sbd {
     void diag(const MPI_Comm & comm,
 	      const SBD & sbd_data,
 	      const sbd::FCIDump & fcidump,
-	      const std::vector<std::vector<size_t>> & adet,
-	      const std::vector<std::vector<size_t>> & bdet,
+	      const det_vector<size_t, det_kind::half> & adet,
+	      const det_vector<size_t, det_kind::half> & bdet,
 	      const std::string & loadname,
 	      const std::string & savename,
 	      double & energy,
 	      std::vector<double> & density,
-	      std::vector<std::vector<size_t>> & co_adet,
-	      std::vector<std::vector<size_t>> & co_bdet,
+	      det_vector<size_t, det_kind::half> & co_adet,
+	      det_vector<size_t, det_kind::half> & co_bdet,
 	      std::vector<std::vector<double>> & one_p_rdm,
 	      std::vector<std::vector<double>> & two_p_rdm) {
 
@@ -285,8 +297,50 @@ namespace sbd {
       auto time_start_init = std::chrono::high_resolution_clock::now();
       std::vector<double> W;
       if( loadname == std::string("") ) {
-	sbd::BasisInitVector(W,adet,bdet,adet_comm_size,bdet_comm_size,h_comm,b_comm,t_comm,init,seed);
+	const bool has_initial_adet =
+	    !sbd_data.initial_adeterminant_bitstring.empty();
+	const bool has_initial_bdet =
+	    !sbd_data.initial_bdeterminant_bitstring.empty();
+	if( !has_initial_adet && has_initial_bdet ) {
+	  throw std::invalid_argument(
+	      "an initial beta determinant requires an initial alpha determinant");
+	}
+	if( !has_initial_adet ) {
+	  if( mpi_rank == 0 ) {
+	    std::cout << "# initial vector source: default" << std::endl;
+	  }
+	  sbd::BasisInitVector(W,adet,bdet,adet_comm_size,bdet_comm_size,
+	                       h_comm,b_comm,t_comm,init,seed);
+	} else {
+	  if( mpi_rank == 0 ) {
+	    std::cout << "# initial vector source: explicit determinants" << std::endl;
+	    std::cout << "# initial alpha determinant bitstring: "
+	              << sbd_data.initial_adeterminant_bitstring << std::endl;
+	    if( has_initial_bdet ) {
+	      std::cout << "# initial beta determinant bitstring: "
+	                << sbd_data.initial_bdeterminant_bitstring << std::endl;
+	    } else {
+	      std::cout << "# initial beta determinant bitstring: same as alpha"
+	                << std::endl;
+	    }
+	  }
+	  const auto initial_adet = from_string_checked(
+	      sbd_data.initial_adeterminant_bitstring, bit_length,
+	      static_cast<size_t>(L));
+	  const auto initial_bdet = from_string_checked(
+	      has_initial_bdet ? sbd_data.initial_bdeterminant_bitstring
+	                       : sbd_data.initial_adeterminant_bitstring,
+	      bit_length,
+	      static_cast<size_t>(L));
+	  sbd::BasisInitVectorFromDeterminants(
+	      W,adet,bdet,adet_comm_size,bdet_comm_size,
+	      initial_adet,initial_bdet,b_comm);
+	}
       } else {
+	if( mpi_rank == 0 ) {
+	  std::cout << "# initial vector source: load" << std::endl;
+	  std::cout << "# load name: " << loadname << std::endl;
+	}
 	sbd::LoadWavefunction(loadname,adet,bdet,
 			      adet_comm_size,bdet_comm_size,
 			      h_comm,b_comm,t_comm,W);
@@ -314,17 +368,17 @@ namespace sbd {
       }
       if (mpi_size_b > 1) {
           init_nccl_comm(&b_nccl_comm, b_comm);
-          thrust::device_vector<double> A(W.size(), 0.0);
+          thrust::device_vector<double> A(1, 0.0);
           nccl_allreduce(A, ncclSum, b_nccl_comm);
       }
       if (false && mpi_size_t > 1) {
           init_nccl_comm(&t_nccl_comm, t_comm);
-          thrust::device_vector<double> A(W.size(), 0.0);
+          thrust::device_vector<double> A(1, 0.0);
           nccl_allreduce(A, ncclSum, t_nccl_comm);
       }
       if (mpi_size_a > 1) {
           init_nccl_comm(&a_nccl_comm, a_comm);
-          thrust::device_vector<double> A(W.size(), 0.0);
+          thrust::device_vector<double> A(1, 0.0);
           nccl_allreduce(A, ncclSum, a_nccl_comm);
       }
       printf("[%s,%d] NCCL communicators have been created.\n",
@@ -346,8 +400,6 @@ namespace sbd {
 	*/
 
 	auto time_start_diag = std::chrono::high_resolution_clock::now();
-	auto time_start_davidson = std::chrono::high_resolution_clock::now();
-	auto time_start_qcham = std::chrono::high_resolution_clock::now();
 #ifdef SBD_THRUST
 	auto time_start_mult_init = std::chrono::high_resolution_clock::now();
         {
@@ -367,12 +419,14 @@ namespace sbd {
 		std::cout << " Elapsed time for mult.Init() " << elapsed_mult_init << " (sec) " << std::endl;
 	}
 
+	auto time_start_qcham = std::chrono::high_resolution_clock::now();
 	thrust::device_vector<double> hii;
         {
             SBD_NVTX_RANGE_COLOR("device_mult.makeQChamDiagTerms", __LINE__);
             device_mult.makeQChamDiagTerms(hii);
         }
 #else
+	auto time_start_qcham = std::chrono::high_resolution_clock::now();
 	std::vector<double> hii;
 	sbd::makeQChamDiagTerms(adet,bdet,bit_length,L,
 				helper,I0,I1,I2,hii,
@@ -385,6 +439,7 @@ namespace sbd {
 		std::cout << " Elapsed time for makeQChamDiagTerms " << elapsed_qcham << " (sec) " << std::endl;
 	}
 
+	auto time_start_davidson = std::chrono::high_resolution_clock::now();
 #ifdef SBD_THRUST
 	if( method == 0 ) {
             SBD_NVTX_RANGE_COLOR("Davidson", __LINE__);
@@ -521,7 +576,7 @@ namespace sbd {
 	}
 
 	auto time_start_davidson = std::chrono::high_resolution_clock::now();
-	sbd::BasisInitVector(W,adet,bdet,adet_comm_size,bdet_comm_size,h_comm,b_comm,t_comm,init,seed);
+	// W was initialized or loaded before Hamiltonian construction.
 #ifdef SBD_THRUST
 	if( method == 1 ) {
 		sbd::Davidson(hii, W, device_mult,
@@ -718,8 +773,8 @@ namespace sbd {
 	  }
 	}
 	if( sbd_data.carryover_type == 2 ) {
-	  std::vector<std::vector<size_t>> res_adet;
-	  std::vector<std::vector<size_t>> res_bdet;
+	  det_vector<size_t, det_kind::half> res_adet;
+	  det_vector<size_t, det_kind::half> res_bdet;
 	  sbd::SinglesExtendHalfdets(co_adet,co_bdet,bit_length,L,
 				     adet_comm_size,bdet_comm_size,b_comm,
 				     res_adet,res_bdet);
@@ -759,9 +814,19 @@ namespace sbd {
 
       FreeHelpers(helper);
 
+#ifdef SBD_USE_NCCL
+      if (mpi_size_b > 1) {
+          ncclCommDestroy(b_nccl_comm);
+      }
+      if (mpi_size_a > 1) {
+          ncclCommDestroy(a_nccl_comm);
+      }
+#endif
+
       MPI_Comm_free(&h_comm);
       MPI_Comm_free(&b_comm);
       MPI_Comm_free(&t_comm);
+      MPI_Comm_free(&a_comm);
     } // end void diag function
 
     /**
@@ -786,8 +851,8 @@ namespace sbd {
 	      const std::string & savename,
 	      double & energy,
 	      std::vector<double> & density,
-	      std::vector<std::vector<size_t>> & co_adet,
-	      std::vector<std::vector<size_t>> & co_bdet,
+	      det_vector<size_t, det_kind::half> & co_adet,
+	      det_vector<size_t, det_kind::half> & co_bdet,
 	      std::vector<std::vector<double>> & one_p_rdm,
 	      std::vector<std::vector<double>> & two_p_rdm) {
 
@@ -821,8 +886,8 @@ namespace sbd {
        */
 
       int do_shuffle = sbd_data.do_shuffle;
-      std::vector<std::vector<size_t>> adet;
-      std::vector<std::vector<size_t>> bdet;
+      det_vector<size_t, det_kind::half> adet;
+      det_vector<size_t, det_kind::half> bdet;
 
       if( mpi_rank == 0 ) {
 	sbd::LoadAlphaDets(adetfile,adet,sbd_data.bit_length,L);

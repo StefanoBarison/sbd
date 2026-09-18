@@ -53,6 +53,12 @@ Below is an explanation of each command-line option.
   The names of the file containing the set of determinants (bitstrings).
 - `--loadname <str>`:  
   The name of the file containing the wavefunction data to load. If not specified, no loading is performed and the Hartree–Fock (HF) solution is used as the initial state.
+- `--initial_determinant_bitstring <str>`:
+  Place unit weight on this determinant instead of using the `--init` policy.
+  The string must contain exactly `2*NORB` bits in the same order as the
+  determinant files and must occur exactly once in the distributed basis.
+  It is used only when `--loadname` is not specified. Loading takes precedence
+  when both options are present.
 - `--savename <str>`:  
   The name of the file in which to save the resulting wavefunction data. If not specified, the wavefunction is not saved.
 - `--b_comm_size <int>`:
@@ -68,13 +74,115 @@ Below is an explanation of each command-line option.
   The maximum size of the subspace used in the Davidson method.
 - `--tolerance <float>`:  
   Convergence threshold for the Davidson method. It determines the stopping criterion based on the norm of the residual vector.
+- `--carryover_type <int>`:
+  Selects how determinants are retained or expanded after diagonalization (default: 0).
+  - 0: Do not generate carryover determinants.
+  - 1: Retain determinants by wavefunction weight.
+  - 2: Apply on-demand exhaustive heatbath expansion.
+  - 3: Apply integral-driven heatbath expansion.
 - `--carryover_ratio <float>`:  
-  The ratio of bitstrings with large wavefunction weights to be retained during the selection step.
+  For `--carryover_type 1`, specifies the ratio of determinants with the largest wavefunction weights to retain.
+- `--heatbath_cutoff <float>`:
+  For `--carryover_type 2` or `3`, specifies the heatbath selection cutoff (default: `1.0e-4`).
+- `--heatbath_truncation <float>`:
+  For `--carryover_type 2` or `3`, specifies the wavefunction-weight truncation applied before expansion (default: `0.0`).
+- `--heatbath_batch_size <int>`:
+  For `--carryover_type 2` or `3`, specifies the aggregate candidate batch size per MPI rank (default: `1000000`).
 - `--shuffle <int>`:  
   Whether to shuffle the order of input half-determinants. If set to 0, no shuffling is performed; otherwise, the input is shuffled.
 - `--rdm <int>`:  
   Whether to compute the 1-particle and 2-particle reduced density matrices (1pRDM and 2pRDM). If set to 0, they are not computed; otherwise, they are computed.
 - `--carryovername <str>`:
-  Specifies the filename to store the carryover determinants.
+  Specifies the filename prefix used to store the carryover determinants.
 - `--bit_length <int>`:  
   Specifies the bit length handled by each size_t when representing bitstrings using `std::vector<size_t>`. The default value is 20.
+- `--do_redist_alpha_eq <int>`:
+  Whether to redistribute determinants across ranks so that each rank owns an equal-sized disjoint range of unique alpha strings (default: 1).
+  This alpha-primary partition improves load balance in the Hamiltonian-vector multiply, where work per rank scales with the number of distinct alpha strings it holds.
+  Among the legacy flags, this takes priority over the other redistribution
+  options. Pass 0 to disable; when disabled, the behavior falls back to
+  `--do_sort_det` if set, then `--do_redist_det` if set, otherwise the sorted
+  input-shard placement is retained. An explicit `--determinant_distribution`
+  takes priority over all legacy flags.
+- `--do_redist_det <int>`:
+  If non-zero, redistribute determinants evenly by determinant count.
+  Used only when `--do_redist_alpha_eq 0` is explicitly passed and `--do_sort_det` is not set.
+- `--do_sort_det <int>`:
+  If non-zero, redistribute determinants as with `--do_redist_det` and then reorder them within each rank.
+  Used only when `--do_redist_alpha_eq 0` is explicitly passed; takes priority over `--do_redist_det`.
+- `--determinant_distribution <str>`:
+  Select the GDB determinant placement. An explicit value takes priority over
+  the legacy redistribution flags. Supported values are:
+  - `input`: preserve the rank placement established by the sorted input
+    shards; no post-load redistribution is performed.
+  - `equal-bra-a`: use the existing equal-alpha-bra redistribution. This is
+    the effective default when neither this option nor legacy overrides are
+    specified.
+  - `count`: redistribute by determinant count.
+  - `count-sorted`: redistribute by count and reorder within each rank.
+  - `grid-cyclic`: assign through a cyclic alpha/beta key grid and sort within
+    each rank. This preserves the grid placement without a subsequent
+    determinant-count redistribution.
+  - `grid-cyclic-balanced`: assign as in `grid-cyclic`, then redistribute by
+    determinant count and sort within each rank.
+- `--determinant_grid_a <int>`, `--determinant_grid_b <int>`:
+  Override both grid dimensions for `grid-cyclic` or
+  `grid-cyclic-balanced`. Their product must equal `b_comm_size`; both must be
+  specified together. Without an override, the dimensions default to the
+  factor pair of `b_comm_size` closest to a square.
+
+### Distribution trade-offs
+
+The determinant distributions optimize different properties; no mode is an
+unconditional replacement for the others.
+
+- `equal-bra-a` keeps work sharing an alpha determinant together. This can
+  improve helper reuse, data locality, and Hamiltonian-application performance.
+  Its per-rank memory use may nevertheless be uneven because beta-side data and
+  helper structures associated with each alpha range are not necessarily
+  divided evenly. At high basis parallelism, the largest rank can therefore
+  determine whether the calculation fits in memory.
+- `grid-cyclic` distributes both alpha and beta keys through a 2-D grid and
+  retains that placement. It can preserve lookup locality and reduce helper
+  storage, but determinant counts may be uneven across ranks.
+- `grid-cyclic-balanced` applies an additional count redistribution. This can
+  reduce determinant-count and peak-memory imbalance, but may lose grid
+  locality and is not guaranteed to reduce lookup work, helper memory, or run
+  time.
+
+Choose the distribution according to the limiting resource: `equal-bra-a` may
+be preferable when alpha locality and time to solution dominate.
+`grid-cyclic` is preferable when the cyclic partition is already sufficiently
+balanced, while `grid-cyclic-balanced` is available when determinant-count or
+peak-memory imbalance is the limiting concern. Measure the relevant modes on
+the target system when more than one choice fits in memory.
+
+### Determinant distribution compatibility
+
+The string selector and grid modes apply to the standard application path; `SBD_FILEIN` retains its legacy distribution behavior.
+
+If `--determinant_distribution` is present, its string value determines the
+placement and the legacy boolean flags are ignored. If it is absent, the
+existing behavior is preserved:
+
+```text
+do_redist_alpha_eq != 0  -> equal-bra-a
+do_sort_det != 0         -> count-sorted
+do_redist_det != 0       -> count
+otherwise                -> input
+```
+
+Because `do_redist_alpha_eq` defaults to 1, an unchanged existing command uses
+`equal-bra-a`. To select the new grid placement on four basis ranks and let the
+program choose the `2 x 2` grid, use:
+
+```bash
+--b_comm_size 4 \
+--determinant_distribution grid-cyclic
+```
+
+To choose the dimensions explicitly, add both options:
+
+```bash
+--determinant_grid_a 2 --determinant_grid_b 2
+```

@@ -13,8 +13,8 @@ namespace sbd {
   /**
      Function for adding diagonal contribution
    */
-  template <typename ElemT>
-  void ZeroDiffCorrelation(const std::vector<size_t> & DetI,
+  template <typename ElemT, typename DetT>
+  void ZeroDiffCorrelation(const DetT & DetI,
 			   ElemT WeightI,
 			   size_t bit_length,
 			   size_t norb,
@@ -32,7 +32,7 @@ namespace sbd {
 	int oj = closed.at(j)/2;
 	int sj = closed.at(j)%2;
 #pragma omp atomic update
-	twobody[sj+2*si][oj+norb*oi+norb*norb*oj+norb*norb*norb*oi]
+	twobody[si+2*sj][oi+norb*oj+norb*norb*oi+norb*norb*norb*oj]
 	  += SquaredNorm(WeightI);
 	// Partner term: the (i,j) loop runs only over j > i, so the (j,i)
 	// ordering must be accumulated explicitly here. Both the spin-block
@@ -109,8 +109,8 @@ namespace sbd {
   /**
      Function for adding one-occupation different contribution
    */
-  template <typename ElemT>
-  void OneDiffCorrelation(const std::vector<size_t> & DetI,
+  template <typename ElemT, typename DetT>
+  void OneDiffCorrelation(const DetT & DetI,
 			  const ElemT WeightI,
 			  const ElemT WeightJ,
 			  const size_t bit_length,
@@ -207,8 +207,8 @@ namespace sbd {
   /**
      Function for adding two-occupation different contribution
    */
-  template <typename ElemT>
-  void TwoDiffCorrelation(const std::vector<size_t> & DetI,
+  template <typename ElemT, typename DetT>
+  void TwoDiffCorrelation(const DetT & DetI,
 			  const ElemT WeightI,
 			  const ElemT WeightJ,
 			  const size_t bit_length,

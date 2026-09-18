@@ -7,6 +7,9 @@
 #ifndef SBD_FRAMEWORK_BIT_MANIPULATION_H
 #define SBD_FRAMEWORK_BIT_MANIPULATION_H
 
+#include "sbd/framework/type_def.h"
+#include "sbd/framework/mpi_utility.h"
+
 #include <stdint.h>
 #include <limits.h>
 #include <unistd.h>
@@ -189,7 +192,8 @@ namespace sbd {
      @param[in] bit_length: length of the bitstring managed by each size_t
      @param[in] L: number of total bits in the bitstring
    */
-  std::string makestring(const std::vector<size_t> & config,
+  template<typename DetT>
+  std::string makestring(const DetT& config,
 			 size_t bit_length,
 			 size_t L) {
     std::string s;
@@ -414,7 +418,8 @@ namespace sbd {
   }
 
   // det_vector overload: pointer-sort avoids moving non-constructible row objects.
-  void sort_bitarray(det_vector<size_t>& a) {
+  template <det_kind Kind>
+  void sort_bitarray(det_vector<size_t, Kind>& a) {
     size_t n = a.size();
     if (n <= 1) return;
     size_t row_len = a.elem_size();
@@ -427,7 +432,7 @@ namespace sbd {
             return std::memcmp(x, y, row_len * sizeof(size_t)) == 0;
         });
     size_t unique_n = static_cast<size_t>(end_it - ptrs.begin());
-    det_vector<size_t> result(unique_n);
+    det_vector<size_t, Kind> result(unique_n);
     for (size_t i = 0; i < unique_n; i++)
         std::memcpy(result[i].data(), ptrs[i], row_len * sizeof(size_t));
     a = std::move(result);
@@ -529,7 +534,19 @@ namespace sbd {
       MPI_Barrier(comm);
     } // end for(int recv_rank=0; recv_rank < mpi_size; recv_rank++)
 
-    sort_bitarray(new_config);
+    // Skip sort_bitarray if new_config is already sorted.  When the source
+    // data was globally ordered before redistribution (e.g. sorted-split
+    // shard files with a rank-count mismatch), mpi_redistribution ships
+    // contiguous slices in rank order, so new_config arrives sorted and the
+    // O((n/r) log(n/r)) sort is pure waste.  The O(n/r) check below costs
+    // nothing relative to the sort it avoids.
+    {
+      bool needs_sort = false;
+      const size_t nc = new_config.size();
+      for (size_t i = 1; i < nc && !needs_sort; ++i)
+        if (less_from_back(new_config[i], new_config[i-1])) needs_sort = true;
+      if (needs_sort) sort_bitarray(new_config);
+    }
     config = std::move(new_config);
 
     std::fill(send_config_size.begin(),send_config_size.end(),static_cast<size_t>(0));
@@ -1062,23 +1079,14 @@ namespace sbd {
    */
   inline int bit_string_sign_factor(const std::vector<size_t> & w,
 				    int bit_length,
-				    size_t x,
-				    size_t r) {
-    int sign = 1;
-    size_t size_t_one = 1;
-    for(size_t k=0; k < r; k++) {
-      for(size_t l=0; l < bit_length; l++) {
-	if( (w[k] & (size_t_one << l)) != 0 ) {
-	  sign *= -1;
-	}
-      }
+				    int x,
+				    int r) {
+    int parity = 0;
+    for(int k=0; k < r; k++) {
+      parity ^= __builtin_popcountll(w[k]);
     }
-    for(size_t l=0; l < x; l++) {
-      if( ( w[r] & (size_t_one << l) ) != 0 ) {
-	sign *= -1;
-      }
-    }
-    return sign;
+    parity ^= __builtin_popcountll(w[r] & ((size_t(1) << x) - 1));
+    return (parity & 1) ? -1 : 1;
   }
 
 
@@ -1281,11 +1289,12 @@ namespace sbd {
     sort_bitarray(dets);
   }
 
+  template<typename DetT>
   inline int destination_by_splitters(
-    const std::vector<size_t> &det,
+    const DetT &det,
     const std::vector<std::vector<size_t>> &splitters) {
     auto it = std::upper_bound(splitters.begin(), splitters.end(), det,
-			       [](const std::vector<size_t>& a, const std::vector<size_t>& b) {
+			       [](const auto& a, const auto& b) {
 				 return less_from_back(a, b); });
     return static_cast<int>(it - splitters.begin());
   }
