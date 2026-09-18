@@ -671,17 +671,44 @@ namespace sbd {
         const int d = blk.block_dim;
         const int off = V.csf_offset[b];
 
+        // Scratch for the Hij overload that takes caller-owned c/d buffers, and
+        // explicit copies of the two determinant rows.
+        //
+        // det[i] returns a non-owning det_vector::row. Upstream made row's
+        // conversion to std::vector<size_t> explicit (146c9d2), which turned what
+        // used to be two silent heap allocations per Hij call into a compile
+        // error -- worth keeping visible: this loop is O(d^2) with d up to 3432
+        // (n_open=14), i.e. millions of pairs. Hoisted out of the r/rp loops and
+        // declared inside the OMP block loop so each thread owns its own.
+        //
+        // c/d MUST be sized, not merely reserved. Unlike the 8-argument Hij
+        // (which push_back()s into its own vectors), the scratch overload writes
+        // c[nc] = ... by index and never resizes: reserve() leaves size()==0, so
+        // every write is out of bounds. That is silent at -O0 and corrupts the
+        // heap at -O3 -- it showed up as a bare SIGTRAP inside the first Davidson
+        // matvec, with the correct energy still produced by the -O0 build.
+        //
+        // Size is 2*norb, not 2: nc counts every differing orbital between the
+        // two determinants (only nc <= 2 is then used), so a near-orthogonal pair
+        // can push nc up to the full spin-orbital count before the tests below.
+        std::vector<int> hij_c(2 * norb, 0);
+        std::vector<int> hij_d(2 * norb, 0);
+        std::vector<size_t> row_i, row_j;
+
         // dense intra-block det-det submatrix H_bb (d x d, symmetric)
         std::vector<double> Hbb(static_cast<size_t>(d) * d, 0.0);
         for (int r = 0; r < d; ++r) {
           const size_t di = blk.det_indices[r];
           if (di == static_cast<size_t>(-1)) continue;
           Hbb[static_cast<size_t>(r) * d + r] = GetReal(hii[di]);
+          row_i.assign(det[di].begin(), det[di].end());
           for (int rp = r + 1; rp < d; ++rp) {
             const size_t dj = blk.det_indices[rp];
             if (dj == static_cast<size_t>(-1)) continue;
             size_t orbDiff = 0;
-            ElemT h = Hij(det[di], det[dj], bit_length, norb, I0, I1, I2, orbDiff);
+            row_j.assign(det[dj].begin(), det[dj].end());
+            ElemT h = Hij(row_i, row_j, bit_length, norb,
+                          hij_c, hij_d, I0, I1, I2, orbDiff);
             const double hv = GetReal(h);
             Hbb[static_cast<size_t>(r) * d + rp] = hv;
             Hbb[static_cast<size_t>(rp) * d + r] = hv;   // H is symmetric
