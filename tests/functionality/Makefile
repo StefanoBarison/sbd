@@ -82,6 +82,28 @@ test: $(TEST_EXECS)
 		echo ""; \
 		echo "Running $$test..."; \
 		case $$test in \
+			test_caop_heatbath_expansion) \
+				echo "  (MPI regression - cutoff, truncation, parent redistribution, and h/b/t layouts)"; \
+				$(MPI_LAUNCHER) -n 1 ./$$test --h 1 --b 1 --t 1 --distribution 0 && \
+				$(MPI_LAUNCHER) -n 2 ./$$test --h 2 --b 1 --t 1 --distribution 0 && \
+				$(MPI_LAUNCHER) -n 2 ./$$test --h 1 --b 2 --t 1 --distribution 0 && \
+				$(MPI_LAUNCHER) -n 2 ./$$test --h 1 --b 1 --t 2 --distribution 0 && \
+				$(MPI_LAUNCHER) -n 8 ./$$test --h 2 --b 2 --t 2 --distribution 0 && \
+				$(MPI_LAUNCHER) -n 8 ./$$test --h 2 --b 2 --t 2 --distribution 1; \
+				;; \
+			test_initial_determinant) \
+				echo "  (MPI regression - distributed initial states)"; \
+				$(MPI_LAUNCHER) -n 4 ./$$test; \
+				;; \
+			test_gdb_grid_distribution) \
+				echo "  (MPI regression - grid ownership, empty ranks, and count redistribution)"; \
+				$(MPI_LAUNCHER) -n 4 ./$$test; \
+				;; \
+			test_heatbath_expansion) \
+				echo "  (MPI regression - h and t replicated layouts)"; \
+				$(MPI_LAUNCHER) -n 4 ./$$test ../../data/h2o/fcidump.txt h && \
+				$(MPI_LAUNCHER) -n 4 ./$$test ../../data/h2o/fcidump.txt t; \
+				;; \
 			test_determinants|test_inner_product) \
 				echo "  (MPI test - using $(MPI_LAUNCHER))"; \
 				$(MPI_LAUNCHER) -n 1 ./$$test; \

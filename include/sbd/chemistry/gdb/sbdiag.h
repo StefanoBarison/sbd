@@ -6,6 +6,7 @@
 #define SBD_CHEMISTRY_GDB_DBDIAG_H
 
 #include "sbd/framework/timestamp.h"
+#include "sbd/framework/determinant_initialization.h"
 
 namespace sbd {
   namespace gdb {
@@ -24,6 +25,7 @@ namespace sbd {
       double eps = 1.0e-4;
       double max_time = 86400.0;
       int init = 0;
+      std::string initial_determinant_bitstring;
       int do_shuffle = 0;
       int do_rdm = 0;
       // Which roots get a per-root RDM computed and written when do_rdm != 0.
@@ -41,7 +43,7 @@ namespace sbd {
       double threshold = 0.01;
       double heatbath_cutoff = 1.0e-4;
       double heatbath_truncation = 0.0;
-      size_t heatbath_batch_size = 200000000;
+      size_t heatbath_batch_size = 1000000;
       size_t bit_length = 20;
       size_t seed = 1729;
       bool timing_barriers = false;
@@ -54,6 +56,9 @@ namespace sbd {
       // configuration orbits. Off by default: the existing distribution
       // strategies are unchanged unless this is asked for.
       bool do_redist_config = false;
+      std::string determinant_distribution;
+      int determinant_grid_a = 0;
+      int determinant_grid_b = 0;
     };
 
     SBD generate_sbd_data(int argc, char * argv[]) {
@@ -61,6 +66,10 @@ namespace sbd {
       for(int i=0; i < argc; i++) {
 	if ( std::string(argv[i]) == "--init" ) {
 	  sbd_data.init = std::atoi(argv[++i]);
+	}
+	if ( std::string(argv[i]) == "--initial_determinant_bitstring" ||
+	     std::string(argv[i]) == "--initial-determinant-bitstring" ) {
+	  sbd_data.initial_determinant_bitstring = std::string(argv[++i]);
 	}
 	if ( std::string(argv[i]) == "--seed" ) {
 	  sbd_data.seed = std::atoi(argv[++i]);
@@ -146,6 +155,18 @@ namespace sbd {
 	    sbd_data.do_redist_config = true;
 	  }
 	}
+	if( std::string(argv[i]) == "--determinant_distribution" ||
+	    std::string(argv[i]) == "--determinant-distribution" ) {
+	  sbd_data.determinant_distribution = std::string(argv[++i]);
+	}
+	if( std::string(argv[i]) == "--determinant_grid_a" ||
+	    std::string(argv[i]) == "--determinant-grid-a" ) {
+	  sbd_data.determinant_grid_a = std::atoi(argv[++i]);
+	}
+	if( std::string(argv[i]) == "--determinant_grid_b" ||
+	    std::string(argv[i]) == "--determinant-grid-b" ) {
+	  sbd_data.determinant_grid_b = std::atoi(argv[++i]);
+	}
       }
       return sbd_data;
     }
@@ -183,10 +204,16 @@ namespace sbd {
       } else  if( sbd_data.carryover_type == 1 ) {
 	std::cout << "# carryover type: weight truncation" << std::endl;
 	std::cout << "# carryover ratio: " << sbd_data.ratio << std::endl;
-      } else if ( sbd_data.carryover_type == 2 || sbd_data.carryover_type == 3 ) {
-	std::cout << "# carryover type: heatbath expansion" << std::endl;
+      } else if ( sbd_data.carryover_type == 2 ) {
+	std::cout << "# carryover type: on-demand exhaustive heatbath expansion" << std::endl;
 	std::cout << "# heatbath truncation: " << sbd_data.heatbath_truncation << std::endl;
 	std::cout << "# heatbath cutoff: " << sbd_data.heatbath_cutoff << std::endl;
+	std::cout << "# heatbath batch size per rank: " << sbd_data.heatbath_batch_size << std::endl;
+      } else if ( sbd_data.carryover_type == 3 ) {
+	std::cout << "# carryover type: integral-driven heatbath expansion" << std::endl;
+	std::cout << "# heatbath truncation: " << sbd_data.heatbath_truncation << std::endl;
+	std::cout << "# heatbath cutoff: " << sbd_data.heatbath_cutoff << std::endl;
+	std::cout << "# heatbath batch size per rank: " << sbd_data.heatbath_batch_size << std::endl;
       }
     }
 
@@ -355,8 +382,26 @@ namespace sbd {
       auto time_start_init = std::chrono::high_resolution_clock::now();
       std::vector<ElemT> w;
       if( loadname.empty() ) {
-	sbd::gdb::BasisInitVector(w,det,h_comm,b_comm,t_comm,init,seed);
+	if( sbd_data.initial_determinant_bitstring.empty() ) {
+	  if( mpi_rank == 0 ) {
+	    std::cout << "# initial vector source: default" << std::endl;
+	  }
+	  sbd::gdb::BasisInitVector(w,det,h_comm,b_comm,t_comm,init,seed);
+	} else {
+	  if( mpi_rank == 0 ) {
+	    std::cout << "# initial vector source: explicit determinant" << std::endl;
+	    std::cout << "# initial determinant bitstring: "
+	              << sbd_data.initial_determinant_bitstring << std::endl;
+	  }
+	  const auto initial_determinant = from_string_checked(
+	      sbd_data.initial_determinant_bitstring, bit_length, 2*static_cast<size_t>(L));
+	  BasisInitVectorFromDeterminant(w,det,initial_determinant,b_comm);
+	}
       } else {
+	if( mpi_rank == 0 ) {
+	  std::cout << "# initial vector source: load" << std::endl;
+	  std::cout << "# load name: " << loadname << std::endl;
+	}
 	sbd::LoadWavefunction(loadname,det,h_comm,b_comm,t_comm,w);
       }
       if( sbd_data.timing_barriers ) MPI_Barrier(comm);
@@ -608,8 +653,8 @@ namespace sbd {
 	     h_comm,b_comm,t_comm);
 	ElemT E;
 	InnerProduct(w,v,E,b_comm);
-	energy = GetReal(E);
 #endif
+	energy = GetReal(E);
 	if( sbd_data.timing_barriers ) MPI_Barrier(comm);
 	auto time_end_mult = std::chrono::high_resolution_clock::now();
 	auto elapsed_mult_count = std::chrono::duration_cast<std::chrono::microseconds>(time_end_mult-time_start_mult).count();
@@ -975,9 +1020,9 @@ namespace sbd {
 		    << " sbd: start heatbath expansion" << std::endl;
 	}
 	auto time_start_hb = std::chrono::high_resolution_clock::now();
-	int hb_type = (co_type == 2) ? 0 : 1;
+	int heatbath_method = (co_type == 2) ? 0 : 1;
 	HeatbathExpansion(cdet,cw,bit_length,static_cast<size_t>(L),I0,I1,I2,
-			  hb_type,hb_cutoff,hb_batch_size,rdet,b_comm,comm);
+			  heatbath_method,hb_cutoff,hb_batch_size,rdet,b_comm,comm);
 	auto time_end_hb = std::chrono::high_resolution_clock::now();
 	auto elapsed_hb_count = std::chrono::duration_cast<std::chrono::microseconds>(time_end_hb-time_start_hb).count();
 	double elapsed_hb = 1.0e-6 * elapsed_hb_count;
@@ -1106,15 +1151,21 @@ namespace sbd {
 	  // sort_bitarray(det) here; load_basis_from_files already sorts
 	  // (caop/basic/basis.h) and every branch below re-sorts internally.
 	  // Kept as-is to avoid changing existing behaviour.
+	  //
+	  // do_redist_config is tested BEFORE do_redist_alpha_eq (which is
+	  // default-true) because it is a correctness requirement, not a
+	  // load-balancing preference: --single_spin at b_comm_size > 1 needs
+	  // every determinant of one spatial configuration on one rank. Putting
+	  // alpha_eq first would silently disable single-spin multi-node.
 	  if( sbd_data.do_redist_config ) {
 	    redistribution_equal_config(det,bit_length,2*L,b_comm);
+	  } else if( sbd_data.do_redist_alpha_eq ) {
+	    redistribution_equal_bra_a(det,bit_length,2*L,b_comm);
 	  } else if( sbd_data.do_sort_det ) {
 	    redistribution(det,bit_length,2*L,b_comm);
 	    reordering(det,bit_length,2*L,b_comm);
 	  } else if ( sbd_data.do_redist_det ) {
 	    redistribution(det,bit_length,2*L,b_comm);
-	  } else if ( sbd_data.do_redist_alpha_eq ) {
-	    redistribution_equal_bra_a(det,bit_length,2*L,b_comm);
 	  }
 	}
 	MpiBcast(det,0,t_comm);
