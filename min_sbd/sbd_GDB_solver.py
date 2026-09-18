@@ -934,7 +934,39 @@ def _write_gdb_dets(
                 f"norb={norb} is too small."
             )
         lines.append(format(full, "b").zfill(total_bits))
-    path.write_text("\n".join(lines) + "\n")
+
+    # Sorted output is REQUIRED, not a tidiness choice. Since caop/basis.h v12
+    # (upstream 8187b8d) load_basis_from_files no longer sorts its input: it
+    # checks and calls MPI_Abort with
+    #     load_basis_from_files rank=0: ERROR file not sorted: <file>
+    # so an unsorted file kills the run before the solve starts. The order this
+    # function receives comes from sampling/amplitude ranking, which is never
+    # sorted by bitstring value -- not even when the alpha and beta halves are
+    # each sorted, because the halves are interleaved bit-by-bit here.
+    #
+    # Safe to reorder: the binary re-sorted determinants internally even before
+    # v12, and _read_gdb_wavefunction keys its amp_map on the (alpha, beta) pair
+    # rather than on line position, so nothing downstream depends on the order of
+    # this file. The caller's order is preserved separately for the .npz archive.
+    #
+    # Sorting the fixed-width strings is exactly less_from_back order: the reader
+    # packs character j at bit (total_bit_length-1-j), so the record compares as
+    # one binary integer. See scripts/sort-basis-shards.py.
+    lines.sort()
+
+    # Duplicates would survive into the basis (the k-way merge dedups, but only
+    # across shards) and a duplicated determinant makes the Hamiltonian singular.
+    deduped = [ln for i, ln in enumerate(lines) if i == 0 or ln != lines[i - 1]]
+    if len(deduped) != len(lines):
+        warnings.warn(
+            f"_write_gdb_dets: dropped {len(lines) - len(deduped)} duplicate "
+            f"determinant(s) of {len(lines)} while writing {path.name}. "
+            f"Duplicate (strs_a[i], strs_b[i]) pairs in the input usually mean "
+            f"the caller cartesian-producted a set that already contained pairs.",
+            UserWarning,
+            stacklevel=2,
+        )
+    path.write_text("\n".join(deduped) + "\n")
 
 
 # ---------------------------------------------------------------------------
